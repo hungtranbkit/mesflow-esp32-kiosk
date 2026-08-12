@@ -1,0 +1,14 @@
+{
+  "screen": "ask_rework",
+  "state": "ASK_REWORK",
+  "width": 240,
+  "height": 320,
+  "version": "ESP32-KIOSK-5.1.9-WORKER-QTY-FLOW",
+  "online": true,
+  "employee": "QA DEMO",
+  "operation": "QA UI CAPTURE",
+  "good_qty": 22,
+  "defect_qty": 3,
+  "repair_qty": 1,
+  "scrap_qty": 2
+}
