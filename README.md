@@ -223,3 +223,4 @@ Firmware tự dò PCF8574T trong dải `0x20..0x27`. Cảm ứng FT6336G (`0x38`
 - Số lượng được giới hạn từ `0` đến `999999`.
 
 Ghi chú lịch sử: riêng bản v5.1.6 cần thư viện Arduino `I2CKeyPad`; từ v5.1.7 đã bỏ phụ thuộc này.
+# mesflow-esp32-kiosk
