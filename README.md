@@ -1,4 +1,14 @@
-# MESFlow ESP32-S3 Kiosk v5.1.9 - Worker quantity flow
+# Kimex ESP32-S3 Kiosk v5.3.1 - OTA fleet safety
+
+Firmware `5.3.3` adds Agent-directed OTA identity and a
+dedicated OTA worker task. HTTPS is fail-closed: production builds must define
+`MESFLOW_ROOT_CA_PEM` with the trusted server CA; the firmware never falls back
+to `setInsecure()`.
+
+The active build and flash procedure is documented in
+`../docs/operations/ESP_KIOSK_OTA_PHASE3.md`.
+
+## Previous worker quantity flow
 
 ## Current project structure
 

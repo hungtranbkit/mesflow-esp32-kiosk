@@ -1,4 +1,6 @@
 build/
+node_modules/
+.playwright/
 .vscode/
 .idea/
 *.bin
@@ -6,3 +8,9 @@ build/
 *.map
 *.log
 .DS_Store
+dist/
+mesflow_ota_ca.h
+test-results/
+playwright-report/
+__pycache__/
+*.pyc

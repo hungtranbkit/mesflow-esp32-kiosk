@@ -1,0 +1,28 @@
+{
+  "name": "esp-kiosk",
+  "version": "1.0.0",
+  "description": "Firmware `5.3.3` adds Agent-directed OTA identity and a dedicated OTA worker task. HTTPS is fail-closed: production builds must define `MESFLOW_ROOT_CA_PEM` with the trusted server CA; the firmware never falls back to `setInsecure()`.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "npx playwright test tests/ui/esp-ui-visual.spec.js",
+    "audit-ui": "./scripts/audit-ui.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hungtranbkit/mesflow-esp32-kiosk.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/hungtranbkit/mesflow-esp32-kiosk/issues"
+  },
+  "homepage": "https://github.com/hungtranbkit/mesflow-esp32-kiosk#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  }
+}

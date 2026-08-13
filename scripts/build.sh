@@ -23,5 +23,6 @@ echo "Sketch: $SKETCH"
 echo
 
 arduino-cli compile \
+  --export-binaries \
   --fqbn "$FQBN" \
   "$SKETCH"
