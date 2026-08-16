@@ -1,0 +1,76 @@
+schema_version: 1
+
+project:
+  code: esp-kiosk
+  name: ESP32 Firmware
+  type: FIRMWARE
+  role: DEVICE
+
+source:
+  root: .
+
+version:
+  # Firmware version is declared in esp/mesflow_app.cpp (FW_VERSION), not a
+  # standalone VERSION file -- TUTORIAL_VERSION.txt tracks the separate
+  # on-device tutorial content package, not firmware. See
+  # reports/PROJECTFLOW_STANDARDIZATION_ASSESSMENT.md §2/§8.
+  source_define:
+    file: esp/mesflow_app.cpp
+    pattern: '#define FW_VERSION "([^"]+)"'
+
+runtime:
+  type: firmware
+
+commands:
+
+  preflight:
+    command: ./scripts/detect-board.sh
+    working_directory: .
+    timeout_seconds: 60
+
+  build:
+    command: ./scripts/build.sh
+    working_directory: .
+    timeout_seconds: 900
+
+  test:
+    command: npm test
+    working_directory: .
+    timeout_seconds: 900
+
+  package:
+    command: ./scripts/build-ota-package.sh
+    working_directory: .
+    timeout_seconds: 900
+
+  flash_local:
+    command: ./scripts/flash.sh
+    working_directory: .
+    timeout_seconds: 300
+    notes: "Requires an explicit serial port argument (never auto-selected -- see mesflow/AGENTS.md ESP Kiosk rules). Physical device required; not applicable to a headless ProjectFlow worker."
+
+artifacts:
+  strategy: immutable
+  directory: ../artifacts/esp-kiosk/ota
+  metadata: ../artifacts/latest/esp-kiosk.json
+
+deployment:
+  build_once: true
+  promote_same_artifact: true
+
+  local:
+    enabled: false
+    approval_required: false
+    notes: "No server-side 'local deploy' concept for firmware -- flash_local targets a physically connected board, not a compose service."
+
+  test:
+    enabled: true
+
+  staging:
+    enabled: true
+    notes: "OTA push to devices via the Deploy Agent's OTA control plane (deploy-agent/ota_control.py) -- not wired as a direct ProjectFlow action."
+
+  production:
+    enabled: true
+    approval_required: true
+    projectflow_direct_execution: false
