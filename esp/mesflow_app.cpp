@@ -977,7 +977,39 @@ bool syncOneOfflineEvent(){
   JsonArray results=resp["results"].as<JsonArray>();if(results.isNull()||!results.size()){setError(-49,"SYNC KHONG CO ACK");return false;}
   const char* status=results[0]["status"]|"";const char* ackId=results[0]["event_id"]|"";
   if(strcmp(ackId,e.eventId)!=0){setError(-50,"ACK SAI EVENT");return false;}
-  if(!strcmp(status,"rejected")){const char* reason=results[0]["reason_code"]|"BUSINESS_REJECT";Serial.printf("[SYNC] rejected event=%s reason=%s\n",e.eventId,reason);if(!appendReject(e.eventId,reason)){setError(-52,"KHONG LUU DUOC REJECT");return false;}lastOfflineSyncEpoch=currentEpoch();return true;}
+  if(!strcmp(status,"rejected")){
+    // BUG (found 2026-08-22, round 3): the server correctly rejects a
+    // business-invalid offline START/FINISH (e.g. Operation's PO already
+    // COMPLETED/CANCELLED or never Started) with status=="rejected", but
+    // this branch only logged it to the Serial/USB console and returned
+    // true -- "sync successful" to every caller. Nothing ever reached the
+    // kiosk screen, Kiosk Events, or notifications, and since START/FINISH
+    // are local-first (the operator already saw "DA LUU TAM" and moved on
+    // to the next worker before this background sync runs), the rejection
+    // was invisible everywhere: no work_session was ever created, so the
+    // production simply never reached the dashboard with no trace of why.
+    const char* reasonCode=results[0]["reason_code"]|"BUSINESS_REJECT";
+    const char* reasonDetail=results[0]["reason"]|"";
+    const bool isStart=e.eventType==(uint8_t)OfflineEventType::START;
+    Serial.printf("[SYNC] rejected event=%s reason=%s detail=%s\n",e.eventId,reasonCode,reasonDetail);
+    char notifyMsg[224];
+    snprintf(notifyMsg,sizeof(notifyMsg),"%s bi tu choi (%s): NV=%s OP=%s. Ly do: %s",
+             isStart?"BAT DAU":"KET THUC",reasonCode,e.workerQr,e.operationQr,
+             reasonDetail[0]?reasonDetail:reasonCode);
+    // Server-side visibility for admin/supervisor (Kiosk Events + notifications --
+    // severity=ERROR makes analytics.py's KioskEventRepository.ingest() also
+    // create an admin notification row, unlike the RECONCILE_REPLAY-only
+    // Session Exceptions path which never covers an ordinary offline reject).
+    sendKioskEvent("OFFLINE_SYNC_REJECTED","ERROR",notifyMsg,"Kiem tra OP/PO va bao quan doc",0);
+    if(!appendReject(e.eventId,reasonCode)){setError(-52,"KHONG LUU DUOC REJECT");return false;}
+    lastOfflineSyncEpoch=currentEpoch();
+    // On-device visibility for whoever is at the kiosk right now. Short,
+    // no-diacritic text -- same convention as every other setError() call
+    // in this file -- rather than the raw (possibly long, diacritic) server
+    // reason, which is already sent in full via sendKioskEvent above.
+    setError(0,isStart?"BI TU CHOI - PO CHUA/DA XONG":"BI TU CHOI - BAO QUAN DOC");
+    return true;
+  }
   if(strcmp(status,"accepted")&&strcmp(status,"duplicate")){setError(-51,"SERVER TAM THOI TU CHOI");return false;}
   if(!appendAck(e.eventId)){setError(-52,"KHONG LUU DUOC ACK");return false;}
   lastOfflineSyncEpoch=currentEpoch();Serial.printf("[OFFLINE SYNC] %s -> %s, pending=%u\n",e.eventId,status,countPendingOfflineEvents());return true;
