@@ -19,6 +19,7 @@
 #include <esp_ota_ops.h>
 #include <Update.h>
 #include <mbedtls/sha256.h>
+#include <esp_task_wdt.h>
 #include "mesflow_vietnamese_font.h"
 
 #ifndef MESFLOW_UI_SCREENSHOT
@@ -133,7 +134,13 @@ constexpr uint32_t FINISH_SUCCESS_HOLD_MS = 0; // Finish xong ve QUET THE ngay
 //   GM865 TX -> ESP GPIO44 (RX)
 //   GM865 RX -> not connected
 #define SCANNER_RX_PIN 44
-constexpr uint32_t SCANNER_BAUD = 9600;
+// 2026-08-30: this unit's module-side baud (its own EEPROM setting, not the
+// GM65's factory default) measured at 115200 via edge-capture + linear
+// regression against a USB-Virtual-Serial-Port ground-truth readback of
+// "WF|EMP|NV002", then reconfirmed clean over the real UART1 peripheral
+// (13/13 frames exact). 9600 (the datasheet's factory default) produced
+// zero bytes on real hardware.
+constexpr uint32_t SCANNER_BAUD = 115200;
 constexpr uint32_t SCANNER_FRAME_TIMEOUT_MS = 50;
 constexpr size_t SCANNER_FRAME_MAX = 256;
 HardwareSerial ScannerSerial(1);
@@ -725,6 +732,31 @@ uint32_t lastOfflineSyncEpoch = 0;
 uint32_t lastCatalogAutoRefreshAt = 0, lastCatalogAutoAttemptAt = 0;
 bool offlineMode = false, fsReady = false, offlineBuffersReady = false;
 char offlineSnapshotRevision[32] = "unknown";
+
+// FORENSICS (2026-09-09): field report "de lau, quet ma lai la bi reset" --
+// the kiosk sits idle, then a scan appears to reboot it. Three different
+// mechanisms can produce that same visible symptom and they need completely
+// different fixes:
+//   1. task-watchdog force-reboot (setup()'s 40s net, armed 2026-08-22 round
+//      5) fired because a blocking network call -- DNS in particular, which
+//      is NOT bounded by our connect/request timeouts -- hung the main loop;
+//   2. brownout: the scanner's illumination LED current spike (plus a WiFi
+//      re-association burst right after idle) sagging a marginal 5V supply;
+//   3. no reboot at all -- WiFi was simply down at that instant, the scan
+//      failed with "WiFi chua ket noi", and the operator had to scan again.
+// esp_reset_reason() tells 1 and 2 apart definitively, and the WiFi outage
+// counters below tell 3 apart from both. All of it was previously only
+// reachable inside a bind/heartbeat payload -- and kiosk_events /
+// kiosk_client_events are empty (0 rows) in every MESFlow database on this
+// host, so in practice nothing was recorded anywhere. Surfaced in
+// buildRemoteStatusText() instead, which the LAN web console and the serial
+// `show` command both dump without needing the server to be reachable at all.
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+uint32_t bootAtMs = 0;
+uint16_t wifiDropCount = 0;          // confirmed outages since boot (post grace period)
+uint32_t lastWifiDropAt = 0;         // millis() of the most recent confirmed outage
+uint32_t lastWifiRecoveredAt = 0;    // millis() when it came back
+uint32_t longestWifiOutageMs = 0;    // worst confirmed outage this boot
 enum class ServerLinkState : uint8_t { UNKNOWN, WIFI_DOWN, UNREACHABLE, AVAILABLE };
 ServerLinkState serverLinkState = ServerLinkState::UNKNOWN;
 uint8_t serverSuccessStreak = 0, serverFailureStreak = 0;
@@ -734,10 +766,23 @@ uint16_t operationCacheCapacity = MAX_CACHED_OPERATIONS;
 uint16_t offlineSessionCapacity = MAX_OFFLINE_SESSIONS;
 uint16_t offlineAckCapacity = MAX_OFFLINE_EVENTS;
 
-void recordServerResult(bool success,bool wifiDown=false){
+// TEMP DIAGNOSTIC (2026-08-22, round 3): serverLinkState degrading toward
+// UNREACHABLE with offlineMode stuck at 1 means something is actually
+// failing in the background (heartbeat and/or the offline-event sync POST
+// both run regardless of offlineMode/user action), but whichever setError()
+// fires LAST always overwrites rt.lastHttpStatus/rt.lastError before anyone
+// can look at the screen -- so the real failing status gets clobbered by the
+// time an operator sees anything. Remember it separately, tagged by source.
+int lastLinkFailureStatus = 0;
+char lastLinkFailureSource[16] = "";
+
+void recordServerResult(bool success,bool wifiDown=false,int status=0,const char* source=nullptr){
   if(success){serverFailureStreak=0;if(serverSuccessStreak<2)serverSuccessStreak++;if(serverSuccessStreak>=2)serverLinkState=ServerLinkState::AVAILABLE;}
   else{serverSuccessStreak=0;if(wifiDown){serverFailureStreak=2;serverLinkState=ServerLinkState::WIFI_DOWN;}
-    else{if(serverFailureStreak<2)serverFailureStreak++;if(serverFailureStreak>=2)serverLinkState=ServerLinkState::UNREACHABLE;}}
+    else{if(serverFailureStreak<2)serverFailureStreak++;if(serverFailureStreak>=2)serverLinkState=ServerLinkState::UNREACHABLE;}
+    lastLinkFailureStatus=status;
+    if(source) safeCopy(lastLinkFailureSource,sizeof(lastLinkFailureSource),source);
+  }
   rt.online=serverLinkState==ServerLinkState::AVAILABLE;
   if (!rt.online) otaLinkReady = false;
 }
@@ -1762,7 +1807,12 @@ static void handlePhoneConfigSave() {
   }
   safeCopy(WIFI_SSID, sizeof(WIFI_SSID), ssid.c_str());
   safeCopy(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), password.c_str());
-  prefs.begin("mesflow", false);
+  // Must use the same "mesflow_cfg" namespace that loadDeviceConfig() reads
+  // at boot. This handler used to write into the "mesflow" namespace
+  // instead, so the phone setup portal would report success but the SSID
+  // never actually took effect after reboot -- ESP fell back to the
+  // firmware's built-in dev WiFi every time.
+  prefs.begin("mesflow_cfg", false);
   const bool saved = prefs.putString("wifi_ssid", WIFI_SSID) > 0;
   prefs.putString("wifi_pass", WIFI_PASSWORD);
   prefs.end();
@@ -1869,11 +1919,42 @@ static String maskedToken(const char* token) {
   return t.substring(0, 4) + "..." + t.substring(t.length() - 4);
 }
 
+// Short human-readable esp_reset_reason(). The raw enum int alone is not
+// something anyone reads off a photo correctly under floor conditions.
+static const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "POWERON";     // cold power-up / power cut
+    case ESP_RST_EXT:       return "EXT-PIN";
+    case ESP_RST_SW:        return "SW";          // our own ESP.restart()
+    case ESP_RST_PANIC:     return "PANIC";       // crash (exception/abort)
+    case ESP_RST_INT_WDT:   return "INT-WDT";
+    case ESP_RST_TASK_WDT:  return "TASK-WDT";    // setup()'s 40s safety net fired
+    case ESP_RST_WDT:       return "OTHER-WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";    // supply sagged (scanner LED / WiFi TX spike)
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
 static String buildRemoteStatusText() {
   String out;
-  out.reserve(1400);
+  out.reserve(1600);
   out += "================ MESFLOW STATUS ================\n";
   out += "Firmware : " + String(APP_VERSION) + "\n";
+  // See the FORENSICS block near wifiDropCount: this is the evidence that
+  // separates "the device rebooted" from "the scan just failed", and if it
+  // did reboot, why.
+  out += "Reset    : " + String(resetReasonName(bootResetReason)) + " (" + String((int)bootResetReason) + ")\n";
+  out += "Uptime   : " + String((millis() - bootAtMs) / 1000UL) + " s\n";
+  out += "WiFi drop: " + String(wifiDropCount) + " since boot; longest=" + String(longestWifiOutageMs / 1000UL) + " s";
+  if (lastWifiDropAt) {
+    out += "; last drop " + String((millis() - lastWifiDropAt) / 1000UL) + " s ago";
+    if (lastWifiRecoveredAt >= lastWifiDropAt)
+      out += ", recovered after " + String((lastWifiRecoveredAt - lastWifiDropAt) / 1000UL) + " s";
+    else out += ", STILL DOWN";
+  }
+  out += "\n";
   out += "Device   : " + String(DEVICE_ID) + " (" + String(DEVICE_NAME) + ")\n";
   out += "Station  : " + String(STATION_CODE) + "\n";
   out += "Server   : " + String(rt.online ? "ONLINE" : "OFFLINE") + "\n";
@@ -3014,7 +3095,20 @@ static void drawMaintenanceScreen() {
   const String web = mdnsReady ? String(mdnsHostname) + ".local" : "KHÔNG SẴN SÀNG";
   drawTextBox(web.c_str(), 62, 137, 160, 22, FONT_HEADER, FONT_HEADER, 1, TextAlign::LEFT, C_TEXT, true);
   drawTextBox("TRẠNG THÁI",18,170,90,20,FONT_HEADER,FONT_HEADER,1,TextAlign::LEFT,C_MUTED,true);
-  drawTextBox(offlineMode?"OFFLINE":"ONLINE",112,167,110,22,FONT_SECTION,FONT_SECTION,1,TextAlign::LEFT,offlineMode?C_WARN:C_OK,true);
+  // TEMP DIAGNOSTIC (2026-08-22): offlineMode==false does not by itself mean
+  // OP/worker scans take the online path -- that gate also checks
+  // serverLinkState (WIFI_DOWN/UNREACHABLE), which had no visible readout
+  // anywhere, so a queue-is-empty kiosk could still be silently forced into
+  // offline-only cache lookups (error code -44) with nothing on screen
+  // explaining why. Surface it here -- remove once root-caused.
+  const char* linkText = offlineMode ? "OFFLINE" :
+      serverLinkState == ServerLinkState::WIFI_DOWN ? "WIFIDOWN" :
+      serverLinkState == ServerLinkState::UNREACHABLE ? "UNREACH" :
+      serverLinkState == ServerLinkState::UNKNOWN ? "UNKNOWN" : "ONLINE";
+  const uint16_t linkColor = offlineMode || serverLinkState == ServerLinkState::WIFI_DOWN ||
+      serverLinkState == ServerLinkState::UNREACHABLE ? C_WARN :
+      serverLinkState == ServerLinkState::UNKNOWN ? C_MUTED : C_OK;
+  drawTextBox(linkText,112,167,110,22,FONT_SECTION,FONT_SECTION,1,TextAlign::LEFT,linkColor,true);
   char pendingText[16];snprintf(pendingText,sizeof(pendingText),"%u",maintenancePendingOverride>=0?(unsigned)maintenancePendingOverride:(unsigned)countPendingOfflineEvents());
   drawTextBox("CHỜ ĐỒNG BỘ",18,201,110,20,FONT_HEADER,FONT_HEADER,1,TextAlign::LEFT,C_MUTED,true);
   drawTextBox(pendingText,150,198,72,22,FONT_SECTION,FONT_SECTION,1,TextAlign::LEFT,C_TEXT,true);
@@ -3550,6 +3644,46 @@ void drawError() {
   drawIndustrialHeader(C_ERR);
   drawPageTitle("LỖI", C_ERR);
   drawCenteredTextFit(shortError, SCREEN_LEFT_MARGIN, 120, 216, 92, FONT_SECTION, FONT_SECTION - 1, 3, C_TEXT, true);
+  // TEMP DIAGNOSTIC (2026-08-22): "MAT KET NOI MAY CHU" collapses many
+  // different underlying failures (WiFi not associated, TCP connect refused,
+  // DNS failure, read timeout...) into one friendly message, which made this
+  // exact bug impossible to pin down remotely. Surface the raw code so the
+  // next occurrence is diagnosable from a photo -- remove once root-caused.
+  char diag[24];
+  snprintf(diag, sizeof(diag), "code %d", rt.lastHttpStatus);
+  printCentered(diag, SW / 2, 214, 1, C_MUTED, true);
+  // TEMP DIAGNOSTIC (2026-08-22, round 2): code -44 alone doesn't say WHY the
+  // OP-scan gate picked the offline-cache-only path instead of asking the
+  // server. Capture the exact gate inputs atomically at the moment of the
+  // error, since serverLinkState/offlineMode can change again before anyone
+  // can check the Maintenance screen after the fact.
+  char diag2[40];
+  const char* lt = serverLinkState == ServerLinkState::WIFI_DOWN ? "WD" :
+      serverLinkState == ServerLinkState::UNREACHABLE ? "UR" :
+      serverLinkState == ServerLinkState::UNKNOWN ? "UK" : "AV";
+  snprintf(diag2, sizeof(diag2), "om=%d link=%s wifi=%d", offlineMode ? 1 : 0, lt,
+           static_cast<int>(WiFi.status()));
+  printCentered(diag2, SW / 2, 230, 1, C_MUTED, true);
+  // TEMP DIAGNOSTIC (2026-08-22, round 3): whichever setError() shows on
+  // screen overwrites rt.lastHttpStatus, hiding the actual background
+  // failure (heartbeat/sync POST) that degraded serverLinkState in the
+  // first place. lastLinkFailureStatus/Source is a separate, dedicated
+  // record of THAT failure, updated only inside recordServerResult().
+  char diag3[40];
+  snprintf(diag3, sizeof(diag3), "last-fail %s=%d", lastLinkFailureSource, lastLinkFailureStatus);
+  printCentered(diag3, SW / 2, 246, 1, C_MUTED, true);
+  // TEMP DIAGNOSTIC (2026-08-22, round 4): "GET=-2" means http.begin()
+  // itself returned false. Per the ESP32 core's HTTPClient::begin(client,
+  // url) source, that function does ONLY string parsing (checks for ':' and
+  // a http/https protocol prefix) -- no DNS/socket I/O happens at that step.
+  // It can only fail if the concatenated URL is malformed, which would mean
+  // SERVER_BASE was empty/corrupt in RAM at that moment (NVS itself is
+  // fine, confirmed separately), or heap pressure is corrupting the String
+  // operations inside that call. Surface both directly instead of guessing.
+  char diag4[40];
+  snprintf(diag4, sizeof(diag4), "srv_len=%d heap=%u", static_cast<int>(strlen(SERVER_BASE)),
+           static_cast<unsigned>(ESP.getFreeHeap()));
+  printCentered(diag4, SW / 2, 258, 1, C_MUTED, true);
   drawFooter("* QUAY LẠI", "");
 }
 
@@ -3666,7 +3800,24 @@ const char* workerFriendlyError(int status, const char* technical) {
   if (detail.indexOf("COMPLETED") >= 0 || detail.indexOf("HOAN THANH") >= 0) return "CÔNG ĐOẠN ĐÃ HOÀN THÀNH";
   if (detail.indexOf("CANCELLED") >= 0 || detail.indexOf("CANCELED") >= 0 || detail.indexOf("HUY") >= 0) return "CÔNG ĐOẠN ĐÃ HỦY";
   if (detail.indexOf("WIP") >= 0 || detail.indexOf("DAU VAO") >= 0 || detail.indexOf("INPUT") >= 0) return "CHƯA CÓ SẢN PHẨM ĐẦU VÀO";
-  if (detail.indexOf("WIFI") >= 0 || detail.indexOf("CONNECTION") >= 0 || detail.indexOf("TIMEOUT") >= 0 || status <= 0) return "MẤT KẾT NỐI MÁY CHỦ";
+  // BUG (found 2026-08-22, round 2): status==0 AND every setError() code
+  // <= -20 in this file are local/business sentinels, not network codes --
+  // e.g. status==0 for "QUET THE TRUOC" (OP scanned before worker card),
+  // -43/-44 "THE|MA CHUA CO CACHE" (offline cache miss), -41/-42/-45..-52
+  // (journal/session/sync bookkeeping). Only -1/-2/-3/-10 (our own
+  // transport sentinels) and raw HTTPClient error codes (-1..-11 per the
+  // ESP32 core) are real transport failures; every local sentinel below
+  // that range was being caught by the old "status < 0" check too, so an
+  // offline-cache-miss on OP scan (-44) STILL showed "MAT KET NOI MAY CHU"
+  // even after the status==0 fix. Narrow the transport-failure band to
+  // (-19, 0) exclusive of 0.
+  const bool realTransportFailure = status < 0 && status > -20;
+  if (detail.indexOf("WIFI") >= 0 || detail.indexOf("CONNECTION") >= 0 || detail.indexOf("TIMEOUT") >= 0 || realTransportFailure) return "MẤT KẾT NỐI MÁY CHỦ";
+  // Any other status<=0 (local validation, or a local/business sentinel
+  // <= -20) is already a short, clear, operator-facing Vietnamese string --
+  // show it as-is instead of falling through to the generic
+  // "CHUA THUC HIEN DUOC".
+  if (status <= 0) return technical;
   const bool finishing = pendingTx.type == static_cast<uint8_t>(PendingType::FINISH) ||
                          uiState == UiState::FINISHING || uiState == UiState::CONFIRM_QTY;
   if (finishing) {
@@ -3723,9 +3874,60 @@ bool decodeResponse(HTTPClient& http, int status, DynamicJsonDocument& response,
   return true;
 }
 
-bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = true, JsonDocument* filter = nullptr, const char* baseOverride = nullptr) {
-  if (WiFi.status() != WL_CONNECTED) {
-    recordServerResult(false,true);
+// ROOT CAUSE (found 2026-08-22, round 4, confirmed via on-device diagnostics
+// + reading the ESP32 core's HTTPClient::begin() source): this one function
+// serves TWO unrelated channels -- the plain-HTTP core MES API (SERVER_BASE)
+// used by every worker/OP scan, and the HTTPS OTA-agent check (OTA_AGENT_BASE,
+// via baseOverride) used only by checkForOta(). Every call recorded its
+// result into the SAME shared serverLinkState/rt.online used to gate the
+// scan online-vs-offline-cache decision. This device was never flashed with
+// an OTA CA cert (MESFLOW_OTA_CA_FILE not set), so MesHttpSession::begin()
+// correctly fails closed on every single OTA HTTPS attempt (by design --
+// never falls back to setInsecure()) -- but that unrelated, expected-to-fail
+// background check was dragging serverLinkState down to UNREACHABLE and
+// forcing every OP/worker scan into offline-cache-only lookups (error -44),
+// even though the real MES API was fast and healthy the whole time.
+// trackLinkState=false lets a caller (checkForOta) opt this channel out of
+// the shared connectivity signal entirely.
+// BUG (field report 2026-09-09, "de lau quet ma lai la bi reset"): after the
+// kiosk sits idle, the AP/router can age the association out. ESP-IDF's own
+// auto-reconnect (WiFi.setAutoReconnect(true), set in connectWifi()) starts
+// re-associating within a second or two, and maintainConnection() nudges it
+// again on its own schedule -- but a scan landing inside that window used to
+// fail INSTANTLY on this one status read ("WiFi chua ket noi") and the
+// operator had to scan the card again, which is exactly what "bi reset"
+// looks like from the floor even when the device never rebooted.
+//
+// Wait, briefly and boundedly, for the reconnect already in progress instead
+// of giving up on the first read. Deliberately does NOT call WiFi.begin() or
+// WiFi.reconnect() here: maintainConnection() owns reconnect policy (its own
+// comment explains why calling disconnect/reconnect from inside a request
+// path turns a transient status into a real outage). This only observes.
+//
+// 3s is the budget: well under setup()'s 40s task-watchdog, and the watchdog
+// is fed while waiting so a slow reconnect can never turn this into a reboot.
+static bool waitForWifiBriefly(uint32_t maxWaitMs = 3000) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  const uint32_t started = millis();
+  while (millis() - started < maxWaitMs) {
+    delay(100);
+    esp_task_wdt_reset();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[NETWORK] WiFi tro lai sau %lu ms cho -- khong bat nguoi dung quet lai.\n",
+                    static_cast<unsigned long>(millis() - started));
+      return true;
+    }
+  }
+  return false;
+}
+
+bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = true, JsonDocument* filter = nullptr, const char* baseOverride = nullptr, bool trackLinkState = true) {
+  // Only the operator-facing MES channel waits. trackLinkState=false is, by
+  // construction, the background OTA-agent channel (the only caller passing
+  // it) -- it already fails closed by design on this fleet and must not stall
+  // the main loop for 3s on a WiFi blip nobody is waiting on.
+  if (!(trackLinkState ? waitForWifiBriefly() : (WiFi.status() == WL_CONNECTED))) {
+    if (trackLinkState) recordServerResult(false,true,-1,"GET-wifi");
     setError(-1, "WiFi chua ket noi");
     return false;
   }
@@ -3737,12 +3939,24 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
   int lastStatus = 0;
   String lastMessage = "Ket noi API that bai";
 
-  // ESP32 doi luc tra HTTP 0 ngay sau mot request truoc do. Thu lai mot lan
-  // bang WiFiClient/HTTPClient moi, khong lam mat worker dang duoc chon.
-  for (int attempt = 1; attempt <= 1; ++attempt) {
+  // ESP32 doi luc tra HTTP 0 ngay sau mot request truoc do (vi du: quet OP
+  // ngay sau khi tra cuu nhan vien, hoac quet the nhan vien tiep theo ngay
+  // sau khi FINISH vua ghi/flash xong). Thu lai mot lan bang WiFiClient/
+  // HTTPClient moi, khong lam mat worker dang duoc chon.
+  // BUG CU: vong lap dung o "attempt <= 1" nen chi chay dung 1 lan --
+  // retry duoi day (if (attempt < 2) delay(300)) khong bao gio co co hoi
+  // chay lan thu 2, nen 1 lan HTTP 0 thoang qua la lap tuc bao "MAT KET
+  // NOI MAY CHU" va bat nguoi dung phai quet lai ma.
+  for (int attempt = 1; attempt <= 2; ++attempt) {
     MesHttpSession net;
 
-    if (!net.begin(url, 1200, 2200, 3)) {
+    // Do lac lo: measured server TTFB alone is ~0.6-0.9s on a good link; the
+    // old 1200ms connect / 2200ms request budget leaves almost no margin for
+    // real WiFi/DNS/TCP latency on the device, so scans were timing out for
+    // real (not just the transient "HTTP 0" case above) even on strong WiFi.
+    // Match httpPostJson()'s non-quick budget -- this GET gates the live
+    // scan UX just as much as those POSTs do.
+    if (!net.begin(url, 4000, 6000, 15)) {
       lastStatus = -2;
       lastMessage = "http.begin that bai";
     } else {
@@ -3758,8 +3972,8 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
         bool decoded = decodeResponse(http, status, response, filter);
         net.end();
 
-        if (!decoded){recordServerResult(false);return false;}
-        recordServerResult(status < 500);
+        if (!decoded){if (trackLinkState) recordServerResult(false,false,status,"GET-decode");return false;}
+        if (trackLinkState) recordServerResult(status < 500,false,status,"GET");
         Serial.printf("[GET OK] HTTP=%d json_used=%u heap=%u\n", status,
                       static_cast<unsigned>(response.memoryUsage()),
                       static_cast<unsigned>(ESP.getFreeHeap()));
@@ -3785,7 +3999,7 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
   }
 
   setError(lastStatus, lastMessage.c_str());
-  recordServerResult(false);
+  if (trackLinkState) recordServerResult(false,false,lastStatus,"GET");
   return false;
 }
 
@@ -3795,8 +4009,14 @@ bool httpPostJson(const char* path,
                   bool auth,
                   bool quick,
                   const char* baseOverride) {
-  if (WiFi.status() != WL_CONNECTED) {
-    recordServerResult(false,true);
+  // Same reconnect-window fix as httpGetJson(), with one exception: `quick`
+  // callers (heartbeat, telemetry drain) are deliberately latency-capped and
+  // run unattended in the main loop -- nobody is standing there waiting for
+  // them, so they must keep failing fast rather than spend 3s per attempt.
+  // START/FINISH (quick=false) is an operator-facing action and gets the wait.
+  const bool wifiUp = quick ? (WiFi.status() == WL_CONNECTED) : waitForWifiBriefly();
+  if (!wifiUp) {
+    recordServerResult(false,true,-1,"POST-wifi");
     setError(-1, "WiFi chua ket noi");
     return false;
   }
@@ -3842,8 +4062,8 @@ bool httpPostJson(const char* path,
         bool decoded = decodeResponse(http, status, response);
         net.end();
 
-        if (!decoded){recordServerResult(false);return false;}
-        recordServerResult(status < 500);
+        if (!decoded){recordServerResult(false,false,status,"POST-decode");return false;}
+        recordServerResult(status < 500,false,status,"POST");
         Serial.printf("[GET OK] HTTP=%d json_used=%u heap=%u\n", status,
                       static_cast<unsigned>(response.memoryUsage()),
                       static_cast<unsigned>(ESP.getFreeHeap()));
@@ -3870,7 +4090,7 @@ bool httpPostJson(const char* path,
   }
 
   setError(lastStatus, lastMessage.c_str());
-  recordServerResult(false);
+  recordServerResult(false,false,lastStatus,"POST");
   return false;
 }
 
@@ -3955,7 +4175,18 @@ bool bindKiosk() {
   request["boot_reason"] = String((int)esp_reset_reason());
   request["browser"] = "MESFlow Embedded Kiosk";
 
-  if (!httpPostJson("/api/kiosk/connect", request, response, false)) {
+  // Suppress the UI side effect of httpPostJson()'s own setError(): when bind
+  // is retried mid-flow (rt.bound went false while the kiosk was already on
+  // READY/scanning, not on the boot BINDING screen), an unsuppressed failure
+  // here would flip straight to ERROR_STATE ("MAT KET NOI MAY CHU") and never
+  // get reverted, since the "if (showBindingScreen) setUi(READY)" below only
+  // fires for the boot-time case. Bind failures are background/retryable and
+  // must never hijack whatever screen the operator is currently looking at.
+  const bool previousSuppress = suppressNetworkUiErrors;
+  suppressNetworkUiErrors = true;
+  const bool bindPosted = httpPostJson("/api/kiosk/connect", request, response, false);
+  suppressNetworkUiErrors = previousSuppress;
+  if (!bindPosted) {
     Serial.println("[BIND] That bai; kiosk van vao READY va se thu lai nen.");
     remoteLogf("BIND failed HTTP=%d error=%s", rt.lastHttpStatus, rt.lastError);
     if (showBindingScreen) setUi(UiState::READY);
@@ -4313,7 +4544,17 @@ bool sendHeartbeat() {
 
   if (!net.begin(url, 1500, 2500, 3)) {
     heartbeatFailCount++;
-    if (heartbeatFailCount >= HEARTBEAT_FAILS_TO_OFFLINE) rt.online = false;
+    // BUG (found 2026-08-22): heartbeat used to write rt.online directly with
+    // its own private threshold (HEARTBEAT_FAILS_TO_OFFLINE=3), completely
+    // independent of recordServerResult()'s serverLinkState (2-in-a-row)
+    // that every other API call drives and that the OP/worker-scan online-
+    // vs-offline-cache gate reads. The two trackers fought each other -- one
+    // could mark the link back up while the other still held it down (or vice
+    // versa) -- so the READY screen's title ("MAT KET NOI" is rt.online==
+    // false) and the scan gate could disagree with reality even with an
+    // empty sync queue and a perfectly good connection. Route heartbeat
+    // through the same single source of truth as every other call.
+    recordServerResult(false, true, -2, "HB-begin");
     Serial.println("[heartbeat] http.begin that bai");
     return false;
   }
@@ -4357,7 +4598,7 @@ bool sendHeartbeat() {
 
   if (status >= 200 && status < 300) {
     heartbeatFailCount = 0;
-    rt.online = true;
+    recordServerResult(true);
 
     if (response["server_epoch"].is<uint32_t>()) {
       syncClockFromServer(response["server_epoch"].as<uint32_t>());
@@ -4379,9 +4620,7 @@ bool sendHeartbeat() {
   }
 
   if (heartbeatFailCount < 255) heartbeatFailCount++;
-  if (heartbeatFailCount >= HEARTBEAT_FAILS_TO_OFFLINE) {
-    rt.online = false;
-  }
+  recordServerResult(false, false, status, "HB");
 
   remoteLogf("HEARTBEAT FAIL HTTP=%d count=%u", status, static_cast<unsigned>(heartbeatFailCount));
 
@@ -4486,7 +4725,11 @@ static void checkForOta() {
   DynamicJsonDocument response(1536);
   const bool previousSuppress = suppressNetworkUiErrors;
   suppressNetworkUiErrors = true;
-  const bool checked = httpGetJson(path, response, true, nullptr, otaAgentBase());
+  // trackLinkState=false: the OTA agent is a separate service from the core
+  // MES API and must never affect serverLinkState/rt.online (see the long
+  // comment on httpGetJson()) -- otherwise a device with no OTA CA cert
+  // provisioned yet can never stay "online" long enough to scan.
+  const bool checked = httpGetJson(path, response, true, nullptr, otaAgentBase(), false);
   suppressNetworkUiErrors = previousSuppress;
   if (!checked) {
     otaCheckSucceeded = false;
@@ -4966,6 +5209,30 @@ void handleSerialLine(String line) {
       if (!rt.bound && !bindKiosk()) return;
       clearRuntimeSelection();
       if (!lookupQr(line.c_str(), true)) return;
+    }
+
+    // BUG (found 2026-08-22): the online lookupQr() above trusts ONLY the
+    // server's view of active_session. But START is LOCAL-FIRST -- it's
+    // written to the local offline journal instantly and only synced to the
+    // server after a backoff delay (starts at 5s). If this same worker's
+    // card is re-scanned before that sync lands (very plausible -- scan
+    // worker, scan OP, then immediately re-scan the same worker card to
+    // enter quantity), the server still doesn't know about the session yet,
+    // so rt.activeSessionId stays 0 and the operator gets bounced back to
+    // "scan OP" as if no session exists, even though one was already
+    // durably created. Fall back to the local session record, same as the
+    // offline path already does, before deciding there's really no session.
+    if (rt.activeSessionId == 0) {
+      int si = findOfflineSession(rt.workerQr);
+      if (si >= 0) {
+        OfflineSession& s = offlineSessions[si];
+        rt.activeSessionId = -1;
+        safeCopy(rt.activeGroupId, sizeof(rt.activeGroupId), s.localSessionId);
+        safeCopy(rt.operationQr, sizeof(rt.operationQr), s.operationQr);
+        safeCopy(rt.operationName, sizeof(rt.operationName), s.operationName);
+        rt.hasOperation = true;
+        Serial.println("[KIOSK] Session cuc bo chua sync nhung van con hieu luc.");
+      }
     }
 
     if (rt.activeSessionId != 0) {
@@ -5805,8 +6072,16 @@ void maintainConnection() {
     // prevents FINISH from flashing a Wi-Fi error and restarting the station.
     if (disconnectedFor < WIFI_TRANSIENT_GRACE_MS) return;
 
-    recordServerResult(false,true);
-    if (!wifiLostAt) wifiLostAt = disconnectObservedAt;
+    recordServerResult(false,true,-99,"WIFI");
+    if (!wifiLostAt) {
+      wifiLostAt = disconnectObservedAt;
+      // Count it only once per outage, and only after the transient grace
+      // period above -- a status blip while an HTTP socket closes is not an
+      // outage and must not inflate this counter (that distinction is the
+      // whole reason WIFI_TRANSIENT_GRACE_MS exists).
+      if (wifiDropCount < 65535) wifiDropCount++;
+      lastWifiDropAt = disconnectObservedAt;
+    }
     if (!offlineMode && millis() - wifiLostAt >= OFFLINE_ENTER_AFTER_MS) {
       offlineMode = true;
       Serial.println("[NETWORK] Chuyen sang OFFLINE sau 45 giay mat mang.");
@@ -5826,6 +6101,14 @@ void maintainConnection() {
     return;
   }
 
+  // Close out a confirmed outage exactly once, before wifiLostAt is cleared.
+  if (wifiLostAt) {
+    lastWifiRecoveredAt = millis();
+    const uint32_t outage = lastWifiRecoveredAt - wifiLostAt;
+    if (outage > longestWifiOutageMs) longestWifiOutageMs = outage;
+    Serial.printf("[NETWORK] WiFi tro lai sau %lu ms (lan mat thu %u).\n",
+                  static_cast<unsigned long>(outage), static_cast<unsigned>(wifiDropCount));
+  }
   disconnectObservedAt = 0;
   wifiLostAt = 0;
   if(serverLinkState==ServerLinkState::WIFI_DOWN)serverLinkState=ServerLinkState::UNKNOWN;
@@ -5889,6 +6172,39 @@ void maintainConnection() {
 // Arduino setup/loop
 // ============================================================
 void setup() {
+  // Capture BEFORE anything else can reset it. This is the one fact that
+  // separates "the watchdog below force-rebooted us" (TASK-WDT) from "the
+  // supply sagged when the scanner lit up" (BROWNOUT) from "somebody power
+  // cycled it" (POWERON) -- see the FORENSICS block near wifiDropCount.
+  bootResetReason = esp_reset_reason();
+  bootAtMs = millis();
+
+  // SAFETY NET (found 2026-08-22, round 5): DNS resolution inside
+  // NetworkClient::connect() -> Network.hostByName() -> lwip_getaddrinfo()
+  // is NOT bounded by httpGetJson()/httpPostJson()'s connectTimeoutMs /
+  // requestTimeoutMs at all -- those only start counting after DNS already
+  // resolved. lwIP retries DNS against up to CONFIG_LWIP_DNS_MAX_SERVERS(3)
+  // servers with its own internal backoff, which on a degraded/flaky WiFi
+  // DNS path can genuinely block the single-threaded main loop task for a
+  // long time with zero recovery -- exactly the "quet OP treo >30s, khong
+  // bao gio bao loi" symptom, on the kiosk's real WiFi where this sandbox's
+  // curl tests can't reproduce it (different network path/DNS server).
+  // A full async-DNS-with-hard-deadline rewrite is high-risk to ship
+  // without any way to test it live here, so this is a bounded, standard
+  // ESP-IDF safety net instead: if the main loop stops feeding the task
+  // watchdog for this long (only possible while genuinely stuck inside one
+  // blocking call), the device force-reboots instead of freezing forever.
+  esp_task_wdt_config_t wdtConfig;
+  wdtConfig.timeout_ms = 40000;
+  wdtConfig.idle_core_mask = 0;
+  wdtConfig.trigger_panic = true;
+  if (esp_task_wdt_init(&wdtConfig) == ESP_ERR_INVALID_STATE) {
+    // Already initialized by the framework's own default config; adopt our
+    // timeout instead of erroring out.
+    esp_task_wdt_reconfigure(&wdtConfig);
+  }
+  esp_task_wdt_add(NULL);
+
   Serial.begin(115200);
   pinMode(SCANNER_RX_PIN, INPUT_PULLUP);
   ScannerSerial.setRxBufferSize(1024);
@@ -5897,8 +6213,14 @@ void setup() {
   while (ScannerSerial.available() > 0) ScannerSerial.read();
   delay(800);
   Serial.printf("\n[SERIAL READY] %s - baud 115200\n", APP_VERSION);
-  Serial.printf("[BOOT] reset_reason=%d free_heap=%u\n",
-                static_cast<int>(esp_reset_reason()),
+  // Name it, don't just number it: this line is what somebody reads back
+  // over serial (or photographs) after a field reset, and "reset_reason=6"
+  // means nothing to anyone standing at the machine. 6 = TASK-WDT (the 40s
+  // safety net above fired on a blocked network call), 9 = BROWNOUT (supply
+  // sag), 1 = POWERON (power cut / plug pulled), 3 = SW (our own restart).
+  Serial.printf("[BOOT] reset_reason=%s (%d) free_heap=%u\n",
+                resetReasonName(bootResetReason),
+                static_cast<int>(bootResetReason),
                 static_cast<unsigned>(ESP.getFreeHeap()));
   Serial.printf("[SCANNER READY] UART1 RX=GPIO%d TX=DISABLED baud=%lu 8N1 inverted=NO frame_timeout=%lums\n",
                 SCANNER_RX_PIN,
@@ -6040,6 +6362,7 @@ void setup() {
 
 void loop() {
   lastLoopAliveAt = millis();
+  esp_task_wdt_reset();
 
   // Execute FINISH cleanup in a fresh loop iteration, after the HTTP request
   // and local ArduinoJson documents from syncPendingTransaction() are gone.
