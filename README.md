@@ -174,14 +174,20 @@ Telemetry is queued and sent one event at a time only when no business transacti
 
 ## UART QR scanner — v4.0.16
 
-The firmware now reads a TTL UART scanner from the board P2 connector at 9600 8N1.
+The firmware now reads a TTL UART scanner from the board P2 connector at 115200 8N1.
 
 ```text
-Scanner TX -> ESP RX / GPIO43
-Scanner RX -> ESP TX / GPIO44 (optional)
+Scanner TX -> ESP RX / GPIO44
+Scanner RX -> not connected
 Scanner GND -> GND
 Scanner 5V -> 5V
 ```
+
+(2026-08-30: corrected from a stale 9600 8N1 / GPIO43 note that didn't match
+`SCANNER_RX_PIN`/`SCANNER_BAUD` in `esp/mesflow_app.cpp`. This unit's
+module-side baud measured 115200 via edge-capture + linear regression
+against a USB-Virtual-Serial-Port ground-truth readback, then reconfirmed
+clean, 13/13 frames exact, over the real UART1 peripheral.)
 
 Open USB Serial Monitor at 115200. A successful scan of `WF|EMP|NV002` prints `[SCANNER RX] WF|EMP|NV002` and is passed into the normal kiosk workflow.
 
