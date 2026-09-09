@@ -732,6 +732,31 @@ uint32_t lastOfflineSyncEpoch = 0;
 uint32_t lastCatalogAutoRefreshAt = 0, lastCatalogAutoAttemptAt = 0;
 bool offlineMode = false, fsReady = false, offlineBuffersReady = false;
 char offlineSnapshotRevision[32] = "unknown";
+
+// FORENSICS (2026-09-09): field report "de lau, quet ma lai la bi reset" --
+// the kiosk sits idle, then a scan appears to reboot it. Three different
+// mechanisms can produce that same visible symptom and they need completely
+// different fixes:
+//   1. task-watchdog force-reboot (setup()'s 40s net, armed 2026-08-22 round
+//      5) fired because a blocking network call -- DNS in particular, which
+//      is NOT bounded by our connect/request timeouts -- hung the main loop;
+//   2. brownout: the scanner's illumination LED current spike (plus a WiFi
+//      re-association burst right after idle) sagging a marginal 5V supply;
+//   3. no reboot at all -- WiFi was simply down at that instant, the scan
+//      failed with "WiFi chua ket noi", and the operator had to scan again.
+// esp_reset_reason() tells 1 and 2 apart definitively, and the WiFi outage
+// counters below tell 3 apart from both. All of it was previously only
+// reachable inside a bind/heartbeat payload -- and kiosk_events /
+// kiosk_client_events are empty (0 rows) in every MESFlow database on this
+// host, so in practice nothing was recorded anywhere. Surfaced in
+// buildRemoteStatusText() instead, which the LAN web console and the serial
+// `show` command both dump without needing the server to be reachable at all.
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+uint32_t bootAtMs = 0;
+uint16_t wifiDropCount = 0;          // confirmed outages since boot (post grace period)
+uint32_t lastWifiDropAt = 0;         // millis() of the most recent confirmed outage
+uint32_t lastWifiRecoveredAt = 0;    // millis() when it came back
+uint32_t longestWifiOutageMs = 0;    // worst confirmed outage this boot
 enum class ServerLinkState : uint8_t { UNKNOWN, WIFI_DOWN, UNREACHABLE, AVAILABLE };
 ServerLinkState serverLinkState = ServerLinkState::UNKNOWN;
 uint8_t serverSuccessStreak = 0, serverFailureStreak = 0;
@@ -1894,11 +1919,42 @@ static String maskedToken(const char* token) {
   return t.substring(0, 4) + "..." + t.substring(t.length() - 4);
 }
 
+// Short human-readable esp_reset_reason(). The raw enum int alone is not
+// something anyone reads off a photo correctly under floor conditions.
+static const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "POWERON";     // cold power-up / power cut
+    case ESP_RST_EXT:       return "EXT-PIN";
+    case ESP_RST_SW:        return "SW";          // our own ESP.restart()
+    case ESP_RST_PANIC:     return "PANIC";       // crash (exception/abort)
+    case ESP_RST_INT_WDT:   return "INT-WDT";
+    case ESP_RST_TASK_WDT:  return "TASK-WDT";    // setup()'s 40s safety net fired
+    case ESP_RST_WDT:       return "OTHER-WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";    // supply sagged (scanner LED / WiFi TX spike)
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
 static String buildRemoteStatusText() {
   String out;
-  out.reserve(1400);
+  out.reserve(1600);
   out += "================ MESFLOW STATUS ================\n";
   out += "Firmware : " + String(APP_VERSION) + "\n";
+  // See the FORENSICS block near wifiDropCount: this is the evidence that
+  // separates "the device rebooted" from "the scan just failed", and if it
+  // did reboot, why.
+  out += "Reset    : " + String(resetReasonName(bootResetReason)) + " (" + String((int)bootResetReason) + ")\n";
+  out += "Uptime   : " + String((millis() - bootAtMs) / 1000UL) + " s\n";
+  out += "WiFi drop: " + String(wifiDropCount) + " since boot; longest=" + String(longestWifiOutageMs / 1000UL) + " s";
+  if (lastWifiDropAt) {
+    out += "; last drop " + String((millis() - lastWifiDropAt) / 1000UL) + " s ago";
+    if (lastWifiRecoveredAt >= lastWifiDropAt)
+      out += ", recovered after " + String((lastWifiRecoveredAt - lastWifiDropAt) / 1000UL) + " s";
+    else out += ", STILL DOWN";
+  }
+  out += "\n";
   out += "Device   : " + String(DEVICE_ID) + " (" + String(DEVICE_NAME) + ")\n";
   out += "Station  : " + String(STATION_CODE) + "\n";
   out += "Server   : " + String(rt.online ? "ONLINE" : "OFFLINE") + "\n";
@@ -3833,8 +3889,44 @@ bool decodeResponse(HTTPClient& http, int status, DynamicJsonDocument& response,
 // even though the real MES API was fast and healthy the whole time.
 // trackLinkState=false lets a caller (checkForOta) opt this channel out of
 // the shared connectivity signal entirely.
+// BUG (field report 2026-09-09, "de lau quet ma lai la bi reset"): after the
+// kiosk sits idle, the AP/router can age the association out. ESP-IDF's own
+// auto-reconnect (WiFi.setAutoReconnect(true), set in connectWifi()) starts
+// re-associating within a second or two, and maintainConnection() nudges it
+// again on its own schedule -- but a scan landing inside that window used to
+// fail INSTANTLY on this one status read ("WiFi chua ket noi") and the
+// operator had to scan the card again, which is exactly what "bi reset"
+// looks like from the floor even when the device never rebooted.
+//
+// Wait, briefly and boundedly, for the reconnect already in progress instead
+// of giving up on the first read. Deliberately does NOT call WiFi.begin() or
+// WiFi.reconnect() here: maintainConnection() owns reconnect policy (its own
+// comment explains why calling disconnect/reconnect from inside a request
+// path turns a transient status into a real outage). This only observes.
+//
+// 3s is the budget: well under setup()'s 40s task-watchdog, and the watchdog
+// is fed while waiting so a slow reconnect can never turn this into a reboot.
+static bool waitForWifiBriefly(uint32_t maxWaitMs = 3000) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  const uint32_t started = millis();
+  while (millis() - started < maxWaitMs) {
+    delay(100);
+    esp_task_wdt_reset();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[NETWORK] WiFi tro lai sau %lu ms cho -- khong bat nguoi dung quet lai.\n",
+                    static_cast<unsigned long>(millis() - started));
+      return true;
+    }
+  }
+  return false;
+}
+
 bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = true, JsonDocument* filter = nullptr, const char* baseOverride = nullptr, bool trackLinkState = true) {
-  if (WiFi.status() != WL_CONNECTED) {
+  // Only the operator-facing MES channel waits. trackLinkState=false is, by
+  // construction, the background OTA-agent channel (the only caller passing
+  // it) -- it already fails closed by design on this fleet and must not stall
+  // the main loop for 3s on a WiFi blip nobody is waiting on.
+  if (!(trackLinkState ? waitForWifiBriefly() : (WiFi.status() == WL_CONNECTED))) {
     if (trackLinkState) recordServerResult(false,true,-1,"GET-wifi");
     setError(-1, "WiFi chua ket noi");
     return false;
@@ -3917,7 +4009,13 @@ bool httpPostJson(const char* path,
                   bool auth,
                   bool quick,
                   const char* baseOverride) {
-  if (WiFi.status() != WL_CONNECTED) {
+  // Same reconnect-window fix as httpGetJson(), with one exception: `quick`
+  // callers (heartbeat, telemetry drain) are deliberately latency-capped and
+  // run unattended in the main loop -- nobody is standing there waiting for
+  // them, so they must keep failing fast rather than spend 3s per attempt.
+  // START/FINISH (quick=false) is an operator-facing action and gets the wait.
+  const bool wifiUp = quick ? (WiFi.status() == WL_CONNECTED) : waitForWifiBriefly();
+  if (!wifiUp) {
     recordServerResult(false,true,-1,"POST-wifi");
     setError(-1, "WiFi chua ket noi");
     return false;
@@ -5975,7 +6073,15 @@ void maintainConnection() {
     if (disconnectedFor < WIFI_TRANSIENT_GRACE_MS) return;
 
     recordServerResult(false,true,-99,"WIFI");
-    if (!wifiLostAt) wifiLostAt = disconnectObservedAt;
+    if (!wifiLostAt) {
+      wifiLostAt = disconnectObservedAt;
+      // Count it only once per outage, and only after the transient grace
+      // period above -- a status blip while an HTTP socket closes is not an
+      // outage and must not inflate this counter (that distinction is the
+      // whole reason WIFI_TRANSIENT_GRACE_MS exists).
+      if (wifiDropCount < 65535) wifiDropCount++;
+      lastWifiDropAt = disconnectObservedAt;
+    }
     if (!offlineMode && millis() - wifiLostAt >= OFFLINE_ENTER_AFTER_MS) {
       offlineMode = true;
       Serial.println("[NETWORK] Chuyen sang OFFLINE sau 45 giay mat mang.");
@@ -5995,6 +6101,14 @@ void maintainConnection() {
     return;
   }
 
+  // Close out a confirmed outage exactly once, before wifiLostAt is cleared.
+  if (wifiLostAt) {
+    lastWifiRecoveredAt = millis();
+    const uint32_t outage = lastWifiRecoveredAt - wifiLostAt;
+    if (outage > longestWifiOutageMs) longestWifiOutageMs = outage;
+    Serial.printf("[NETWORK] WiFi tro lai sau %lu ms (lan mat thu %u).\n",
+                  static_cast<unsigned long>(outage), static_cast<unsigned>(wifiDropCount));
+  }
   disconnectObservedAt = 0;
   wifiLostAt = 0;
   if(serverLinkState==ServerLinkState::WIFI_DOWN)serverLinkState=ServerLinkState::UNKNOWN;
@@ -6058,6 +6172,13 @@ void maintainConnection() {
 // Arduino setup/loop
 // ============================================================
 void setup() {
+  // Capture BEFORE anything else can reset it. This is the one fact that
+  // separates "the watchdog below force-rebooted us" (TASK-WDT) from "the
+  // supply sagged when the scanner lit up" (BROWNOUT) from "somebody power
+  // cycled it" (POWERON) -- see the FORENSICS block near wifiDropCount.
+  bootResetReason = esp_reset_reason();
+  bootAtMs = millis();
+
   // SAFETY NET (found 2026-08-22, round 5): DNS resolution inside
   // NetworkClient::connect() -> Network.hostByName() -> lwip_getaddrinfo()
   // is NOT bounded by httpGetJson()/httpPostJson()'s connectTimeoutMs /
@@ -6092,8 +6213,14 @@ void setup() {
   while (ScannerSerial.available() > 0) ScannerSerial.read();
   delay(800);
   Serial.printf("\n[SERIAL READY] %s - baud 115200\n", APP_VERSION);
-  Serial.printf("[BOOT] reset_reason=%d free_heap=%u\n",
-                static_cast<int>(esp_reset_reason()),
+  // Name it, don't just number it: this line is what somebody reads back
+  // over serial (or photographs) after a field reset, and "reset_reason=6"
+  // means nothing to anyone standing at the machine. 6 = TASK-WDT (the 40s
+  // safety net above fired on a blocked network call), 9 = BROWNOUT (supply
+  // sag), 1 = POWERON (power cut / plug pulled), 3 = SW (our own restart).
+  Serial.printf("[BOOT] reset_reason=%s (%d) free_heap=%u\n",
+                resetReasonName(bootResetReason),
+                static_cast<int>(bootResetReason),
                 static_cast<unsigned>(ESP.getFreeHeap()));
   Serial.printf("[SCANNER READY] UART1 RX=GPIO%d TX=DISABLED baud=%lu 8N1 inverted=NO frame_timeout=%lums\n",
                 SCANNER_RX_PIN,
