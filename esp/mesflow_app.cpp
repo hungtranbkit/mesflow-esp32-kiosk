@@ -505,6 +505,7 @@ constexpr char ACTION_QUEUE_PATH[] = "/kiosk_action_queue.jsonl";
 constexpr char ACTION_QUEUE_TMP_PATH[] = "/kiosk_action_queue.tmp";
 constexpr uint16_t ACTION_QUEUE_MAX = 100;
 constexpr uint32_t ACTION_QUEUE_RETRY_MS = 15000;
+constexpr uint32_t ACTION_QUEUE_IDLE_MS = 20000;
 char sessionTraceId[96] = "";
 uint32_t clientEventCounter = 0;
 uint32_t lastActionQueueRetryAt = 0;
@@ -3623,6 +3624,12 @@ bool emitActionEvent(const char* eventType, const char* category,
                      const char* result, int httpStatus,
                      uint32_t durationMs, const char* message,
                      const char* errorCode, const char* inputType) {
+  // Lean telemetry (user, 2026-10-07): routine steps (scanned / accepted /
+  // pending / recovered) are not logged -- production data already goes
+  // through the business API, and every queued event costs a ~1.7 s HTTPS
+  // POST on the UI loop. Only failures and rejections are kept.
+  if (!result || !strcmp(result, "RECEIVED") || !strcmp(result, "SUCCESS") ||
+      !strcmp(result, "PENDING") || !strcmp(result, "RECOVERED")) return true;
   DynamicJsonDocument event(2048);
   char eventId[112]; nextClientEventId(eventId, sizeof(eventId));
   event["client_event_id"] = eventId;
@@ -3660,6 +3667,8 @@ void serviceActionEventQueue() {
   if (uiState == UiState::STARTING || uiState == UiState::FINISHING ||
       uiState == UiState::SYNC_PENDING || uiState == UiState::LOOKUP_WORKER ||
       uiState == UiState::LOOKUP_OPERATION) return;
+  // Only from an idle READY screen, so a scan rarely waits behind a telemetry POST.
+  if (uiState != UiState::READY || millis() - stateEnteredAt < ACTION_QUEUE_IDLE_MS) return;
   if (millis() - lastActionQueueRetryAt < ACTION_QUEUE_RETRY_MS) return;
   lastActionQueueRetryAt = millis();
   if (!LittleFS.exists(ACTION_QUEUE_PATH)) return;
@@ -3729,7 +3738,7 @@ uint32_t maxStateDurationMs(UiState state) {
 
 bool sendKioskEvent(const char* eventType, const char* severity, const char* message,
                     const char* recoveryAction, uint32_t stateAgeMs) {
-  if (!rt.bound || WiFi.status() != WL_CONNECTED) return false;
+  if (!strcmp(eventType, "USER_FORCED_EXIT")) return true;   // '*' cancel is routine
   DynamicJsonDocument request(1536);
   request["device_id"] = DEVICE_ID;
   request["device_name"] = DEVICE_NAME;
@@ -3758,8 +3767,9 @@ bool sendKioskEvent(const char* eventType, const char* severity, const char* mes
   request["recovery_action"] = recoveryAction;
   request["recovery_count"] = stateRecoveryCount;
 
-  DynamicJsonDocument response(256);
-  return httpPostJson("/api/kiosk/events", request, response, true, true);
+  // Queued like telemetry: an inline POST here blocked the scanner for up to 7 s.
+  String payload; serializeJson(request, payload);
+  return enqueueActionPayload(payload);
 }
 
 void recoverUiFromStuck(const char* reason, bool userRequested) {
@@ -4899,7 +4909,7 @@ static void checkForOta() {
   }
   const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? otaRetryIntervalMs() : OTA_CHECK_INTERVAL_MS;
   if (lastOtaCheckAt && millis() - lastOtaCheckAt < interval) return;
-  lastOtaCheckAt = millis(); otaEvent("OTA_CHECK");
+  lastOtaCheckAt = millis();   // no OTA_CHECK event: a POST per poll is noise
   Serial.printf("[OTA] CHECK agent=%s version=%s model=%s\n", otaAgentBase(), FW_VERSION, HW_MODEL);
   char path[320]; snprintf(path, sizeof(path), "/api/esp-ota/check?kiosk_id=%s&current_version=%s&hardware_model=%s",
                            DEVICE_UUID[0] ? DEVICE_UUID : DEVICE_ID, FW_VERSION, HW_MODEL);
@@ -6628,10 +6638,14 @@ void maintainConnection() {
   // for the normal cooldown.  This also covers bind completion after boot.
   if (rt.bound && rt.online && !otaLinkReady) {
     otaLinkReady = true;
-    lastOtaCheckAt = 0;
-    otaCheckSucceeded = false;
-    otaAvailableWaitingIdle = false;
-    Serial.println("[OTA] LINK_READY immediate check scheduled");
+    // A check already in flight (it can go online on another core) counts:
+    // resetting here re-ran the whole check right after it finished.
+    if (!otaCheckTaskRunning) {
+      lastOtaCheckAt = 0;
+      otaCheckSucceeded = false;
+      otaAvailableWaitingIdle = false;
+      Serial.println("[OTA] LINK_READY immediate check scheduled");
+    }
   }
   if (rt.bound && hasPendingTransaction()) {
     if (millis() - lastPendingRetryAt >= PENDING_RETRY_MS) { lastPendingRetryAt = millis(); syncPendingTransaction(false); }

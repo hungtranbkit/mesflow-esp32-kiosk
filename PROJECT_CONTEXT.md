@@ -62,6 +62,9 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   drawWorker/drawStartSuccess call sites. Flashed to both boards (dell bench + kiosk1) 2026-10-07.
 - Employee scan shows the cached name instantly (before /api/lookup, ~1.7 s over HTTPS); idea for later if OP scans
   feel slow too: keep one TLS connection alive (MesHttpSession uses setReuse(false) + a new client per request).
+- Lean telemetry (2026-10-07): only failure/rejection events are logged, system events are queued, the queue is
+  sent only after 20 s idle on READY, no OTA_CHECK event. Remaining loop blockers: heartbeat (20 s, HTTPS) and the
+  6-hourly catalog refresh (~7 s on READY).
 - Bench-test caution: never inject serial input while the user is testing on the device (a stray `*` on READY shows
   "DU LIEU KHONG HOP LE"; two readers on /dev/ttyACM0 steal each other's bytes).
 

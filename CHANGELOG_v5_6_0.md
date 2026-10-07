@@ -84,3 +84,14 @@ re-scan (0 open). All events accepted by `/api/station/events/sync`.
 - On an employee scan the name is drawn at once from the offline worker cache, then the HTTPS `/api/lookup` runs
   (TLS handshake per request, ~1.7 s) and picks the final screen (open OPs / quantity input). Measured on the bench
   board: name at 0.35 s after the scan (was ~2.3 s). Unknown cards still wait for the server.
+
+## Lean telemetry (2026-10-07)
+Background HTTPS calls on the UI loop made a scan wait for seconds. They are now cut down (user: "cơ chế đơn giản, giảm bớt sự kiện log"):
+- `emitActionEvent` drops routine results (RECEIVED / SUCCESS / PENDING / RECOVERED). Only failures and rejections
+  are queued; business data still goes through the MES API.
+- `sendKioskEvent` (STUCK_STATE, ABANDONED_QTY_ENTRY) is queued instead of POSTed inline (that blocked for up to 7 s).
+  `USER_FORCED_EXIT` (a `*` cancel) is not sent at all.
+- The telemetry queue is sent only after READY has been idle for 20 s (`ACTION_QUEUE_IDLE_MS`).
+- OTA: no `OTA_CHECK` event per poll, and LINK_READY no longer re-runs a check that is already in flight (it ran
+  twice back-to-back after boot).
+- Measured on the bench board after boot: heartbeat every 20 s, catalog once, one OTA check, nothing else.
