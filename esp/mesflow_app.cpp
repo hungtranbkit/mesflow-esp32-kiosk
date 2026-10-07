@@ -140,10 +140,27 @@ constexpr uint32_t FINISH_SUCCESS_HOLD_MS = 0; // Finish xong ve QUET THE ngay
 // "WF|EMP|NV002", then reconfirmed clean over the real UART1 peripheral
 // (13/13 frames exact). 9600 (the datasheet's factory default) produced
 // zero bytes on real hardware.
-constexpr uint32_t SCANNER_BAUD = 115200;
+constexpr uint32_t SCANNER_BAUD = 115200;   // compile-time default only
+// The GM65/GM865 baud lives in the MODULE's own EEPROM and differs per unit
+// (one bench unit 115200, another factory 9600). A wrong baud is total
+// silence, not an error. Per-device override in NVS mesflow_cfg/scan_baud,
+// set live with the console command `scanner-baud <baud>` (2026-10-07: the
+// reference board's module is at 9600 -- v2 ran it at 9600 -- and v1's fixed
+// 115200 made the scanner look dead).
+uint32_t scannerBaud = SCANNER_BAUD;
+static bool validScannerBaud(uint32_t b){return b==1200||b==2400||b==4800||b==9600||b==19200||b==38400||b==57600||b==115200;}
 constexpr uint32_t SCANNER_FRAME_TIMEOUT_MS = 50;
 constexpr size_t SCANNER_FRAME_MAX = 256;
 HardwareSerial ScannerSerial(1);
+String applyScannerBaudCommand(const String& arg){
+  const uint32_t b=(uint32_t)arg.toInt();
+  if(!validScannerBaud(b))return "scanner-baud: gia tri khong hop le (1200/2400/4800/9600/19200/38400/57600/115200)\n";
+  Preferences p;p.begin("mesflow_cfg",false);p.putUInt("scan_baud",b);p.end();
+  scannerBaud=b;ScannerSerial.end();ScannerSerial.begin(scannerBaud,SERIAL_8N1,44,-1);
+  while(ScannerSerial.available()>0)ScannerSerial.read();
+  Serial.printf("[SCANNER] baud=%lu (luu NVS)\n",(unsigned long)scannerBaud);
+  return String("scanner-baud => ")+String(scannerBaud)+" (da luu, ap dung ngay)\n";
+}
 static uint8_t scannerFrame[SCANNER_FRAME_MAX] = {0};
 static size_t scannerFrameLength = 0;
 static uint32_t scannerLastByteAt = 0;
@@ -1083,6 +1100,21 @@ void recoverOfflineSessionIntents(){
     }
   }
   if(changed)saveOfflineSessions();
+}
+
+// The append-only log was never compacted: after ~250 START/FINISH cycles the
+// 500-entry ACK scratch overflowed, answered events looked pending again and
+// were resent forever ("BO NHO OFFLINE DAY"), and every loop re-read a growing
+// file. Once EVERYTHING is answered the log carries no information the server
+// does not have, so it is dropped. Open local sessions are kept (their own
+// file); a START re-added at boot by recoverOfflineSessionIntents() is
+// answered "duplicate" by the server (same client_event_id).
+constexpr size_t EVENT_LOG_COMPACT_BYTES = 48U * 1024U;
+void compactEventLogIfDrained(){
+  if(!fsReady||!LittleFS.exists(EVENT_LOG_FILE))return;
+  File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return;const size_t size=f.size();f.close();
+  if(size<EVENT_LOG_COMPACT_BYTES||countPendingOfflineEvents()!=0)return;
+  if(LittleFS.remove(EVENT_LOG_FILE))Serial.printf("[OFFLINE] nhat ky da dong bo het (%u bytes) -> xoa\n",(unsigned)size);
 }
 
 bool readOldestPendingEvent(OfflineLogRecord &out){
@@ -2071,6 +2103,7 @@ static String buildRemoteStatusText() {
     out += "Keypad   : PCF8574T " + String(keypadMappingReady ? "READY" : "NEEDS CALIBRATION") +
            " @ 0x" + String(keypadAddress, HEX) + "\n";
   } else out += "Keypad   : NOT FOUND\n";
+  out += "Scanner  : baud=" + String(scannerBaud) + " bytes=" + String(scannerByteCount) + "\n";
   out += "Queue    : " + String(countPendingOfflineEvents()) + "\n";
   out += "OfflineQ : " + String(countPendingOfflineEvents()) + "\n";
   out += "Cache    : workers=" + String(workerCacheCount) + " operations=" + String(operationCacheCount) + " sessions=" + String(offlineSessionCount) + "\n";
@@ -2148,6 +2181,7 @@ static String executeRemoteCommand(String line, bool& delayedReboot, bool& openS
     return "Da gui vao kiosk nhu may quet: " + payload + "\n" + buildRemoteStatusText();
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); return "Da mo man hinh test cam ung.\n"; }
+  if (cmd.startsWith("scanner-baud")) return cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n";
   if (cmd == "keypad-calibrate confirm" || cmd == "calibrate-keypad confirm") {
     if (!requestRuntimeKeypadCalibration("WEB")) {
       return "Khong the hieu chinh luc nay. Dua kiosk ve READY, dam bao khong co giao dich dang cho va thu lai.\n";
@@ -5088,6 +5122,7 @@ static void consolePrintStatus() {
   Serial.printf("Cache    : workers=%u operations=%u sessions=%u\n",
                 workerCacheCount, operationCacheCount, offlineSessionCount);
   Serial.printf("LittleFS : %s\n", fsReady ? "READY" : "NOT READY");
+  Serial.printf("Scanner  : UART1 GPIO44 baud=%lu bytes=%lu\n", (unsigned long)scannerBaud, (unsigned long)scannerByteCount);
   Serial.printf("Keypad   : %s", !keypadAvailable ? "NOT FOUND" :
                 (keypadMappingReady ? "READY" : "NEEDS CALIBRATION"));
   if (keypadAvailable) Serial.printf(" @ 0x%02X", keypadAddress);
@@ -5253,6 +5288,7 @@ static bool handleConsoleCommand(String line) {
     return true;
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); Serial.println("Da mo test cam ung."); return true; }
+  if (cmd.startsWith("scanner-baud")) { Serial.print(cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n"); return true; }
   if (cmd == "bind") { bindKiosk(); return true; }
   if (cmd == "heartbeat") { sendHeartbeat(); return true; }
   if (cmd == "retry" || cmd == "dongbo") {
@@ -6245,6 +6281,7 @@ void maintainConnection() {
         offlineNextSyncAt=0;
         offlineMode = false;
         Serial.println("[OFFLINE SYNC] Queue da dong bo het; tro lai ONLINE.");
+        compactEventLogIfDrained();
         if (uiState == UiState::READY) drawReady(0);
       }
     }
@@ -6305,7 +6342,12 @@ void setup() {
   Serial.begin(115200);
   pinMode(SCANNER_RX_PIN, INPUT_PULLUP);
   ScannerSerial.setRxBufferSize(1024);
-  ScannerSerial.begin(SCANNER_BAUD, SERIAL_8N1, SCANNER_RX_PIN, -1);
+  {
+    Preferences p; p.begin("mesflow_cfg", true);
+    const uint32_t stored = p.getUInt("scan_baud", 0); p.end();
+    if (validScannerBaud(stored)) scannerBaud = stored;
+  }
+  ScannerSerial.begin(scannerBaud, SERIAL_8N1, SCANNER_RX_PIN, -1);
   delay(100);
   while (ScannerSerial.available() > 0) ScannerSerial.read();
   delay(800);
@@ -6321,7 +6363,7 @@ void setup() {
                 static_cast<unsigned>(ESP.getFreeHeap()));
   Serial.printf("[SCANNER READY] UART1 RX=GPIO%d TX=DISABLED baud=%lu 8N1 inverted=NO frame_timeout=%lums\n",
                 SCANNER_RX_PIN,
-                static_cast<unsigned long>(SCANNER_BAUD),
+                static_cast<unsigned long>(scannerBaud),
                 static_cast<unsigned long>(SCANNER_FRAME_TIMEOUT_MS));
   Serial.println("[SCANNER WIRING] GM865 TX -> ESP GPIO44/RX; GM865 RX de trong; GND chung; VCC 5V.");
 
@@ -6403,7 +6445,7 @@ void setup() {
   emitActionEvent("KIOSK_BOOT", "SYSTEM", "SUCCESS");
   if (!fsReady) Serial.println("[OFFLINE] LittleFS mount FAIL; offline mode disabled.");
   else if (!offlineBuffersReady) Serial.println("[OFFLINE] PSRAM buffers unavailable; online mode only.");
-  else { loadOfflineStorage(); recoverOfflineSessionIntents(); }
+  else { loadOfflineStorage(); recoverOfflineSessionIntents(); compactEventLogIfDrained(); }
   loadPendingTransaction();
 
   if (storedToken.length() && storedStation == STATION_CODE) {

@@ -27,3 +27,11 @@
 START OP1 → re-scan (1 open, quantity) → scan OP2 on the quantity screen (2nd START) → re-scan (2 open, list) →
 scan OP1 → 7/0 → finish → OP1 CLOSED good=7, OP2 OPEN → re-scan (1 open) → `WF|OPID|2` → 3/0 → OP2 CLOSED good=3 →
 re-scan (0 open). All events accepted by `/api/station/events/sync`.
+
+## Scanner baud per device + log compaction (same release)
+- **Scanner baud is per unit** (the GM65/GM865 keeps it in its own EEPROM; a wrong baud = total silence). New NVS
+  `mesflow_cfg/scan_baud`, set live with the console command `scanner-baud <baud>` (serial or LAN console;
+  allow-list 1200…115200); default stays 115200. The reference board's module is at **9600** (v2 ran it at 9600) —
+  that is why the scanner "stopped scanning" after going back to v1. `status` now prints `Scanner: baud=… bytes=…`.
+- **Event log compaction**: once every event is answered and the log is ≥ 48 KB it is deleted (on queue drain and
+  at boot). Fixes the ~250-cycle ACK-scratch overflow (old events resent forever / "BO NHO OFFLINE DAY").

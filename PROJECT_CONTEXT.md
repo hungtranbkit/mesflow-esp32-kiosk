@@ -48,12 +48,21 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   LAN console (port 17892) incl. factory-reset; device_secret over plain HTTP. No QC / pause / setup-skip-qty
   (web kiosk: SETUP skips the quantity screens).
 
+## Scanner + peripherals (2026-10-07)
+- Scanner silent after the v1 flash: the module is at **9600** baud (v2's default), v1 hard-coded 115200. Now
+  per-device NVS `mesflow_cfg/scan_baud` + console `scanner-baud <baud>`; the bench board is set to 9600 (persists).
+  A physical scan has NOT been confirmed yet (0 bytes during a 2-minute watch — nobody scanned or a cable issue).
+- I2C bus (SDA16/SCL15) answers only at 0x18: **touch FT6336G (0x38) and keypad PCF8574T (0x20–0x27) not found**
+  → check the peripheral cable/power; without the keypad quantities cannot be typed on the device.
+- Event log compaction added (≥ 48 KB and fully answered → deleted).
+
 ## Known gaps / next
 - The transient `ui_state=ERROR` (08:02:31) matched background-sync `setError` calls hijacking the screen
   (audit finding) — now logged only (v5.6.0). DEV does have catalog data (27 workers / 319 operations).
 - Feature audit vs Kiosk Web done (2026-10-07): web kiosk F1–F12 incl. multi-OP, SETUP skips quantities, error
   screen with server message/action, version auto-reload; ESP lacked multi-OP (done in 5.6.0). Remaining gaps to
-  consider, keeping the ESP lean: SETUP operations should skip the quantity screens (server zeroes quantities);
-  event-log compaction; LAN console auth.
+  consider, keeping the ESP lean: SETUP operations should skip the quantity screens — needs the server to return
+  `operation_type` in `/api/lookup` + `active_sessions` (cross-project); LAN console auth (the provision token is
+  broadcast over UDP, so it protects nothing — decide with the deploy-agent owners).
 - To roll back to v2: rebuild `../mesflow-kiosk-runtime-v2` (`scripts/build-dev.sh`) and flash; its NVS keys
   (`kiosk_v2`, `kiosk_identity`) are in the backup above.
