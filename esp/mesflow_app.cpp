@@ -1187,6 +1187,31 @@ bool eventAnswered(const char* eventId){
   while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){if(validObject(r)&&(r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&!strcmp(r.eventId,eventId)){f.close();return true;}}
   f.close();return false;
 }
+// Same as findOfflineSessionFor, but also matches a session started with the
+// other label of the same operation (WF|OPID|<id> vs the server's operation_qr).
+int findOfflineSessionForOp(const char* workerQr,const char* opQr,int opId){
+  const int byQr=findOfflineSessionFor(workerQr,opQr);if(byQr>=0||opId<=0)return byQr;
+  for(uint16_t i=0;i<offlineSessionCount;i++)if(!strcmp(offlineSessions[i].workerQr,workerQr)&&operationIdFromQr(offlineSessions[i].operationQr)==opId)return i;
+  return -1;
+}
+// A FINISH saved here that the server has not answered yet: the server still
+// lists that session as open, but the worker already closed it on this kiosk.
+// Only the log is scanned, and only while something is pending.
+bool finishPendingFor(const char* workerQr,const char* opQr,int opId){
+  if(!fsReady||!offlineBuffersReady||countPendingOfflineEvents()==0)return false;
+  File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return false;OfflineLogRecord r;uint16_t ackCount=0;
+  while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r))if(validObject(r)&&(r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&ackCount<offlineAckCapacity)safeCopy(offlineAckScratch[ackCount++],64,r.eventId);
+  f.seek(0);
+  while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){
+    if(!validObject(r)||r.recordType!=(uint8_t)LogRecordType::EVENT||r.eventType!=(uint8_t)OfflineEventType::FINISH)continue;
+    if(strcmp(r.workerQr,workerQr))continue;
+    const bool sameOp=(opQr&&opQr[0]&&!strcmp(r.operationQr,opQr))||(opId>0&&operationIdFromQr(r.operationQr)==opId);
+    if(!sameOp)continue;
+    bool answered=false;for(uint16_t i=0;i<ackCount;i++)if(!strcmp(offlineAckScratch[i],r.eventId)){answered=true;break;}
+    if(!answered){f.close();return true;}
+  }
+  f.close();return false;
+}
 void removeOfflineSessionAt(uint16_t si){for(uint16_t i=si+1;i<offlineSessionCount;i++)offlineSessions[i-1]=offlineSessions[i];offlineSessionCount--;}
 // Local sessions of this worker that the list does not have yet. Online
 // (serverKnown=true): only STARTs the server has not answered -- an answered
@@ -1203,7 +1228,7 @@ void mergeLocalOpenOps(const char* workerQr,bool serverKnown){
       continue;
     }
     if(findOpenOp(s.operationQr)>=0)continue;
-    OpenOp o;o.sessionId=-1;safeCopy(o.localId,sizeof(o.localId),s.localSessionId);safeCopy(o.opQr,sizeof(o.opQr),s.operationQr);safeCopy(o.opName,sizeof(o.opName),s.operationName);
+    OpenOp o;o.sessionId=-1;o.operationId=operationIdFromQr(s.operationQr);safeCopy(o.localId,sizeof(o.localId),s.localSessionId);safeCopy(o.opQr,sizeof(o.opQr),s.operationQr);safeCopy(o.opName,sizeof(o.opName),s.operationName);
     addOpenOp(o);
   }
   if(changed)saveOfflineSessions();
@@ -4650,6 +4675,10 @@ bool lookupQr(const char* qr, bool expectingWorker) {
       if (o.sessionId <= 0) return;
       o.operationId = s["operation_id"] | 0;
       safeCopy(o.opQr, sizeof(o.opQr), s["operation_qr"] | "");
+      if (finishPendingFor(rt.workerQr, o.opQr, o.operationId)) {
+        Serial.printf("[MULTI-OP] session %d da ket thuc tren may, cho dong bo -> an\n", o.sessionId);
+        return;
+      }
       safeCopy(o.opName, sizeof(o.opName), s["operation_name"] | "Cong doan dang mo");
       safeCopy(o.po, sizeof(o.po), s["po"] | "");
       safeCopy(o.part, sizeof(o.part), s["part"] | "");
@@ -4825,7 +4854,7 @@ bool finishSession() {
     setError(-30,"KHÔNG LƯU ĐƯỢC - BÁO QUẢN LÝ");return false;
   }
   {
-    int si=findOfflineSessionFor(rt.workerQr,rt.operationQr);
+    int si=findOfflineSessionForOp(rt.workerQr,rt.operationQr,rt.operationId);
     if(si>=0&&!offlineSessions[si].finishPending){removeOfflineSessionAt(si);saveOfflineSessions();}
   }
   Serial.printf("[OFFLINE] local-first FINISH event=%s pending=%u\n",eventId,countPendingOfflineEvents());
@@ -5622,7 +5651,10 @@ void handleSerialLine(String line) {
     beginSessionTrace();
     emitActionEvent("EMPLOYEE_SCANNED", "USER_ACTION", "RECEIVED");
     Serial.printf("[SCAN EMP] %s\n", line.c_str());
-    if (offlineMode || WiFi.status() != WL_CONNECTED || serverLinkState==ServerLinkState::UNREACHABLE || serverLinkState==ServerLinkState::WIFI_DOWN) {
+    // Only a real link problem forces the cache. A non-empty offline queue does
+    // not: lookupQr merges unsynced local STARTs and hides sessions with an
+    // unsynced local FINISH, and sessions opened elsewhere stay visible.
+    if (WiFi.status() != WL_CONNECTED || serverLinkState==ServerLinkState::UNREACHABLE || serverLinkState==ServerLinkState::WIFI_DOWN) {
       offlineMode = true;
       if (!offlineLookupWorker(line.c_str())) return;
     } else {
@@ -7008,6 +7040,12 @@ void setup() {
   allocateOfflineBuffers();
   fsReady = LittleFS.begin(true);
   esp_task_wdt_reset();
+  // The action queue is rewritten as tmp -> remove -> rename. Power lost in
+  // between leaves only the complete tmp file: take it back.
+  if (fsReady && LittleFS.exists(ACTION_QUEUE_TMP_PATH)) {
+    if (!LittleFS.exists(ACTION_QUEUE_PATH)) LittleFS.rename(ACTION_QUEUE_TMP_PATH, ACTION_QUEUE_PATH);
+    else LittleFS.remove(ACTION_QUEUE_TMP_PATH);
+  }
   prefs.begin("mesflow", true);
   clientEventCounter = prefs.getULong("evt_counter", 0);
   safeCopy(offlineSnapshotRevision,sizeof(offlineSnapshotRevision),prefs.getString("snap_rev","unknown").c_str());

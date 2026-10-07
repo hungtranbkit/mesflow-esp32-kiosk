@@ -147,3 +147,21 @@ Two read-only audits (blocking paths, logic) of `esp/mesflow_app.cpp`; confirmed
   - (c) The action-queue rewrite is remove+rename (power loss in between drops telemetry).
   - (d) DNS has no timeout.
   - (e) UI-path `delay()`s (1.8 s "ĐÃ LƯU TẠM" holds) drop key presses.
+
+## Audit follow-ups (2026-10-07)
+- (a) A worker lookup asks the server whenever the link is up, even while the offline queue still holds events.
+  Before, any queued event forced the cache-only path, so sessions opened on the web or another kiosk were invisible
+  for 5 s after every START, or for good while one event kept failing. Two rules keep the list right:
+  - `lookupQr` hides a server session that has an unanswered local FINISH (`finishPendingFor`: worker + operation
+    QR or OPID). The server still lists it until that FINISH syncs.
+  - It still merges unsynced local STARTs.
+  - OP scans keep the local-first/offline START path while events are queued, so the server sees events in order.
+- (b) Local sessions started with `WF|OPID|<id>` carry that operation id in the open-OP list, and an online FINISH
+  removes the local record by QR or by OPID (`findOfflineSessionForOp`). Not covered: `WF|OP|X` vs
+  `WF|OPID|<id>` for the same operation while offline, because the catalog cache has no operation ids.
+- (c) Boot recovers the action queue after a power loss between remove and rename: the complete tmp file is kept.
+- (d) DNS: not changed. lwIP DNS is bounded by its retry count, and the watchdog is now fed before each request.
+- (e) The 0.9–1.8 s "ĐÃ LƯU TẠM" / "ĐÃ GHI NHẬN" holds: not changed. Scanner bytes are buffered (1 KB) and handled
+  after the hold; a key press during the hold has no meaning there.
+- Verified on the bench board: boot, scan -> name 0.2 s / lookup 0.35 s, `key *` cancel. kiosk1 flashed, bound,
+  keypad kept. The pending-queue lookup path was not exercised live: it would need real START/FINISH on mesflow.net.

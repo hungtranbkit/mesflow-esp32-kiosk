@@ -69,9 +69,10 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   timeout 8 s (core default 120 s caused freeze-then-WDT-reset). Idle heap is ~45 KB lower (162 KB), min ~78 KB.
   A passive serial logger may be running on dell: `/home/dell/aigw-probe/longlog.py` (pid in longlog.pid),
   writing esp-dell-serial.log; stop it before flashing (two readers break esptool).
-- Audit 2026-10-07 (see CHANGELOG "Audit fixes"): open design follow-ups: (a) offline-queue-pending forces
-  cache-only worker lookups, (b) WF|OP vs WF|OPID matching for local sessions, (c) action-queue remove+rename,
-  (d) no DNS timeout, (e) blocking UI delay()s. Serial `*` is NOT a cancel (use `key *`); keypad `*` is.
+- Audit 2026-10-07 (CHANGELOG "Audit fixes" + "Audit follow-ups"): worker lookups now go online even with a
+  pending offline queue (server sessions with an unanswered local FINISH are hidden via finishPendingFor); still open:
+  WF|OP vs WF|OPID matching while OFFLINE (catalog has no op ids). The pending-queue path is untested live.
+  Serial `*` is NOT a cancel (use `key *`); keypad `*` is.
 - Bench-test caution: never inject serial input while the user is testing on the device (a stray `*` on READY shows
   "DU LIEU KHONG HOP LE"; two readers on /dev/ttyACM0 steal each other's bytes).
 
