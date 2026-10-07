@@ -77,6 +77,8 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   shared/NAT 10.42.0.0/24, ESP got 10.42.0.98, RSSI -42), fallback KIMEXVN-OFFICE (auto-switch after a 45 s outage,
   back to the primary via a 10-min scan). PC sudo needs a password (kiosk1 user). Hotspot password:
   ~/esp-backups/kiosk1-esp/provision/hotspot.json (0600).
+- Wi-Fi networks (2026-10-07): kiosk1 ESP 1=KIOSK1-ESP 2=KIMEXVN-OFFICE; dell bench ESP 1=Airport 2=KIOSK1-ESP
+  3=KIMEXVN-OFFICE (set with serial `wifi-set`, never echoed). Failover verified on kiosk1 (57 s -> OFFICE).
 - Bench-test caution: never inject serial input while the user is testing on the device (a stray `*` on READY shows
   "DU LIEU KHONG HOP LE"; two readers on /dev/ttyACM0 steal each other's bytes).
 

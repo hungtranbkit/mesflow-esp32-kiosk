@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_wifi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -64,11 +65,14 @@ using PsramJsonDocument = BasicJsonDocument<PsramJsonAllocator>;
 // phone setup or LAN provisioning from MESFlow Admin Center.
 char WIFI_SSID[33]       = "panda";
 char WIFI_PASSWORD[65]   = "12345678a";
-// Optional second network (NVS wifi_ssid2/wifi_pass2), e.g. the office Wi-Fi
-// behind a hotspot on the kiosk PC: used when the primary is gone for a while.
+// Up to two more known networks (NVS wifi_ssid2/3, wifi_pass2/3), in priority
+// order after the primary: e.g. another area's Wi-Fi, so a kiosk moved there
+// connects without setup, or the office Wi-Fi behind a kiosk-PC hotspot.
 char WIFI_SSID2[33]      = "";
 char WIFI_PASSWORD2[65]  = "";
-bool wifiOnFallback = false;
+char WIFI_SSID3[33]      = "";
+char WIFI_PASSWORD3[65]  = "";
+int8_t wifiSlot = 0;     // 0 = primary, 1/2 = WIFI_SSID2/3
 char SERVER_BASE[192]    = "";  // Bat buoc cau hinh qua Setup Portal/NVS; khong co fallback hardcode
 // Deploy Agent is the OTA control plane. NVS/maintenance can override this
 // per environment, but a fresh kiosk is immediately OTA-capable by default.
@@ -388,6 +392,7 @@ inline bool onUiLoopTask() { return !uiLoopTask || xTaskGetCurrentTaskHandle() =
 constexpr uint32_t WORKER_IDLE_RELEASE_MS = 90000;
 constexpr uint32_t WIFI_SWITCH_AFTER_MS = 45000;
 constexpr uint32_t WIFI_PRIMARY_RECHECK_MS = 10UL * 60UL * 1000UL;
+constexpr int32_t WIFI_GOOD_RSSI = -70;
 constexpr uint32_t KEEPALIVE_IDLE_MS = 45000;      // heartbeat every 20 s keeps the link warm
 constexpr unsigned long TLS_HANDSHAKE_TIMEOUT_S = 8;
 class MesHttpSession {
@@ -1982,10 +1987,14 @@ bool loadDeviceConfig() {
   String station = prefs.getString("station", STATION_CODE);
   String ssid2 = prefs.getString("wifi_ssid2", "");
   String pass2 = prefs.getString("wifi_pass2", "");
+  String ssid3 = prefs.getString("wifi_ssid3", "");
+  String pass3 = prefs.getString("wifi_pass3", "");
   prefs.end();
 
   copyConfigValue(WIFI_SSID2, sizeof(WIFI_SSID2), ssid2);
   copyConfigValue(WIFI_PASSWORD2, sizeof(WIFI_PASSWORD2), pass2);
+  copyConfigValue(WIFI_SSID3, sizeof(WIFI_SSID3), ssid3);
+  copyConfigValue(WIFI_PASSWORD3, sizeof(WIFI_PASSWORD3), pass3);
   copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
   copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), pass);
   copyConfigValue(SERVER_BASE, sizeof(SERVER_BASE), server);
@@ -2003,6 +2012,8 @@ bool saveDeviceConfig() {
   prefs.putString("wifi_pass", WIFI_PASSWORD); // empty password is valid for open Wi-Fi
   prefs.putString("wifi_ssid2", WIFI_SSID2);
   prefs.putString("wifi_pass2", WIFI_PASSWORD2);
+  prefs.putString("wifi_ssid3", WIFI_SSID3);
+  prefs.putString("wifi_pass3", WIFI_PASSWORD3);
   if (!SERVER_BASE[0]) { prefs.end(); return false; }
   ok &= prefs.putString("server", SERVER_BASE) > 0;
   ok &= prefs.putString("ota_agent", OTA_AGENT_BASE) > 0;
@@ -4511,26 +4522,72 @@ void urlEncode(const char* input, char* output, size_t outputSize) {
 // ============================================================
 // API operations
 // ============================================================
+static const char* wifiSlotSsid(int8_t i) { return i == 0 ? WIFI_SSID : i == 1 ? WIFI_SSID2 : WIFI_SSID3; }
+static const char* wifiSlotPass(int8_t i) { return i == 0 ? WIFI_PASSWORD : i == 1 ? WIFI_PASSWORD2 : WIFI_PASSWORD3; }
+static bool wifiExtraNetworks() { return WIFI_SSID2[0] || WIFI_SSID3[0]; }
+uint32_t wifiPreferredCheckAt = 0;   // next "better network?" scan not before 10 min after this
+static bool wifiDriverSsidIs(const char* ssid) {
+  wifi_config_t conf;
+  return esp_wifi_get_config(WIFI_IF_STA, &conf) == ESP_OK && !strncmp(reinterpret_cast<const char*>(conf.sta.ssid), ssid, 32);
+}
+static void wifiBeginSlot(int8_t slot) {
+  wifiSlot = slot;
+  wifiPreferredCheckAt = millis();
+  mesKeepAlive.drop();
+  Serial.printf("[NETWORK] Ket noi WiFi %s (uu tien %d)\n", wifiSlotSsid(slot), slot + 1);
+  // While the driver is still (auto-)connecting, setting a new config is
+  // refused silently and it keeps the old network: stop that attempt first,
+  // then check the driver really took the new SSID.
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    WiFi.disconnect(false, false);
+    delay(150);
+    WiFi.begin(wifiSlotSsid(slot), wifiSlotPass(slot));
+    if (wifiDriverSsidIs(wifiSlotSsid(slot))) return;
+    delay(500);
+  }
+  Serial.printf("[NETWORK] Driver khong nhan cau hinh %s\n", wifiSlotSsid(slot));
+}
+// After any (re)connect, trust the driver over our bookkeeping.
+static void wifiSyncSlotFromDriver() {
+  const String now = WiFi.SSID();
+  for (int8_t k = 0; k < 3; k++) if (wifiSlotSsid(k)[0] && now == wifiSlotSsid(k)) { wifiSlot = k; return; }
+}
+// From finished scan results: the first known network in priority order that
+// is in good range, else the strongest known one; -1 when none is visible.
+static int8_t pickKnownNetwork(int16_t n) {
+  int32_t best[3] = {-127, -127, -127};
+  for (int16_t i = 0; i < n; i++)
+    for (int8_t k = 0; k < 3; k++)
+      if (wifiSlotSsid(k)[0] && WiFi.SSID(i) == wifiSlotSsid(k) && WiFi.RSSI(i) > best[k]) best[k] = WiFi.RSSI(i);
+  for (int8_t k = 0; k < 3; k++) if (best[k] >= WIFI_GOOD_RSSI) return k;
+  int8_t pick = -1;
+  for (int8_t k = 0; k < 3; k++) if (best[k] > -127 && (pick < 0 || best[k] > best[pick])) pick = k;
+  return pick;
+}
+
 bool connectWifi() {
   setUi(UiState::WIFI);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
-  wifiOnFallback = false;
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  uint32_t started = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
-    delay(250);
+  // With extra networks configured, scan once and start with the best one
+  // here; then try the others in priority order.
+  int8_t first = 0;
+  if (wifiExtraNetworks()) {
+    const int16_t n = WiFi.scanNetworks(false, true);
     esp_task_wdt_reset();
+    const int8_t pick = n > 0 ? pickKnownNetwork(n) : -1;
+    WiFi.scanDelete();
+    if (pick >= 0) first = pick;
   }
-  if (WiFi.status() != WL_CONNECTED && WIFI_SSID2[0]) {
-    Serial.printf("[NETWORK] Khong vao duoc %s -> thu mang du phong %s\n", WIFI_SSID, WIFI_SSID2);
-    wifiOnFallback = true;
-    WiFi.begin(WIFI_SSID2, WIFI_PASSWORD2);
+  uint32_t started = 0;
+  for (int8_t k = 0; k < 3 && WiFi.status() != WL_CONNECTED; ++k) {
+    const int8_t slot = k == 0 ? first : (k <= first ? k - 1 : k);
+    if (!wifiSlotSsid(slot)[0]) continue;
+    wifiBeginSlot(slot);
     started = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
+    while (WiFi.status() != WL_CONNECTED && millis() - started < (k == 0 ? 20000UL : 15000UL)) {
       delay(250);
       esp_task_wdt_reset();
     }
@@ -4543,7 +4600,8 @@ bool connectWifi() {
   }
 
   rt.online = true;
-  Serial.printf("WiFi OK. IP=%s RSSI=%d dBm\n",
+  wifiSyncSlotFromDriver();
+  Serial.printf("WiFi OK. SSID=%s IP=%s RSSI=%d dBm\n", WiFi.SSID().c_str(),
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   return true;
 }
@@ -5392,7 +5450,8 @@ static void consolePrintStatus() {
   Serial.printf("Server   : %s\n", SERVER_BASE);
   Serial.printf("WiFi     : %s\n", WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
   Serial.printf("SSID     : %s\n", WIFI_SSID[0] ? WIFI_SSID : "<NOT SET>");
-  Serial.printf("WiFi2    : %s%s\n", WIFI_SSID2[0] ? WIFI_SSID2 : "<none>", wifiOnFallback ? " (DANG DUNG)" : "");
+  Serial.printf("WiFi 1/2/3: %s | %s | %s  (dang dung: %d)\n", WIFI_SSID, WIFI_SSID2[0] ? WIFI_SSID2 : "-",
+                WIFI_SSID3[0] ? WIFI_SSID3 : "-", wifiSlot + 1);
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("IP       : %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("RSSI     : %d dBm\n", WiFi.RSSI());
@@ -5604,6 +5663,15 @@ static bool handleConsoleCommand(String line) {
   // Serial-only: set the Wi-Fi networks (primary + optional fallback), then restart.
   //   wifi-set {"ssid":"KIOSK1-ESP","password":"...","fallback_ssid":"OFFICE","fallback_password":"..."}
   // "fallback_ssid":"" clears the fallback; omitting it keeps the current one.
+  if (cmd == "wifi-scan") {   // ~3 s blocking scan; for choosing a fallback network
+    const int16_t n = WiFi.scanNetworks(false, true);
+    Serial.printf("[WIFI-SCAN] %d mang (2.4 GHz)\n", n);
+    for (int16_t i = 0; i < n; i++)
+      Serial.printf("[WIFI-SCAN] %-32s RSSI %4ld ch %2ld%s\n", WiFi.SSID(i).c_str(), (long)WiFi.RSSI(i), (long)WiFi.channel(i),
+                    WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? " OPEN" : "");
+    WiFi.scanDelete();
+    return true;
+  }
   if (cmd.startsWith("wifi-set ")) {
     DynamicJsonDocument doc(512);
     if (deserializeJson(doc, line.substring(9))) { Serial.println("[WIFI-SET] JSON khong hop le."); return true; }
@@ -5617,10 +5685,17 @@ static bool handleConsoleCommand(String line) {
       copyConfigValue(WIFI_SSID2, sizeof(WIFI_SSID2), ssid2);
       copyConfigValue(WIFI_PASSWORD2, sizeof(WIFI_PASSWORD2), pass2);
     }
+    if (doc.containsKey("fallback2_ssid")) {
+      String ssid3 = doc["fallback2_ssid"] | ""; String pass3 = doc["fallback2_password"] | "";
+      if (ssid3.length() >= sizeof(WIFI_SSID3) || pass3.length() >= sizeof(WIFI_PASSWORD3)) { Serial.println("[WIFI-SET] Tu choi: fallback2 qua dai."); return true; }
+      copyConfigValue(WIFI_SSID3, sizeof(WIFI_SSID3), ssid3);
+      copyConfigValue(WIFI_PASSWORD3, sizeof(WIFI_PASSWORD3), pass3);
+    }
     copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
     copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), pass);
     if (!saveDeviceConfig()) { Serial.println("[WIFI-SET] Khong ghi duoc NVS."); return true; }
-    Serial.printf("[WIFI-SET] OK primary=%s fallback=%s -> khoi dong lai de ap dung.\n", WIFI_SSID, WIFI_SSID2[0] ? WIFI_SSID2 : "<none>");
+    Serial.printf("[WIFI-SET] OK 1=%s 2=%s 3=%s -> khoi dong lai de ap dung.\n", WIFI_SSID,
+                  WIFI_SSID2[0] ? WIFI_SSID2 : "<none>", WIFI_SSID3[0] ? WIFI_SSID3 : "<none>");
     return true;
   }
   if (cmd.startsWith("provision ")) {
@@ -6824,16 +6899,15 @@ void serviceKeypad() {
   }
 }
 
-// On the fallback network, look for the primary every 10 min (async scan, only
-// on an idle READY screen) and move back when it is in good range.
-static void serviceWifiReturnToPrimary() {
-  static uint32_t lastScanAt = 0;
+// On a lower-priority network, look for a better one every 10 min (async
+// scan, only on an idle READY screen) and move when it is in good range.
+static void serviceWifiPreferredNetwork() {
   static bool scanning = false;
-  if (!wifiOnFallback || !WIFI_SSID2[0]) { scanning = false; return; }
+  if (wifiSlot == 0 || !wifiExtraNetworks()) { scanning = false; return; }
   if (!scanning) {
     if (uiState != UiState::READY || millis() - stateEnteredAt < 20000 || hasPendingTransaction()) return;
-    if (lastScanAt && millis() - lastScanAt < WIFI_PRIMARY_RECHECK_MS) return;
-    lastScanAt = millis();
+    if (millis() - wifiPreferredCheckAt < WIFI_PRIMARY_RECHECK_MS) return;
+    wifiPreferredCheckAt = millis();
     if (WiFi.scanNetworks(true) == WIFI_SCAN_FAILED) return;
     scanning = true;
     return;
@@ -6841,15 +6915,12 @@ static void serviceWifiReturnToPrimary() {
   const int16_t n = WiFi.scanComplete();
   if (n == WIFI_SCAN_RUNNING) return;
   scanning = false;
-  int32_t best = -127;
-  for (int16_t i = 0; i < n; i++) if (WiFi.SSID(i) == WIFI_SSID && WiFi.RSSI(i) > best) best = WiFi.RSSI(i);
+  const int8_t pick = n > 0 ? pickKnownNetwork(n) : -1;
   WiFi.scanDelete();
-  if (best < -70) return;
+  if (pick < 0 || pick >= wifiSlot) return;   // pickKnownNetwork only prefers a higher slot when it is in good range
   if (uiState != UiState::READY || hasPendingTransaction()) return;
-  Serial.printf("[NETWORK] Mang chinh %s da co lai (RSSI %ld) -> quay lai\n", WIFI_SSID, static_cast<long>(best));
-  mesKeepAlive.drop();
-  wifiOnFallback = false;
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("[NETWORK] Mang uu tien hon %s da co lai -> chuyen\n", wifiSlotSsid(pick));
+  wifiBeginSlot(pick);
 }
 
 void maintainConnection() {
@@ -6892,13 +6963,18 @@ void maintainConnection() {
       // With a second network configured, a 45 s outage switches to the other
       // one (e.g. the kiosk PC hotspot is off -> office Wi-Fi, and back).
       static uint32_t lastSsidSwitchAt = 0;
-      if (WIFI_SSID2[0] && disconnectedFor >= WIFI_SWITCH_AFTER_MS &&
+      if (wifiExtraNetworks() && disconnectedFor >= WIFI_SWITCH_AFTER_MS &&
           (!lastSsidSwitchAt || millis() - lastSsidSwitchAt >= WIFI_SWITCH_AFTER_MS)) {
         lastSsidSwitchAt = millis();
-        wifiOnFallback = !wifiOnFallback;
-        Serial.printf("[NETWORK] WiFi mat %lu ms -> chuyen sang %s\n", static_cast<unsigned long>(disconnectedFor),
-                      wifiOnFallback ? WIFI_SSID2 : WIFI_SSID);
-        if (wifiOnFallback) WiFi.begin(WIFI_SSID2, WIFI_PASSWORD2); else WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        // Already offline: a ~3 s scan here costs nothing. Pick the best known
+        // network in range; if the scan fails, rotate to the next one.
+        const int16_t n = WiFi.scanNetworks(false, true);
+        esp_task_wdt_reset();
+        int8_t pick = n > 0 ? pickKnownNetwork(n) : -1;
+        WiFi.scanDelete();
+        if (pick < 0) { pick = wifiSlot; do { pick = (pick + 1) % 3; } while (!wifiSlotSsid(pick)[0]); }
+        Serial.printf("[NETWORK] WiFi mat %lu ms -> chon mang %s\n", static_cast<unsigned long>(disconnectedFor), wifiSlotSsid(pick));
+        wifiBeginSlot(pick);
         return;
       }
       Serial.printf("[NETWORK] WiFi mat %lu ms, yeu cau reconnect. status=%d\n",
@@ -6908,15 +6984,18 @@ void maintainConnection() {
     }
     return;
   }
-  serviceWifiReturnToPrimary();
+  serviceWifiPreferredNetwork();
 
   // Close out a confirmed outage exactly once, before wifiLostAt is cleared.
   if (wifiLostAt) {
     lastWifiRecoveredAt = millis();
     const uint32_t outage = lastWifiRecoveredAt - wifiLostAt;
     if (outage > longestWifiOutageMs) longestWifiOutageMs = outage;
-    Serial.printf("[NETWORK] WiFi tro lai sau %lu ms (lan mat thu %u).\n",
-                  static_cast<unsigned long>(outage), static_cast<unsigned>(wifiDropCount));
+    wifiSyncSlotFromDriver();
+    wifiPreferredCheckAt = millis();
+    Serial.printf("[NETWORK] WiFi tro lai sau %lu ms (lan mat thu %u) -> %s RSSI %d.\n",
+                  static_cast<unsigned long>(outage), static_cast<unsigned>(wifiDropCount),
+                  WiFi.SSID().c_str(), WiFi.RSSI());
   }
   disconnectObservedAt = 0;
   wifiLostAt = 0;

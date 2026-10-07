@@ -180,3 +180,20 @@ Two read-only audits (blocking paths, logic) of `esp/mesflow_app.cpp`; confirmed
   The password is in `~/esp-backups/kiosk1-esp/provision/hotspot.json` (0600, dell).
 - ESP kiosk1: primary KIOSK1-ESP, fallback KIMEXVN-OFFICE. Measured: RSSI -42 dBm (was -81), heartbeat OK with
   keep-alive reuse, employee scan done in 1.0 s.
+
+## Up to 3 known Wi-Fi networks + auto-switch (2026-10-07)
+- Firmware knows up to 3 networks: `WIFI_SSID` plus NVS `wifi_ssid2/3` and `wifi_pass2/3`, in priority order.
+  - `wifi-set` takes `fallback_ssid/_password` and `fallback2_ssid/_password`.
+  - `wifi-scan` lists the 2.4 GHz networks in range with RSSI and channel.
+- Choice (`pickKnownNetwork`): the first known network, in priority order, at -70 dBm or better; otherwise the
+  strongest known network in range. This is used:
+  - at boot, after one scan (the other networks are then tried in order);
+  - after a 45 s outage (scan, then switch);
+  - every 10 min on a lower-priority network (async scan on an idle READY screen), to move back up.
+- `wifiBeginSlot` stops a pending (auto-)connect first and checks with `esp_wifi_get_config` that the driver took
+  the new SSID. While the driver is reconnecting, a new config is refused silently: first test on kiosk1, the ESP
+  "switched" to OFFICE but stayed on the hotspot config. After every (re)connect the slot is re-read from
+  `WiFi.SSID()`.
+- kiosk1 failover test: hotspot off at t=5 s -> outage -> switch to KIMEXVN-OFFICE at 57 s, connected at 59 s
+  (-78 dBm), heartbeats OK.
+- Dell bench ESP: 1 = Airport, 2 = KIOSK1-ESP, 3 = KIMEXVN-OFFICE. It can be moved to the kiosk1 area without setup.
