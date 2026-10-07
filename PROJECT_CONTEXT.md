@@ -61,8 +61,9 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   (audit finding) — now logged only (v5.6.0). DEV does have catalog data (27 workers / 319 operations).
 - Feature audit vs Kiosk Web done (2026-10-07): web kiosk F1–F12 incl. multi-OP, SETUP skips quantities, error
   screen with server message/action, version auto-reload; ESP lacked multi-OP (done in 5.6.0). Remaining gaps to
-  consider, keeping the ESP lean: SETUP operations should skip the quantity screens — needs the server to return
-  `operation_type` in `/api/lookup` + `active_sessions` (cross-project); LAN console auth (the provision token is
+  consider, keeping the ESP lean: LAN console auth (the provision token is
   broadcast over UDP, so it protects nothing — decide with the deploy-agent owners).
 - To roll back to v2: rebuild `../mesflow-kiosk-runtime-v2` (`scripts/build-dev.sh`) and flash; its NVS keys
   (`kiosk_v2`, `kiosk_identity`) are in the backup above.
+- Decision (user, 2026-10-07): SETUP operations keep the normal flow on the ESP (operators enter time
+  there) -- do NOT add a "skip quantity screens" path like the web kiosk has.
