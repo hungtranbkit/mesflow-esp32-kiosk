@@ -5322,6 +5322,19 @@ static bool handleConsoleCommand(String line) {
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); Serial.println("Da mo test cam ung."); return true; }
   if (cmd == "recovery-menu") { openRecoveryMenu(); return true; }
+  // Serial-only (needs the USB cable): switch server/station/device/token without
+  // touching Wi-Fi, identity, keypad mapping or scanner baud. Same rules as the
+  // LAN provisioning API (applyConfigJson). Example:
+  //   provision {"server_url":"https://mesflow.net","station_code":"111","kiosk_token":"..."}
+  if (cmd.startsWith("provision ")) {
+    DynamicJsonDocument doc(1024);
+    String error;
+    if (deserializeJson(doc, line.substring(10))) { Serial.println("[PROVISION] JSON khong hop le."); return true; }
+    if (!applyConfigJson(doc, false, error)) { Serial.printf("[PROVISION] Tu choi: %s\n", error.c_str()); return true; }
+    Serial.printf("[PROVISION] OK server=%s station=%s device=%s token=%s -> khoi dong lai de ap dung.\n",
+                  SERVER_BASE, STATION_CODE, DEVICE_ID, rt.kioskToken[0] ? "STORED" : "EMPTY");
+    return true;
+  }
   if (cmd.startsWith("key ") && cmd.length() == 5) { handleKeypadKey(line.charAt(4)); return true; }
   if (cmd.startsWith("scanner-baud")) { Serial.print(cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n"); return true; }
   if (cmd == "bind") { bindKiosk(); return true; }
@@ -5348,7 +5361,9 @@ void handleSerialLine(String line) {
   if (!line.length()) return;
   lastInputAtMs = millis();
   inputEventCount++;
-  safeCopy(lastInputPreview, sizeof(lastInputPreview), line.c_str());
+  // `provision {json}` carries a kiosk token: never keep it as the input preview
+  // (that preview is reported in heartbeats/diagnostics).
+  safeCopy(lastInputPreview, sizeof(lastInputPreview), line.startsWith("provision ") ? "provision ***" : line.c_str());
 
   // Console administration always has priority over QR/session state.
   if (handleConsoleCommand(line)) return;

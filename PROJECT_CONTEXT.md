@@ -76,6 +76,15 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   saved one): the keypad is unused until someone presses a key, which opens the 12-key wizard.
 - Fixed by this: the boot-time wizard used to block forever without feeding the 40 s watchdog -> TASK-WDT reboot loop.
 
+## Bench board (dell) -> https://mesflow.net (2026-10-07)
+- Switched from DEV to PRODUCTION_TEST without rewriting NVS (keypad mapping + scanner baud + Wi-Fi "Airport" kept):
+  new serial-only console command `provision {"server_url":...,"station_code":...,"device_id":...,"device_name":...,
+  "kiosk_token":...}` (same rules as the LAN provisioning API `applyConfigJson`; the line is masked in the input
+  preview), then `restart`. Same device_uuid `e5dedadc-...` registered + approved on mesflow.net: **id 84343**,
+  station 1 "111" (token in `~/esp-backups/v1-provision/token-mesflow-net.json`, 0600). DEV identity 2230 is now stale.
+- Runs the CDC-on build with the CA bundle: heartbeat READY/OK over HTTPS (RSSI -25), catalog 26/320, OTA check to
+  deploy.mesflow.net now answers NO_UPDATE (with a CA it works; it was 401/failing before).
+
 ## Known gaps / next
 - The transient `ui_state=ERROR` (08:02:31) matched background-sync `setError` calls hijacking the screen
   (audit finding) — now logged only (v5.6.0). DEV does have catalog data (27 workers / 319 operations).
