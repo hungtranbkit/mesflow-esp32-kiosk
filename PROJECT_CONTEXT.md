@@ -59,6 +59,23 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
 - Touch FT6336G (0x38) is still not found on I2C (only 0x18 besides the keypad) — touch is optional; not investigated.
 - Event log compaction added (>= 48 KB and fully answered -> deleted).
 
+## Field board on kiosk1 -> https://mesflow.net (2026-10-07)
+- Board ESP32-S3 MAC 44:1b:f6:ce:64:4c plugged into the KIMEX kiosk PC (`ssh kiosk`, 192.168.1.48) `/dev/ttyACM0`;
+  it ran v2 (`KIOSK-LASER-01`, identity 10577, station 1 "111", Wi-Fi KIMEXVN-OFFICE, http://mesflow.net).
+- Flashed 5.6.0 (v1 line) with a **CA bundle** (GTS Root R1/R3/R4 + ISRG X1/X2 -> `esp/mesflow_ota_ca.h`, gitignored)
+  so `https://mesflow.net` stays HTTPS (downgrade to http now only when no CA is compiled in). Tools on kiosk1:
+  `~/esp-update/esptool` (standalone, copied from arduino15), firmware + backup in `~/esp-update/`; serial access via a
+  temporary ACL (`sudo setfacl -m u:kiosk1:rw /dev/ttyACM0`, lost on replug).
+- New identity on PRODUCTION_TEST (mesflow-test VPS `mesflow-app`): **id 84315**, uuid `b92b38d5-...`, ACTIVE, station 1;
+  NVS: Wi-Fi copied from the v2 NVS, server https://mesflow.net, device KIOSK-LASER-01, station "111". Secrets in
+  `~/esp-backups/kiosk1-esp/provision/` (0600); v2 NVS backup in `~/esp-backups/kiosk1-esp/`. Old v2 identity 10577
+  left ACTIVE (stale) -- disable it in /kiosk-management if wanted.
+- Verified: heartbeat READY/OK over HTTPS (first one fails until NTP sets the clock), catalog 26/320 via HTTPS.
+  Wi-Fi is weak there (RSSI -82 dBm).
+- That board runs the **CDC-on** build (USB serial readable from kiosk1). It has **no keypad calibration** (v2 never
+  saved one): the keypad is unused until someone presses a key, which opens the 12-key wizard.
+- Fixed by this: the boot-time wizard used to block forever without feeding the 40 s watchdog -> TASK-WDT reboot loop.
+
 ## Known gaps / next
 - The transient `ui_state=ERROR` (08:02:31) matched background-sync `setError` calls hijacking the screen
   (audit finding) — now logged only (v5.6.0). DEV does have catalog data (27 workers / 319 operations).
