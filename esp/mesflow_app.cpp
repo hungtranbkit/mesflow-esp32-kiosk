@@ -188,7 +188,7 @@ String applyScannerBaudCommand(const String& arg){
   const uint32_t b=(uint32_t)arg.toInt();
   if(!validScannerBaud(b))return "scanner-baud: gia tri khong hop le (1200/2400/4800/9600/19200/38400/57600/115200)\n";
   Preferences p;p.begin("mesflow_cfg",false);p.putUInt("scan_baud",b);p.end();
-  reattachScanner(b);scannerBaudConfirmed=false;
+  reattachScanner(b);scannerBaudConfirmed=true;
   Serial.printf("[SCANNER] baud=%lu (luu NVS)\n",(unsigned long)scannerBaud);
   return String("scanner-baud => ")+String(scannerBaud)+" (da luu, ap dung ngay)\n";
 }
@@ -371,6 +371,16 @@ static void handleDebugShowScreen();
 // -------------------- UNIFIED HTTP/HTTPS TRANSPORT ----------
 // One transport wrapper for LAN HTTP and Internet HTTPS.
 // HTTPClient creates Host, Content-Length/Transfer-Encoding and Connection.
+// Set from the Wi-Fi event task on disconnect / new IP: a kept socket is dead
+// then even if connected() still says yes. Consumed on the loop task.
+volatile bool keepAliveInvalidated = false;
+// Bumped on every change of the offline event log (see countPendingOfflineEvents).
+volatile uint32_t eventLogGeneration = 1;
+// The UI loop task. Screen/state changes from any other task (the OTA check on
+// core 0) are refused -- drawing from two cores corrupts the display.
+TaskHandle_t uiLoopTask = nullptr;
+inline bool onUiLoopTask() { return !uiLoopTask || xTaskGetCurrentTaskHandle() == uiLoopTask; }
+constexpr uint32_t WORKER_IDLE_RELEASE_MS = 90000;
 constexpr uint32_t KEEPALIVE_IDLE_MS = 45000;      // heartbeat every 20 s keeps the link warm
 constexpr unsigned long TLS_HANDSHAKE_TIMEOUT_S = 8;
 class MesHttpSession {
@@ -381,6 +391,7 @@ public:
              uint16_t clientTimeoutSeconds,
              bool useHttp10 = true,
              bool followRedirects = false) {
+    esp_task_wdt_reset();   // no-op on the OTA task (not subscribed)
     end();
     secure_ = url.startsWith("https://");
 
@@ -436,8 +447,10 @@ class MesKeepAlive {
 public:
   bool begin(const String& url, uint16_t connectTimeoutMs, uint16_t requestTimeoutMs,
              uint16_t clientTimeoutSeconds) {
+    esp_task_wdt_reset();
     const bool secure = url.startsWith("https://");
     if (secure && strlen(MESFLOW_ROOT_CA_PEM) == 0) return false;
+    if (keepAliveInvalidated) { keepAliveInvalidated = false; drop(); }   // Wi-Fi dropped/re-associated
     // The heartbeat (20 s) keeps it warm; after a longer gap the server or a
     // NAT may have dropped it silently, so start clean instead of timing out.
     if (secure != secure_ || millis() - lastUsedAt_ > KEEPALIVE_IDLE_MS) drop();
@@ -452,13 +465,37 @@ public:
     http_.useHTTP10(false);   // keep-alive needs HTTP/1.1; bodies are read with getString() (chunked-safe)
     reused_ = http_.connected();
     began_ = secure ? http_.begin(tls_, url) : http_.begin(plain_, url);
+    static const char* teHeader[] = {"Transfer-Encoding"};
+    if (began_) http_.collectHeaders(teHeader, 1);
     Serial.printf("[HTTP] keep-alive %s\n", reused_ ? "REUSE" : "NEW");
     return began_;
   }
   HTTPClient& http() { return http_; }
   bool reused() const { return reused_; }
+  // HTTP/1.1 body with neither Content-Length nor chunked encoding ends only
+  // when the server closes the socket: getString() would wait for the server's
+  // idle timeout (tens of seconds). Such a response is read briefly and closed.
+  bool bodyDelimited(int status) {
+    if (status == 204 || status == 304 || http_.getSize() >= 0) return true;
+    return http_.header("Transfer-Encoding").indexOf("chunked") >= 0;
+  }
+  String readBody(int status) {
+    if (status == 204 || status == 304) return String();
+    if (bodyDelimited(status)) return http_.getString();
+    String out; NetworkClient* in = http_.getStreamPtr(); const uint32_t t0 = millis();
+    while (in && millis() - t0 < 1500 && out.length() < 8192) {
+      while (in->available() && out.length() < 8192) out += static_cast<char>(in->read());
+      if (!in->connected()) break;
+      delay(5);
+    }
+    closeAfterUse_ = true;
+    return out;
+  }
   // Success: HTTPClient keeps the socket when the server allowed keep-alive.
-  void release() { if (began_) http_.end(); began_ = false; lastUsedAt_ = millis(); }
+  void release() {
+    if (closeAfterUse_) { closeAfterUse_ = false; drop(); return; }
+    if (began_) http_.end(); began_ = false; lastUsedAt_ = millis();
+  }
   // Any error: close for real so the next request starts a fresh connection.
   void drop() { if (began_) http_.end(); began_ = false; tls_.stop(); plain_.stop(); lastUsedAt_ = 0; }
 
@@ -469,6 +506,7 @@ private:
   bool secure_ = false;
   bool began_ = false;
   bool reused_ = false;
+  bool closeAfterUse_ = false;
   uint32_t lastUsedAt_ = 0;
 };
 MesKeepAlive mesKeepAlive;
@@ -484,6 +522,7 @@ public:
   HTTPClient& http() { return keep_ ? mesKeepAlive.http() : own_.http(); }
   bool keepAlive() const { return keep_; }
   void end() { if (keep_) mesKeepAlive.release(); else own_.end(); }
+  String readBody(int status) { return keep_ ? mesKeepAlive.readBody(status) : own_.http().getString(); }
   void fail() { if (keep_) mesKeepAlive.drop(); else own_.end(); }
 private:
   bool keep_;
@@ -785,6 +824,8 @@ bool loadPendingTransaction() {
 void safeCopy(char* dst, size_t size, const char* src);
 void setError(int status, const char* message);
 void setUi(UiState next);
+extern bool recoveryMenuActive;
+extern bool recoveryInfoActive;
 void resetForNextWorker();
 void drawSimple(const char* title, const char* line1, const char* line2, const char* footer, uint16_t accent);
 void drawTopClock(bool force = false);
@@ -963,6 +1004,7 @@ bool allocateOfflineBuffers() {
       offlineAckCapacity, 64, caps));
 
   offlineBuffersReady = workerCache && operationCache && offlineSessions && offlineAckScratch;
+  eventLogGeneration++;   // the cached pending count was computed without buffers
   if (!offlineBuffersReady) {
     freeOfflineBuffers();
     Serial.printf("[MEM] Buffer allocation failed mode=%s heap=%u psram=%u\n",
@@ -1060,7 +1102,22 @@ int findOfflineSession(const char* workerQr){for(uint16_t i=0;i<offlineSessionCo
 
 bool saveOfflineSessions(){for(uint16_t i=0;i<offlineSessionCount;i++)sealObject(offlineSessions[i]);return saveArray(SESSION_FILE,offlineSessions,offlineSessionCount);}
 
+// The log changes only through appendLogRecord / the two removes below, which
+// bump eventLogGeneration; the count is recomputed only after a change.
+static uint32_t pendingCountGeneration = 0;
+static volatile uint16_t pendingCountCache = 0;
+// For the OTA task: never touches the file or the shared scratch buffer.
+bool offlineEventsMaybePending() { return pendingCountGeneration != eventLogGeneration || pendingCountCache != 0; }
+uint16_t countPendingOfflineEventsUncached();
 uint16_t countPendingOfflineEvents() {
+  if (!onUiLoopTask()) return offlineEventsMaybePending() ? 1 : 0;
+  const uint32_t gen = eventLogGeneration;
+  if (pendingCountGeneration == gen) return pendingCountCache;
+  pendingCountCache = countPendingOfflineEventsUncached();
+  pendingCountGeneration = gen;
+  return pendingCountCache;
+}
+uint16_t countPendingOfflineEventsUncached() {
   if(!fsReady || !offlineBuffersReady)return 0; uint16_t ackCount=0,eventCount=0;
   File f=LittleFS.open(EVENT_LOG_FILE,"r"); if(!f)return 0; OfflineLogRecord r;
   while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){if(!validObject(r))continue;if((r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&ackCount<offlineAckCapacity)safeCopy(offlineAckScratch[ackCount++],64,r.eventId);}
@@ -1074,7 +1131,7 @@ bool appendLogRecord(OfflineLogRecord &r) {
   if(total&&used*100U/total>=95U){setError(-41,"BỘ NHỚ ĐÃ ĐẦY - BÁO QUẢN LÝ");return false;}
   if(total&&used*100U/total>=85U)Serial.printf("[OFFLINE] storage warning used=%u%%\n",(unsigned)(used*100U/total));
   sealObject(r); File f=LittleFS.open(EVENT_LOG_FILE,"a");if(!f)return false;
-  size_t n=f.write((uint8_t*)&r,sizeof(r));f.flush();f.close();return n==sizeof(r);
+  size_t n=f.write((uint8_t*)&r,sizeof(r));f.flush();f.close();eventLogGeneration++;return n==sizeof(r);
 }
 bool appendAck(const char* eventId){OfflineLogRecord a;memset(&a,0,sizeof(a));a.magic=OFF_MAGIC;a.version=OFF_VERSION;a.recordType=(uint8_t)LogRecordType::ACK;safeCopy(a.eventId,sizeof(a.eventId),eventId);return appendLogRecord(a);}
 bool appendReject(const char* eventId,const char* reason){OfflineLogRecord a;memset(&a,0,sizeof(a));a.magic=OFF_MAGIC;a.version=OFF_VERSION;a.recordType=(uint8_t)LogRecordType::REJECT;safeCopy(a.eventId,sizeof(a.eventId),eventId);safeCopy(a.operationName,sizeof(a.operationName),reason);return appendLogRecord(a);}
@@ -1157,7 +1214,7 @@ void selectOpenOp(uint8_t i){
   safeCopy(rt.activeGroupId,sizeof(rt.activeGroupId),o.sessionId<0?o.localId:"");
   safeCopy(rt.operationQr,sizeof(rt.operationQr),o.opQr);safeCopy(rt.operationName,sizeof(rt.operationName),o.opName);
   safeCopy(rt.po,sizeof(rt.po),o.po);safeCopy(rt.part,sizeof(rt.part),o.part);
-  demoGoodQty=0;demoReworkQty=0;demoDefectQty=0;
+  demoGoodQty=0;demoReworkQty=0;demoDefectQty=0;keypadNumberLength=0;keypadNumberBuffer[0]='\0';
 }
 // After an employee scan: one open OP -> straight to its quantity (unchanged
 // behaviour); several -> the employee screen lists them and an OP scan picks one.
@@ -1221,8 +1278,9 @@ constexpr size_t EVENT_LOG_COMPACT_BYTES = 48U * 1024U;
 void compactEventLogIfDrained(){
   if(!fsReady||!LittleFS.exists(EVENT_LOG_FILE))return;
   File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return;const size_t size=f.size();f.close();
-  if(size<EVENT_LOG_COMPACT_BYTES||countPendingOfflineEvents()!=0)return;
-  if(LittleFS.remove(EVENT_LOG_FILE))Serial.printf("[OFFLINE] nhat ky da dong bo het (%u bytes) -> xoa\n",(unsigned)size);
+  // Only with no open local session: their "already synced" state lives in the ACKs.
+  if(size<EVENT_LOG_COMPACT_BYTES||countPendingOfflineEvents()!=0||offlineSessionCount!=0)return;
+  if(LittleFS.remove(EVENT_LOG_FILE))eventLogGeneration++,Serial.printf("[OFFLINE] nhat ky da dong bo het (%u bytes) -> xoa\n",(unsigned)size);
 }
 
 bool readOldestPendingEvent(OfflineLogRecord &out){
@@ -1280,12 +1338,14 @@ bool syncOneOfflineEvent(){
     // Session Exceptions path which never covers an ordinary offline reject).
     sendKioskEvent("OFFLINE_SYNC_REJECTED","ERROR",notifyMsg,"Kiem tra OP/PO va bao quan doc",0);
     if(!appendReject(e.eventId,reasonCode)){backgroundError(-52,"KHONG LUU DUOC REJECT");return false;}
+    if(isStart){const int si=findOfflineSessionByLocalId(e.localSessionId);if(si>=0){removeOfflineSessionAt(si);saveOfflineSessions();}}
     lastOfflineSyncEpoch=currentEpoch();
     // On-device visibility for whoever is at the kiosk right now. Short,
     // no-diacritic text -- same convention as every other setError() call
     // in this file -- rather than the raw (possibly long, diacritic) server
     // reason, which is already sent in full via sendKioskEvent above.
-    setError(0,isStart?"BI TU CHOI - PO CHUA/DA XONG":"BI TU CHOI - BAO QUAN DOC");
+    if(uiState==UiState::READY) setError(0,isStart?"BI TU CHOI - PO CHUA/DA XONG":"BI TU CHOI - BAO QUAN DOC");
+    else backgroundError(0,isStart?"BI TU CHOI - PO CHUA/DA XONG":"BI TU CHOI - BAO QUAN DOC");
     return true;
   }
   if(strcmp(status,"accepted")&&strcmp(status,"duplicate")){backgroundError(-51,"SERVER TAM THOI TU CHOI");return false;}
@@ -2566,7 +2626,7 @@ static bool refreshCatalogFromMes(String& message, uint16_t& workersLoaded, uint
   MesHttpSession net;
   // Flask/nginx may return a chunked HTTP/1.1 body. HTTP/1.0 makes the
   // response easier and more reliable to persist before JSON parsing.
-  if (!net.begin(url, 15000, 35000, 35, true, true)) {
+  if (!net.begin(url, 5000, 12000, 12, true, true)) {
     message = "http.begin that bai: " + url;
     remoteLogf("CATALOG BEGIN FAIL url=%s", url.c_str());
     return false;
@@ -2607,7 +2667,15 @@ static bool refreshCatalogFromMes(String& message, uint16_t& workersLoaded, uint
   // Download first, parse second. This avoids deserializeJson() reading a
   // temporarily empty/chunked WiFi stream and also leaves exact byte diagnostics.
   catalogStage("body-download");
-  int written = http.writeToStream(&temp);
+  // Feed the 40 s watchdog per chunk: a slow 110 KB download must not reset the kiosk.
+  struct WdtFeedingFile : public Stream {
+    File& f; explicit WdtFeedingFile(File& file) : f(file) {}
+    size_t write(uint8_t b) override { esp_task_wdt_reset(); return f.write(b); }
+    size_t write(const uint8_t* b, size_t n) override { esp_task_wdt_reset(); return f.write(b, n); }
+    int available() override { return 0; } int read() override { return -1; } int peek() override { return -1; }
+    void flush() override { f.flush(); }
+  } wdtFile(temp);
+  int written = http.writeToStream(&wdtFile);
   temp.flush();
   size_t actualLength = temp.size();
   catalogDebug.written = written;
@@ -3647,11 +3715,14 @@ bool postActionPayload(const String& payload) {
   addJsonHeaders(http);
   addAuthHeaders(http);
   int status = http.POST(payload);
-  if (status > 0) { http.getString(); net.end(); } else net.fail();
+  if (status > 0) { net.readBody(status); net.end(); } else net.fail();
   // Deliberately do not call setError(): telemetry must never change kiosk UI.
   return status >= 200 && status < 300;
 }
 
+// Conservative flag for the OTA task (it must not read the queue file): true
+// until the loop has seen the queue empty, set again by every enqueue.
+volatile bool actionQueueMaybeNonEmpty = true;
 uint16_t actionQueueCount() {
   if (!LittleFS.exists(ACTION_QUEUE_PATH)) return 0;
   File f = LittleFS.open(ACTION_QUEUE_PATH, "r");
@@ -3683,6 +3754,7 @@ bool enqueueActionPayload(const String& payload) {
   }
   File f = LittleFS.open(ACTION_QUEUE_PATH, "a");
   if (!f) return false;
+  actionQueueMaybeNonEmpty = true;
   bool ok = f.println(payload) > 0;
   f.close();
   return ok;
@@ -3696,8 +3768,9 @@ bool emitActionEvent(const char* eventType, const char* category,
   // pending / recovered) are not logged -- production data already goes
   // through the business API, and every queued event costs a ~1.7 s HTTPS
   // POST on the UI loop. Only failures and rejections are kept.
-  if (!result || !strcmp(result, "RECEIVED") || !strcmp(result, "SUCCESS") ||
-      !strcmp(result, "PENDING") || !strcmp(result, "RECOVERED")) return true;
+  if (strcmp(eventType, "KIOSK_BOOT") != 0 &&
+      (!result || !strcmp(result, "RECEIVED") || !strcmp(result, "SUCCESS") ||
+       !strcmp(result, "PENDING") || !strcmp(result, "RECOVERED"))) return true;
   DynamicJsonDocument event(2048);
   char eventId[112]; nextClientEventId(eventId, sizeof(eventId));
   event["client_event_id"] = eventId;
@@ -3739,7 +3812,7 @@ void serviceActionEventQueue() {
   if (uiState != UiState::READY || millis() - stateEnteredAt < ACTION_QUEUE_IDLE_MS) return;
   if (millis() - lastActionQueueRetryAt < ACTION_QUEUE_RETRY_MS) return;
   lastActionQueueRetryAt = millis();
-  if (!LittleFS.exists(ACTION_QUEUE_PATH)) return;
+  if (!LittleFS.exists(ACTION_QUEUE_PATH)) { actionQueueMaybeNonEmpty = false; return; }
 
   // Send at most one telemetry event per pass. Never drain the entire file in
   // one loop because repeated POST/open/close cycles can starve the scanner UI
@@ -3768,7 +3841,7 @@ void serviceActionEventQueue() {
     const bool hasRemaining = check && check.size() > 0;
     if (check) check.close();
     if (hasRemaining) LittleFS.rename(ACTION_QUEUE_TMP_PATH, ACTION_QUEUE_PATH);
-    else LittleFS.remove(ACTION_QUEUE_TMP_PATH);
+    else { LittleFS.remove(ACTION_QUEUE_TMP_PATH); actionQueueMaybeNonEmpty = false; }
   }
 }
 
@@ -3882,6 +3955,14 @@ void recoverUiFromStuck(const char* reason, bool userRequested) {
 void serviceStateWatchdog() {
   if (millis() - lastStateWatchdogAt < STATE_WATCHDOG_CHECK_MS) return;
   lastStateWatchdogAt = millis();
+  // A worker screen left alone must not let the next person's OP scan be booked
+  // to the previous worker. Not an incident: release quietly.
+  if (uiState == UiState::WORKER_OK && !hasPendingTransaction() &&
+      millis() - stateEnteredAt > WORKER_IDLE_RELEASE_MS) {
+    Serial.println("[KIOSK] Man hinh nhan vien bo trong qua lau -> ve QUET THE.");
+    resetForNextWorker();
+    return;
+  }
   const uint32_t limit = maxStateDurationMs(uiState);
   if (!limit) return;
   const uint32_t age = millis() - stateEnteredAt;
@@ -3946,6 +4027,11 @@ void drawError() {
 }
 
 void setUi(UiState next) {
+  if (!onUiLoopTask()) { Serial.printf("[UI] bo qua setUi tu task khac (state=%d)\n", (int)next); return; }
+  // Any screen change closes the hold-'*' recovery menu: otherwise a scan or
+  // the state watchdog drew over it while its flag stayed set, and the next
+  // worker's digits went to the menu ('5' = reboot).
+  if (recoveryMenuActive || recoveryInfoActive) { recoveryMenuActive = false; recoveryInfoActive = false; }
   const UiState previous = uiState;
   uiState = next;
   stateEnteredAt = millis();
@@ -4099,7 +4185,7 @@ void setError(int status, const char* message) {
   const char* technical = message && message[0] ? message : "UNKNOWN ERROR";
   Serial.printf("[ERROR] HTTP %d: %s\n", status, technical);
   remoteLogf("ERROR HTTP %d: %s", status, technical);
-  if (suppressNetworkUiErrors) {
+  if (suppressNetworkUiErrors || !onUiLoopTask()) {
     safeCopy(rt.lastError, sizeof(rt.lastError), technical);
     return;
   }
@@ -4126,7 +4212,7 @@ bool decodeResponse(HTTPClient& http, int status, DynamicJsonDocument& response,
   if (wholeBody) {
     // HTTP/1.1 keep-alive: the body may be chunked and must be read to the end
     // before the socket is reused. These responses are a few KB.
-    String body = http.getString();
+    String body = mesKeepAlive.readBody(status);
     DeserializationError err = filter
         ? deserializeJson(response, body, DeserializationOption::Filter(*filter))
         : deserializeJson(response, body);
@@ -4286,7 +4372,7 @@ bool httpPostJson(const char* path,
   // START/FINISH (quick=false) is an operator-facing action and gets the wait.
   const bool wifiUp = quick ? (WiFi.status() == WL_CONNECTED) : waitForWifiBriefly();
   if (!wifiUp) {
-    recordServerResult(false,true,-1,"POST-wifi");
+    if (!(baseOverride && baseOverride[0])) recordServerResult(false,true,-1,"POST-wifi");
     setError(-1, "WiFi chua ket noi");
     return false;
   }
@@ -4333,8 +4419,8 @@ bool httpPostJson(const char* path,
         bool decoded = decodeResponse(http, status, response, nullptr, net.keepAlive());
         if (decoded) net.end(); else net.fail();
 
-        if (!decoded){recordServerResult(false,false,status,"POST-decode");return false;}
-        recordServerResult(status < 500,false,status,"POST");
+        if (!decoded){if (net.keepAlive()) recordServerResult(false,false,status,"POST-decode");return false;}
+        if (net.keepAlive()) recordServerResult(status < 500,false,status,"POST");
         Serial.printf("[GET OK] HTTP=%d json_used=%u heap=%u\n", status,
                       static_cast<unsigned>(response.memoryUsage()),
                       static_cast<unsigned>(ESP.getFreeHeap()));
@@ -4361,7 +4447,7 @@ bool httpPostJson(const char* path,
   }
 
   setError(lastStatus, lastMessage.c_str());
-  recordServerResult(false,false,lastStatus,"POST");
+  if (!(baseOverride && baseOverride[0])) recordServerResult(false,false,lastStatus,"POST");
   return false;
 }
 
@@ -4398,6 +4484,7 @@ bool connectWifi() {
   uint32_t started = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
     delay(250);
+    esp_task_wdt_reset();
   }
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -4849,7 +4936,7 @@ bool sendHeartbeat() {
   int status = http.POST(payload);
   String responseBody;
   if (status > 0) {
-    responseBody = http.getString();
+    responseBody = net.readBody(status);
     if (responseBody.length()) {
       DeserializationError err = deserializeJson(response, responseBody);
       if (err && status >= 200 && status < 300) {
@@ -4925,7 +5012,7 @@ static void otaEvent(const char* status, const char* errorCode = "", const char*
 static bool otaIdleSafe() {
   return WiFi.status() == WL_CONNECTED && rt.bound && rt.online && uiState == UiState::READY &&
          !rt.hasWorker && !rt.hasOperation && rt.activeSessionId <= 0 &&
-         !hasPendingTransaction() && countPendingOfflineEvents() == 0 && actionQueueCount() == 0 &&
+         !hasPendingTransaction() && !offlineEventsMaybePending() && !actionQueueMaybeNonEmpty &&
          !offlineMode && !maintenanceMode && !keypadCalibrationRequested && !keypadCalibrationInProgress;
 }
 
@@ -4978,7 +5065,11 @@ static bool performOtaUpdate() {
   if (strcasecmp(actual, otaExpectedSha256) != 0) { Update.abort(); otaEvent("OTA_VERIFY_FAILED", "OTA_HASH_MISMATCH", actual); return false; }
   otaEvent("OTA_DOWNLOAD_COMPLETE"); otaEvent("OTA_VERIFY_OK");
   if (!Update.end(true) || !Update.isFinished()) { otaEvent("OTA_FAILED", "OTA_FLASH_ERROR", Update.errorString()); return false; }
-  rememberOtaBoot(); otaEvent("OTA_REBOOTING"); delay(300); ESP.restart(); return true;
+  rememberOtaBoot();
+  // Idle was checked before the download; an operator may have started since.
+  // This runs on the OTA task, so waiting here does not block the kiosk.
+  for (uint16_t waited = 0; !otaIdleSafe() && waited < 600; ++waited) vTaskDelay(pdMS_TO_TICKS(1000));
+  otaEvent("OTA_REBOOTING"); delay(300); ESP.restart(); return true;
 }
 
 static void checkForOta() {
@@ -5370,7 +5461,7 @@ static void consoleClearOffline() {
     return;
   }
   LittleFS.remove(SESSION_FILE);
-  LittleFS.remove(EVENT_LOG_FILE);
+  LittleFS.remove(EVENT_LOG_FILE); eventLogGeneration++;
   offlineSessionCount = 0;
   clearPendingTransaction();
   Serial.println("[CONSOLE] DA XOA queue va offline sessions. Du lieu chua sync khong the phuc hoi.");
@@ -5809,7 +5900,9 @@ void dispatchScannerFrame(const char* reason) {
   // re-scans when the screen has not reacted yet): handle it once.
   static String lastDispatchedScan;
   static uint32_t lastDispatchedScanAt = 0;
-  if (scannerText.length() && scannerText == lastDispatchedScan && millis() - lastDispatchedScanAt < 3000) {
+  // Not on READY / ERROR: after '*' or an error the same card must work again.
+  if (scannerText.length() && scannerText == lastDispatchedScan && millis() - lastDispatchedScanAt < 3000 &&
+      uiState != UiState::READY && uiState != UiState::ERROR_STATE) {
     Serial.printf("[SCANNER DUP] bo qua ma lap lai: %s\n", scannerText.c_str());
     scannerFrameLength = 0;
     return;
@@ -5821,6 +5914,7 @@ void dispatchScannerFrame(const char* reason) {
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
     handleSerialLine(scannerText);
+    lastDispatchedScanAt = millis();   // window counts from the end of a (possibly slow) lookup
   } else {
     Serial.println("[SCANNER DROP] Frame khong co chuoi QR MESFlow hop le; khong gui vao MES.");
     // Garbage (unprintable bytes, or only a couple of characters for a whole
@@ -6293,7 +6387,7 @@ static void appendKeypadDigit(char key) {
 constexpr uint32_t RECOVERY_COUNTDOWN_FROM_MS = 3000;
 constexpr uint32_t RECOVERY_MENU_HOLD_MS = 5000;
 bool recoveryMenuActive = false;
-static bool recoveryInfoActive = false;
+bool recoveryInfoActive = false;
 static int recoveryCountdownShown = -1;
 
 static void drawRecoveryMenu() {
@@ -6772,6 +6866,10 @@ void maintainConnection() {
 // Arduino setup/loop
 // ============================================================
 void setup() {
+  uiLoopTask = xTaskGetCurrentTaskHandle();   // setup() and loop() run on the same Arduino task
+  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED || event == ARDUINO_EVENT_WIFI_STA_GOT_IP) keepAliveInvalidated = true;
+  });
   // Capture BEFORE anything else can reset it. This is the one fact that
   // separates "the watchdog below force-rebooted us" (TASK-WDT) from "the
   // supply sagged when the scanner lit up" (BROWNOUT) from "somebody power
@@ -6811,7 +6909,7 @@ void setup() {
   {
     Preferences p; p.begin("mesflow_cfg", true);
     const uint32_t stored = p.getUInt("scan_baud", 0); p.end();
-    if (validScannerBaud(stored)) scannerBaud = stored;
+    if (validScannerBaud(stored)) { scannerBaud = stored; scannerBaudConfirmed = true; }
   }
   ScannerSerial.begin(scannerBaud, SERIAL_8N1, SCANNER_RX_PIN, -1);
   installScannerErrorHook();
@@ -6909,6 +7007,7 @@ void setup() {
                 static_cast<unsigned>(ESP.getFreePsram()));
   allocateOfflineBuffers();
   fsReady = LittleFS.begin(true);
+  esp_task_wdt_reset();
   prefs.begin("mesflow", true);
   clientEventCounter = prefs.getULong("evt_counter", 0);
   safeCopy(offlineSnapshotRevision,sizeof(offlineSnapshotRevision),prefs.getString("snap_rev","unknown").c_str());

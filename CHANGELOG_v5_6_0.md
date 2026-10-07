@@ -108,3 +108,42 @@ Background HTTPS calls on the UI loop made a scan wait for seconds. They are now
   each attempt.
 - Measured on the bench board: lookup 0.35 s (was 1.65 s), whole employee scan 0.9 s (was 2.3 s), heartbeat
   0.2-0.4 s (was ~2.2 s), log shows `[HTTP] keep-alive REUSE`. Free heap 162 KB idle (was 207 KB), min free 78 KB.
+
+## Audit fixes (2026-10-07)
+Two read-only audits (blocking paths, logic) of `esp/mesflow_app.cpp`; confirmed findings fixed:
+- Blocking / watchdog:
+  - WDT fed at every new request (`MesHttpSession::begin`, `MesKeepAlive::begin`), in the boot Wi-Fi wait and
+    after the LittleFS mount.
+  - Catalog download: connect 5 s / response 12 s (was 15 / 35 s); the file writer feeds the WDT per chunk.
+  - Keep-alive: drops the kept socket on Wi-Fi disconnect / new IP (`keepAliveInvalidated`). A body with neither
+    Content-Length nor chunked encoding is read for at most 1.5 s, then the socket is closed (`readBody`), instead of
+    `getString()` waiting for the server's idle timeout.
+  - `countPendingOfflineEvents()` is memoized (`eventLogGeneration`); it used to re-read the whole log on every loop
+    pass.
+- OTA task (core 0):
+  - `setUi` / `setError` refuse calls from any task but the UI loop (`onUiLoopTask`).
+  - OTA-agent POSTs no longer drive the MES link state.
+  - `otaIdleSafe` uses flags instead of reading the files from core 0.
+  - After the download, the restart waits (up to 10 min) until the kiosk is idle again.
+- Logic:
+  - Any `setUi` closes the hold-`*` recovery menu. A scan or watchdog used to draw over it with the flag still set,
+    so the next worker's digits went to the menu (`5` = reboot).
+  - A rejected START removes its local session (ghost open OP).
+  - Event-log compaction only runs with no open local session (their ACKs live in the log).
+  - `selectOpenOp` clears the keypad buffer (digits carried over to the next open OP).
+  - `WORKER_OK` is released after 90 s idle (`WORKER_IDLE_RELEASE_MS`), so the next person's OP scan is not booked
+    to the previous worker.
+  - Scanner dedupe is skipped on READY / ERROR (re-scan after `*` or an error works) and its window counts from the
+    end of the lookup.
+  - A stored or manually set scanner baud counts as confirmed (one noise burst no longer starts a re-detect).
+  - A background sync reject no longer wipes a quantity being typed (error shown only on READY).
+  - `KIOSK_BOOT` telemetry is kept.
+- Verified on the bench board: boot, keep-alive REUSE, one OTA check, scan -> name 0.2 s / lookup 0.4 s, re-scan
+  right after cancel is accepted. kiosk1 flashed and booted (heartbeat OK, keypad mapping kept).
+- Not changed (design follow-ups, need server-side agreement):
+  - (a) While the offline queue is non-empty, worker lookups use the local cache only (sessions opened elsewhere are
+    invisible).
+  - (b) `WF|OP|` vs `WF|OPID|` matching for local sessions (local entries have operationId 0).
+  - (c) The action-queue rewrite is remove+rename (power loss in between drops telemetry).
+  - (d) DNS has no timeout.
+  - (e) UI-path `delay()`s (1.8 s "ĐÃ LƯU TẠM" holds) drop key presses.
