@@ -5808,7 +5808,9 @@ static void drawKeypadCalibration(uint8_t index, const char* note, uint16_t acce
 
 static void waitKeypadRelease() {
   uint32_t stableSince = 0;
-  while (true) {
+  const uint32_t started = millis();
+  while (millis() - started < 10000) {   // a stuck key must not hang the kiosk
+    esp_task_wdt_reset();
     const int pair = scanKeypadPair();
     if (pair == -1) {
       if (stableSince == 0) stableSince = millis();
@@ -5820,11 +5822,18 @@ static void waitKeypadRelease() {
   }
 }
 
+// Returns the pair, or -9 when nobody pressed anything for KEYPAD_CAL_IDLE_MS.
+// 2026-10-07: the wizard waited forever without feeding the 40 s task
+// watchdog -> an unattended kiosk with a fresh keypad rebooted in a loop.
+constexpr uint32_t KEYPAD_CAL_IDLE_MS = 60000;
 static int waitStableKeypadPair() {
   int candidate = -1;
   uint32_t stableSince = 0;
   uint32_t lastWarningAt = 0;
+  const uint32_t started = millis();
   while (true) {
+    esp_task_wdt_reset();
+    if (candidate < 0 && millis() - started >= KEYPAD_CAL_IDLE_MS) return -9;
     const int pair = scanKeypadPair();
     if (pair >= 0) {
       if (pair != candidate) {
@@ -5855,6 +5864,12 @@ static bool calibrateKeypadInteractive() {
       while (true) {
         drawKeypadCalibration(index, "DANG CHO PHIM");
         const int pair = waitStableKeypadPair();
+        if (pair == -9) {
+          Serial.println("[KEYPAD CAL] Khong ai bam phim trong 60 giay -> huy hieu chinh, giu nguyen ban phim cu.");
+          drawSimple("HỦY HIỆU CHỈNH", "KHÔNG CÓ NGƯỜI BẤM", "BẤM 1 PHÍM ĐỂ LÀM LẠI", "", C_WARN);
+          delay(1500);
+          return false;
+        }
         bool duplicate = false;
         for (uint8_t previous = 0; previous < index; ++previous) {
           if (keypadPairs[previous] == static_cast<uint8_t>(pair)) duplicate = true;
@@ -5942,7 +5957,9 @@ static void serviceRuntimeKeypadCalibration() {
   demoDefectQty = 0;
   keypadNumberLength = 0;
   keypadNumberBuffer[0] = '\0';
-  clearKeypadCalibration();
+  // Keep the saved mapping until a NEW one is complete: an aborted wizard
+  // (nobody pressing) must leave the old calibration in place.
+  keypadMappingReady = false;
   keypadReleaseAll();
 
   drawSimple("HIỆU CHỈNH KEYPAD", "TẠM KHÓA THAO TÁC", "LÀM THEO MÀN HÌNH", "KHÔNG TẮT NGUỒN", C_INFO);
@@ -5965,7 +5982,8 @@ static void serviceRuntimeKeypadCalibration() {
   if (calibrated) {
     Serial.println("[KEYPAD CAL] Hieu chinh runtime thanh cong; kiosk da tro ve READY.");
   } else {
-    Serial.println("[KEYPAD CAL] Hieu chinh runtime that bai; keypad bi vo hieu hoa.");
+    if (loadKeypadMapping()) Serial.println("[KEYPAD CAL] Huy/that bai -> giu nguyen mapping cu.");
+    else Serial.println("[KEYPAD CAL] Huy/that bai; chua co mapping -> bam 1 phim de lam lai.");
   }
 }
 
@@ -5994,8 +6012,9 @@ bool initKeypad() {
   keypadAvailable = true;
   keypadReleaseAll();
   if (!loadKeypadMapping()) {
-    Serial.println("[KEYPAD] Chua co mapping hop le; mo hieu chinh tren LCD.");
-    calibrateKeypadInteractive();
+    // No blocking wizard at boot: an unattended kiosk must still come up
+    // (Wi-Fi, server, scanner). The wizard opens when somebody presses a key.
+    Serial.println("[KEYPAD] Chua co mapping; ban phim tam chua dung -- bam 1 phim bat ky de hieu chinh.");
   }
   keypadCandidatePair = -1;
   keypadEmittedPair = -1;
@@ -6297,14 +6316,21 @@ static void serviceKeypadPresence() {
         keypadReleaseAll();
         keypadCandidatePair = -1;
         keypadEmittedPair = -1;
-        Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong) -> hieu chinh lai vi tri phim.\n", address);
-        markKeypadNeedsCalibration("KEYPAD_ATTACHED");
+        if (loadKeypadMapping()) {
+          Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong) -> dung ban phim da hieu chinh.\n", address);
+        } else {
+          Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong), chua hieu chinh -> bam 1 phim de bat dau.\n", address);
+        }
         break;
       }
     }
     return;
   }
-  if (!keypadMappingReady && !keypadWantsCalibration) markKeypadNeedsCalibration("NO_MAPPING");
+  // Not calibrated: wait for a person -- the first key press opens the wizard.
+  if (!keypadMappingReady && !keypadWantsCalibration && millis() - keypadLastPollAt >= 50) {
+    keypadLastPollAt = millis();
+    if (scanKeypadPair() >= 0) markKeypadNeedsCalibration("KEY_PRESSED_UNCALIBRATED");
+  }
   if (keypadWantsCalibration && uiState == UiState::READY && !keypadCalibrationRequested &&
       !keypadCalibrationInProgress && !hasPendingTransaction()) {
     if (requestRuntimeKeypadCalibration(keypadCalibrationReason)) keypadWantsCalibration = false;
