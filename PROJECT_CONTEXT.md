@@ -87,6 +87,8 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   Wi-Fi is weak there (RSSI -82 dBm).
 - That board runs the **CDC-on** build (USB serial readable from kiosk1). It has **no keypad calibration** (v2 never
   saved one): the keypad is unused until someone presses a key, which opens the 12-key wizard.
+  -> Calibrated 2026-10-07 14:2x via `keypad-calibrate` over SSH serial (operator pressed 12 keys, saved to NVS):
+  rows P5/P1/P2/P4, columns P6/P7/P3 (e.g. 1=P5-P6, #=P3-P4).
 - Fixed by this: the boot-time wizard used to block forever without feeding the 40 s watchdog -> TASK-WDT reboot loop.
 
 ## Bench board (dell) -> https://mesflow.net (2026-10-07)
