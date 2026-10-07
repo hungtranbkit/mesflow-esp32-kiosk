@@ -67,3 +67,5 @@ re-scan (0 open). All events accepted by `/api/station/events/sync`.
   count as a garbage scan for the auto-detect.
 - A confirmed baud is re-detected after 2 garbage scans in a row (scanner swapped while running).
 - OTA: successful check every 5 min (was 12 s).
+- Keypad `*` on the employee screen ("* HỦY") now cancels back to "QUÉT THẺ NHÂN VIÊN" (it was ignored: the keypad
+  handler only knew quantity/confirm screens). Open sessions are not touched. Verified on the bench board (screenshot).

@@ -6305,6 +6305,16 @@ void handleKeypadKey(char key) {
     return;
   }
 
+  // The employee screen shows "* HUY" but the keypad never handled it
+  // (2026-10-07): '*' there cancels back to "scan card". Open sessions are not
+  // touched -- only the selection on this kiosk is dropped.
+  if (key == '*' && (uiState == UiState::WORKER_OK || uiState == UiState::OPERATION_OK)) {
+    Serial.println("[KEYPAD] * -> huy, quay ve quet the.");
+    emitActionEvent("USER_CANCELLED", "USER_ACTION", "CANCELLED");
+    resetForNextWorker();
+    return;
+  }
+
   if (!isQuantityInputState()) {
     Serial.println("[KEYPAD] Bo qua: kiosk khong o man hinh nhap so luong.");
     return;
