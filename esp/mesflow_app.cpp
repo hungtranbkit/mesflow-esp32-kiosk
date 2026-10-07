@@ -344,6 +344,8 @@ void readScannerCommands();
 static bool requestRuntimeKeypadCalibration(const char* source);
 static void serviceRuntimeKeypadCalibration();
 static void enterMaintenanceMode(bool duringBoot);
+static void openRecoveryMenu();
+void handleKeypadKey(char key);
 static void exitMaintenanceMode();
 static void drawMaintenanceScreen();
 static void serviceMaintenanceMode();
@@ -5311,6 +5313,8 @@ static bool handleConsoleCommand(String line) {
     return true;
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); Serial.println("Da mo test cam ung."); return true; }
+  if (cmd == "recovery-menu") { openRecoveryMenu(); return true; }
+  if (cmd.startsWith("key ") && cmd.length() == 5) { handleKeypadKey(line.charAt(4)); return true; }
   if (cmd.startsWith("scanner-baud")) { Serial.print(cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n"); return true; }
   if (cmd == "bind") { bindKiosk(); return true; }
   if (cmd == "heartbeat") { sendHeartbeat(); return true; }
@@ -6060,6 +6064,116 @@ static void appendKeypadDigit(char key) {
   redrawKeypadQuantity();
 }
 
+// '*'-hold recovery menu, ported from v2 (docs/WIFI_RECOVERY.md there):
+// hold '*' -> countdown from 3 s -> MENU KHOI PHUC at 5 s -> keep holding to
+// 10 s -> Wi-Fi setup portal directly. Released before 3 s, '*' is the normal
+// delete/back key. The menu works from every screen and never depends on the
+// session state. Item 7 keeps v1's maintenance page (server / OTA URL).
+constexpr uint32_t RECOVERY_COUNTDOWN_FROM_MS = 3000;
+constexpr uint32_t RECOVERY_MENU_HOLD_MS = 5000;
+bool recoveryMenuActive = false;
+static bool recoveryInfoActive = false;
+static int recoveryCountdownShown = -1;
+
+static void drawRecoveryMenu() {
+  tft.fillScreen(C_BG);
+  drawIndustrialHeader(WiFi.status() == WL_CONNECTED ? C_OK : C_ERR);
+  drawCenteredTextFit("MENU KHÔI PHỤC", SCREEN_LEFT_MARGIN, 34, 216, 26, FONT_TITLE, FONT_TITLE - 1, 1, C_INFO, true);
+  const char* items[] = {"Thử lại mạng", "Đồng bộ lại", "Cài đặt Wi-Fi", "Quay lại", "Khởi động lại",
+                         "Thông tin thiết bị", "Bảo trì (đổi server)"};
+  for (uint8_t i = 0; i < 7; i++) {
+    char number[3]; snprintf(number, sizeof(number), "%u", (unsigned)(i + 1));
+    drawOptionRow(number, items[i], 64 + i * 31);
+  }
+  drawFooter("* GIỮ: WI-FI", "4 QUAY LẠI");
+}
+
+static void drawRecoveryCountdown(int secondsLeft) {
+  tft.fillScreen(C_BG);
+  drawIndustrialHeader(C_INFO);
+  drawCenteredTextFit("ĐANG GIỮ *", SCREEN_LEFT_MARGIN, 80, 216, 40, FONT_TITLE, FONT_TITLE - 1, 1, C_TEXT, true);
+  char line[40]; snprintf(line, sizeof(line), "MENU SAU %d GIÂY", secondsLeft);
+  drawCenteredTextFit(line, SCREEN_LEFT_MARGIN, 140, 216, 40, FONT_SECTION, FONT_SECTION - 1, 1, C_INFO, true);
+  drawCenteredTextFit("THẢ TAY ĐỂ HỦY", SCREEN_LEFT_MARGIN, 200, 216, 30, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED, false);
+}
+
+static void drawRecoveryInfo() {
+  tft.fillScreen(C_BG);
+  drawIndustrialHeader(WiFi.status() == WL_CONNECTED ? C_OK : C_ERR);
+  drawCenteredTextFit("THÔNG TIN THIẾT BỊ", SCREEN_LEFT_MARGIN, 34, 216, 26, FONT_SECTION, FONT_SECTION - 1, 1, C_INFO, true);
+  char lines[9][72];
+  snprintf(lines[0], 72, "FW %s", FW_VERSION);
+  snprintf(lines[1], 72, "ID %s", DEVICE_ID);
+  snprintf(lines[2], 72, "Wi-Fi %s %ddBm", WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "MẤT", (int)WiFi.RSSI());
+  snprintf(lines[3], 72, "IP %s", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-");
+  snprintf(lines[4], 72, "%s", SERVER_BASE[0] ? SERVER_BASE : "SERVER CHƯA ĐẶT");
+  snprintf(lines[5], 72, "Liên kết %s  Chờ gửi %u", rt.bound ? "OK" : "CHƯA", (unsigned)countPendingOfflineEvents());
+  snprintf(lines[6], 72, "Máy quét %lu baud", (unsigned long)scannerBaud);
+  snprintf(lines[7], 72, "Bàn phím %s", keypadAvailable ? (keypadMappingReady ? "OK" : "CHƯA HIỆU CHỈNH") : "KHÔNG THẤY");
+  snprintf(lines[8], 72, "UUID %.8s", DEVICE_UUID);
+  for (uint8_t i = 0; i < 9; i++)
+    drawTextBox(lines[i], 14, 62 + i * 25, 212, 23, FONT_HEADER, FONT_HEADER - 1, 1, TextAlign::LEFT, C_TEXT, false);
+  drawFooter("PHÍM BẤT KỲ", "VỀ MENU");
+}
+
+static void openRecoveryMenu() {
+  recoveryMenuActive = true;
+  recoveryInfoActive = false;
+  Serial.println("[RECOVERY] Mo menu khoi phuc (giu *).");
+  drawRecoveryMenu();
+}
+
+static void closeRecoveryMenu() {
+  recoveryMenuActive = false;
+  recoveryInfoActive = false;
+  redrawProductionUi();
+}
+
+static void handleRecoveryMenuKey(char key) {
+  if (recoveryInfoActive) { recoveryInfoActive = false; drawRecoveryMenu(); return; }
+  Serial.printf("[RECOVERY] chon '%c'\n", key);
+  switch (key) {
+    case '1':   // retry network
+      drawSimple("THỬ LẠI MẠNG", "ĐANG KẾT NỐI LẠI", "", "", C_INFO);
+      WiFi.reconnect();
+      lastHeartbeatAt = 0;
+      delay(800);
+      closeRecoveryMenu();
+      break;
+    case '2':   // resync: send the queue now, refresh the catalog when idle
+      drawSimple("ĐỒNG BỘ LẠI", "ĐANG GỬI DỮ LIỆU", "", "", C_INFO);
+      lastOfflineSyncAt = 0; offlineNextSyncAt = 0;
+      syncOneOfflineEvent();
+      lastCatalogAutoRefreshAt = 0; lastCatalogAutoAttemptAt = 0;
+      delay(600);
+      closeRecoveryMenu();
+      break;
+    case '3':   // Wi-Fi setup portal
+      recoveryMenuActive = false;
+      drawSimple("CÀI ĐẶT WI-FI", "ĐANG KHỞI ĐỘNG...", "", "", C_INFO);
+      startSetupPortal("Recovery menu");
+      break;
+    case '4': case '*': case '#':
+      closeRecoveryMenu();
+      break;
+    case '5':
+      drawSimple("KHỞI ĐỘNG LẠI", "VUI LÒNG CHỜ", "", "", C_WARN);
+      delay(600);
+      ESP.restart();
+      break;
+    case '6':
+      recoveryInfoActive = true;
+      drawRecoveryInfo();
+      break;
+    case '7':
+      recoveryMenuActive = false;
+      enterMaintenanceMode(false);
+      break;
+    default:
+      break;
+  }
+}
+
 void handleKeypadKey(char key) {
   lastUserActionAt = millis();
   stateEnteredAt = millis();  // quantity timeout is idle time, not total screen time
@@ -6069,6 +6183,8 @@ void handleKeypadKey(char key) {
   lastInputWasKeypad = true;
   snprintf(lastInputPreview, sizeof(lastInputPreview), "KEYPAD '%c'", key);
   Serial.printf("[KEYPAD] phim='%c' state=%s\n", key, stateName(uiState));
+
+  if (recoveryMenuActive) { handleRecoveryMenuKey(key); return; }
 
   if (maintenanceMode) {
     if (key == '1') {
@@ -6228,14 +6344,28 @@ void serviceKeypad() {
       ? keypadPairToKey(static_cast<uint8_t>(keypadCandidatePair)) : '\0';
   if (wifiSetupHoldActive) {
     if (stableKey == '*') {
-      if (!wifiSetupHoldTriggered && millis() - wifiSetupHoldStartedAt >= WIFI_SETUP_HOLD_MS) {
-        wifiSetupHoldTriggered = true;
-        enterMaintenanceMode(false);
+      const uint32_t held = millis() - wifiSetupHoldStartedAt;
+      if (!wifiSetupHoldTriggered && held >= WIFI_SETUP_HOLD_MS) {
+        wifiSetupHoldTriggered = true;          // held through the menu: Wi-Fi setup (v2)
+        recoveryMenuActive = false; recoveryInfoActive = false;
+        drawSimple("CÀI ĐẶT WI-FI", "ĐANG KHỞI ĐỘNG...", "", "", C_INFO);
+        startSetupPortal("Hold * 10s");
+      } else if (!wifiSetupHoldTriggered && held >= RECOVERY_MENU_HOLD_MS && !recoveryMenuActive) {
+        openRecoveryMenu();
+      } else if (!recoveryMenuActive && held >= RECOVERY_COUNTDOWN_FROM_MS) {
+        const int left = (int)((RECOVERY_MENU_HOLD_MS - held + 999) / 1000);
+        if (left != recoveryCountdownShown) { recoveryCountdownShown = left; drawRecoveryCountdown(left); }
       }
     } else if (keypadCandidatePair == -1) {
-      // A normal '*' action is deferred until release so a maintenance hold
-      // never deletes/cancels anything while its ten-second timer is active.
-      if (!wifiSetupHoldTriggered) handleKeypadKey('*');
+      // A normal '*' action is deferred until release so a hold never
+      // deletes/cancels anything while its timer is running. Released during
+      // the countdown: just restore the screen. The menu stays open on release.
+      const uint32_t held = millis() - wifiSetupHoldStartedAt;
+      if (!wifiSetupHoldTriggered && !recoveryMenuActive) {
+        if (held >= RECOVERY_COUNTDOWN_FROM_MS) redrawProductionUi();
+        else handleKeypadKey('*');
+      }
+      recoveryCountdownShown = -1;
       wifiSetupHoldActive = false;
       wifiSetupHoldTriggered = false;
       wifiSetupHoldStartedAt = 0;

@@ -50,3 +50,14 @@ re-scan (0 open). All events accepted by `/api/station/events/sync`.
 - Shown after DEFECT > 0 (as before, same as v2 and the web kiosk). Keys changed because repairable defects are rare:
   **`#` = KHÔNG, tiếp tục** → confirm screen (then `#` finishes); **`1` = CÓ** → repairable-quantity input (`#` to
   continue); `*` = back to DEFECT. Was 1 = KHÔNG, 2 = CÓ. Serial/console: 1 = CÓ, 2 (or 0) = KHÔNG.
+
+## Hold `*` → recovery menu (ported from v2, user 2026-10-07)
+- Hold `*`: countdown from 3 s ("ĐANG GIỮ * — MENU SAU N GIÂY"), **MENU KHÔI PHỤC at 5 s**, keep holding to **10 s →
+  Wi-Fi setup portal** directly (as in v2; was: 10 s → maintenance mode). Released before 3 s, `*` is the normal
+  delete/back key; released during the countdown, the screen is restored.
+- Menu (works from any screen, independent of the session state): 1 Thử lại mạng (Wi-Fi reconnect + heartbeat now),
+  2 Đồng bộ lại (send the queue now, refresh the catalog when idle), 3 Cài đặt Wi-Fi (portal), 4 Quay lại (also `*`/`#`),
+  5 Khởi động lại, 6 Thông tin thiết bị (FW, ID, Wi-Fi/RSSI, IP, server, bind + queue, scanner baud, keypad, UUID),
+  **7 Bảo trì (đổi server)** = v1's maintenance page, kept.
+- Console (serial/LAN): `recovery-menu`, `key <c>` (inject a keypad key, for tests). Verified over serial: open, 6,
+  any key back, 2, reopen, 4. The physical 5 s / 10 s hold needs a person at the keypad.
