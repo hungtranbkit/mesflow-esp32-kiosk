@@ -5445,6 +5445,16 @@ void handleSerialLine(String line) {
     } else {
       if (!rt.bound && !bindKiosk()) return;
       clearRuntimeSelection();
+      // The HTTPS lookup takes ~1.5-2 s (TLS handshake per request). Show the
+      // cached name right away; LOOKUP_WORKER only redraws the header, so this
+      // screen stays until the lookup picks the final one (user, 2026-10-07).
+      if (CachedWorker* cached = findCachedWorker(line.c_str())) {
+        safeCopy(rt.workerCode, sizeof(rt.workerCode), cached->code);
+        safeCopy(rt.workerName, sizeof(rt.workerName), cached->name);
+        clearOpenOps();
+        drawWorker();
+        Serial.printf("[KIOSK] Hien ten tu cache: %s\n", rt.workerCode);
+      }
       if (!lookupQr(line.c_str(), true)) return;   // fills openOps (server + unsynced local) and picks the screen
     }
     if (rt.activeSessionId != 0) {

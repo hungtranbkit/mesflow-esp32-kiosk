@@ -79,3 +79,8 @@ re-scan (0 open). All events accepted by `/api/station/events/sync`.
   worker screen and the "ĐANG LÀM" screen, wrapping to 2 lines (box 62 px). In the multi-OP list it is always 16 px,
   on up to 2 lines. Verified on the bench board: "Huỳnh Thị Mơ" (1 line) and "Phạm Hoàng Huyền Linh" (2 lines),
   same size.
+
+## Instant employee name (2026-10-07)
+- On an employee scan the name is drawn at once from the offline worker cache, then the HTTPS `/api/lookup` runs
+  (TLS handshake per request, ~1.7 s) and picks the final screen (open OPs / quantity input). Measured on the bench
+  board: name at 0.35 s after the scan (was ~2.3 s). Unknown cards still wait for the server.
