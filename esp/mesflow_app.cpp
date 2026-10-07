@@ -196,6 +196,7 @@ static uint8_t scannerFrame[SCANNER_FRAME_MAX] = {0};
 static size_t scannerFrameLength = 0;
 static uint32_t scannerLastByteAt = 0;
 static uint32_t scannerByteCount = 0;
+static volatile uint32_t scannerRxErrors = 0;   // UART frame/break/parity errors (event task)
 static uint32_t scannerFrameCount = 0;
 
 // Capacitive touch (FT6336G capacitive touch, I2C address 0x38)
@@ -5332,6 +5333,32 @@ static bool handleConsoleCommand(String line) {
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); Serial.println("Da mo test cam ung."); return true; }
   if (cmd == "recovery-menu") { openRecoveryMenu(); return true; }
+  // Wiring check that does not depend on the baud: count level changes on the
+  // scanner RX pin for 10 s (scan during that time). 0 edges = no signal reaches
+  // GPIO44 (cable / TX wire); edges but no bytes = baud / UART side.
+  if (cmd == "scanner-probe") {
+    Serial.println("[SCANNER PROBE] Quet ma trong 10 giay...");
+    const int pin = SCANNER_RX_PIN;
+    int last = digitalRead(pin), edges = 0, lows = 0;
+    const uint32_t started = millis();
+    uint32_t samples = 0, lastEdgeUs = micros(), minPulseUs = 0xFFFFFFFF;
+    while (millis() - started < 10000) {
+      const int v = digitalRead(pin);
+      if (v != last) {
+        const uint32_t now = micros(), width = now - lastEdgeUs;
+        if (edges > 0 && width >= 2 && width < minPulseUs) minPulseUs = width;
+        lastEdgeUs = now; edges++; last = v;
+      }
+      if (!v) lows++;
+      if ((++samples & 0x3FFF) == 0) esp_task_wdt_reset();
+    }
+    // the shortest pulse is one bit -> baud estimate
+    const uint32_t estBaud = minPulseUs != 0xFFFFFFFF && minPulseUs ? 1000000UL / minPulseUs : 0;
+    Serial.printf("[SCANNER PROBE] GPIO%d edges=%d min_pulse_us=%lu est_baud~%lu uart_baud=%lu bytes_uart=%lu rx_errors=%lu\n",
+                  pin, edges, (unsigned long)(minPulseUs == 0xFFFFFFFF ? 0 : minPulseUs), (unsigned long)estBaud,
+                  (unsigned long)scannerBaud, (unsigned long)scannerByteCount, (unsigned long)scannerRxErrors);
+    return true;
+  }
   // Serial-only (needs the USB cable): switch server/station/device/token without
   // touching Wi-Fi, identity, keypad mapping or scanner baud. Same rules as the
   // LAN provisioning API (applyConfigJson). Example:
@@ -5675,7 +5702,18 @@ void dispatchScannerFrame(const char* reason) {
                 static_cast<unsigned>(scannerText.length()),
                 scannerText.c_str());
 
+  // Same code scanned again while the kiosk was still busy with it (operator
+  // re-scans when the screen has not reacted yet): handle it once.
+  static String lastDispatchedScan;
+  static uint32_t lastDispatchedScanAt = 0;
+  if (scannerText.length() && scannerText == lastDispatchedScan && millis() - lastDispatchedScanAt < 3000) {
+    Serial.printf("[SCANNER DUP] bo qua ma lap lai: %s\n", scannerText.c_str());
+    scannerFrameLength = 0;
+    return;
+  }
   if (scannerText.startsWith("WF|EMP|") || isOperationQr(scannerText.c_str())) {
+    lastDispatchedScan = scannerText;
+    lastDispatchedScanAt = millis();
     noteScannerFrameValid();
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
@@ -5694,7 +5732,6 @@ void dispatchScannerFrame(const char* reason) {
 // A scanner at a much LOWER baud than the UART can produce no bytes at all,
 // only frame/break errors (the "silent wrong baud" case). Those errors count as
 // garbage for the auto-detect too. Set from the UART event task -> volatile.
-static volatile uint32_t scannerRxErrors = 0;
 static uint32_t scannerRxErrorsSeen = 0;
 static uint32_t scannerRxErrorAt = 0;
 void installScannerErrorHook() {
@@ -5738,6 +5775,14 @@ void readScannerCommands() {
       Serial.println("[SCANNER WARNING] Frame day; in frame hien tai va bat dau lai.");
       dispatchScannerFrame("BUFFER_FULL");
       scannerFrame[scannerFrameLength++] = value;
+    }
+    // The scanner ends every code with CR. Cut the frame there: bytes read in
+    // one go (the loop was busy in a 1-7 s HTTPS call) used to be glued into one
+    // invalid frame, e.g. "WF|EMP|NV006WF|EMP|NV007WF|EMP|NV008" (2026-10-07).
+    if ((value == '\r' || value == '\n') && scannerFrameLength > 1) {
+      dispatchScannerFrame("CR");
+    } else if ((value == '\r' || value == '\n') && scannerFrameLength == 1) {
+      scannerFrameLength = 0;   // stray terminator (CR LF pair)
     }
   }
 

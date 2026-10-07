@@ -69,3 +69,7 @@ re-scan (0 open). All events accepted by `/api/station/events/sync`.
 - OTA: successful check every 5 min (was 12 s).
 - Keypad `*` on the employee screen ("* HỦY") now cancels back to "QUÉT THẺ NHÂN VIÊN" (it was ignored: the keypad
   handler only knew quantity/confirm screens). Open sessions are not touched. Verified on the bench board (screenshot).
+- Scanner frames are cut at CR/LF (the GM65 terminator), not only on a 50 ms gap: scans read in one go after a busy
+  loop (HTTPS call 1–7 s) were glued into one invalid frame ("WF|EMP|NV006WF|EMP|NV007WF|EMP|NV008"), which looked like
+  "the scanner does not work". The same code repeated within 3 s is handled once. Console `scanner-probe` measures the
+  raw RX pin for 10 s (edges, shortest pulse -> baud estimate, UART bytes/errors) to tell wiring vs. baud vs. firmware.
