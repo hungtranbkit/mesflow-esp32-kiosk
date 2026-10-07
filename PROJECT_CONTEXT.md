@@ -33,6 +33,21 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
 4. Serial logs: this FQBN has **USB CDC on boot OFF**, so `Serial` goes to UART0 pins, not `/dev/ttyACM0` —
    the USB port is silent. Observe via DEV DB (`kiosk_identities`, `kiosk_status`) or the remote console.
 
+## v5.6.0 (2026-10-07) — multi-OP + stability (see CHANGELOG_v5_6_0.md)
+- `OpenOp openOps[MAX_OPEN_OPS=6]` next to `RuntimeData rt`; helpers before `offlineLookupWorker`
+  (`findOpenOp` matches QR or `WF|OPID|<id>` → operation id, `mergeLocalOpenOps`, `selectOpenOp`,
+  `enterAfterWorkerScan`, `eventAnswered`). `lookupQr(worker)` fills the list; the OP-scan branch selects or starts.
+- Fixed: ghost local session after an online finish; catalog refresh every 60 s when empty; background sync errors
+  hijacking the screen; OTA polling with no CA (http.begin failures every 12–25 s).
+- Verified end-to-end on the board against DEV (NV005, DEV-OP1/DEV-OP2: sessions 17/18) — see the changelog.
+- **Bench board currently runs a TEST build with `CDCOnBoot=cdc`** (USB serial works: send `WF|EMP|…`, `WF|OP|…`,
+  digits, `status` over `/dev/ttyACM0` 115200; harness `/home/dell/aigw-probe/esp_harness.py`). The repo profile
+  (`.mesflow-arduino.env`) is unchanged (CDC off) — decide before fleet builds whether CDC should be on.
+- Not done (audit, keep lean): event log is never compacted (after ~250 cycles the 500-ACK scratch overflows →
+  old events resent / "BO NHO OFFLINE DAY"); `countPendingOfflineEvents` scans the log every loop; unauthenticated
+  LAN console (port 17892) incl. factory-reset; device_secret over plain HTTP. No QC / pause / setup-skip-qty
+  (web kiosk: SETUP skips the quantity screens).
+
 ## Known gaps / next
 - One transient `ui_state=ERROR` at 08:02:31 with no server event — likely a cache/lookup call failing because
   DEV has no stations/operations data for this kiosk. Confirm with the feature audit (in progress).

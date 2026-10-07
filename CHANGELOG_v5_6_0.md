@@ -1,0 +1,29 @@
+# v5.6.0 — Several operations at once + connection stability (2026-10-07)
+
+## Multi-OP (server migration 0054_multi_open_session_per_employee)
+- One employee may run several operations at once (max **6** on the device; the server allows one open
+  session per operation). `/api/lookup` `active_sessions[]` is read in full (was: only `[0]`), plus local
+  STARTs not yet answered by the server.
+- Employee scan: 0 open → "QUÉT CÔNG ĐOẠN"; 1 open → straight to its quantity (unchanged); 2+ → the employee
+  screen shows "ĐANG CHẠY N VIỆC" + up to 3 names, and an OP scan picks one.
+- OP scan anywhere (incl. on a quantity screen): an OP the employee already runs → finish THAT one; a new OP →
+  START it, the others stay open (was: "DANG CO SESSION" refusal).
+- Finish targets the selected session (offline: by local session id, not "the worker's first one"); a server
+  session is finished local-first even while offline.
+- `WF|OPID|<id>` labels (every SETUP label) are accepted from the scanner and matched by operation id.
+- Heartbeat sends `open_operations`.
+
+## Stability
+- Ghost session: an online FINISH now drops the local session record; on an online employee scan, local records
+  whose START the server already answered but no longer lists (finished elsewhere) are dropped.
+- Catalog auto-refresh: an empty catalog is retried after 15 min (was every 60 s inside loop(), with 15 s + 35 s
+  timeouts against the 40 s task watchdog); a failed refresh waits 5 min.
+- Background sync problems (no ACK, wrong ACK, transient refusal, cannot store ACK) are logged, no longer switch
+  the operator's screen to ERROR. A REJECTED event is still shown.
+- OTA: with an HTTPS agent and no CA in the build, the kiosk no longer polls (it could only fail, every 12–25 s,
+  and posted OTA_CHECK from the second core). Build with `MESFLOW_OTA_CA_FILE` to enable OTA.
+
+## Verified on the reference board (DEV, NV005, DEV-PO-1)
+START OP1 → re-scan (1 open, quantity) → scan OP2 on the quantity screen (2nd START) → re-scan (2 open, list) →
+scan OP1 → 7/0 → finish → OP1 CLOSED good=7, OP2 OPEN → re-scan (1 open) → `WF|OPID|2` → 3/0 → OP2 CLOSED good=3 →
+re-scan (0 open). All events accepted by `/api/station/events/sync`.

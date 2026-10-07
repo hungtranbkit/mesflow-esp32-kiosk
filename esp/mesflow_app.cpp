@@ -73,10 +73,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.5.7"
+#define FW_VERSION "5.6.0"
 #define FW_BUILD "20260813.0015"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.5.7-KIMEX-OTA-DEFAULT";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.0-KIMEX-MULTI-OP";
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -521,6 +521,23 @@ struct RuntimeData {
 
 RuntimeData rt;
 
+// Several operations open at once for one employee (server migration
+// 0054_multi_open_session_per_employee: at most ONE open session per
+// operation, any number of operations). The kiosk keeps a short list and
+// picks one by SCANNING its operation QR, never by position.
+constexpr uint8_t MAX_OPEN_OPS = 6;
+struct OpenOp {
+  int sessionId = 0;          // > 0 server session id, -1 local (start not acked yet)
+  int operationId = 0;
+  char localId[56] = "";      // local session id when sessionId == -1
+  char opQr[96] = "";
+  char opName[72] = "";
+  char po[40] = "";
+  char part[40] = "";
+};
+OpenOp openOps[MAX_OPEN_OPS];
+uint8_t openOpCount = 0;
+
 
 // ============================================================
 // Durable transaction journal
@@ -961,10 +978,74 @@ bool enqueueOfflineEvent(OfflineEventType type,const char* localSessionId,int go
   Serial.printf("[OFFLINE] queued %s seq=%lu pending=%u\n",type==OfflineEventType::START?"START":"FINISH",(unsigned long)seq,countPendingOfflineEvents());return true;
 }
 
+bool isOperationQr(const char* qr){return qr&&(strncmp(qr,"WF|OP|",6)==0||strncmp(qr,"WF|OPID|",8)==0);}
+int operationIdFromQr(const char* qr){return (qr&&strncmp(qr,"WF|OPID|",8)==0)?atoi(qr+8):0;}
+void clearOpenOps(){openOpCount=0;}
+int findOpenOp(const char* qr){
+  const int id=operationIdFromQr(qr);
+  for(uint8_t i=0;i<openOpCount;i++){
+    if(openOps[i].opQr[0]&&!strcmp(openOps[i].opQr,qr))return i;
+    if(id>0&&openOps[i].operationId==id)return i;
+  }
+  return -1;
+}
+bool addOpenOp(const OpenOp& o){
+  if(openOpCount>=MAX_OPEN_OPS)return false;
+  if(o.opQr[0]&&findOpenOp(o.opQr)>=0)return false;
+  if(o.operationId>0)for(uint8_t i=0;i<openOpCount;i++)if(openOps[i].operationId==o.operationId)return false;
+  openOps[openOpCount++]=o;return true;
+}
+int findOfflineSessionFor(const char* workerQr,const char* opQr){for(uint16_t i=0;i<offlineSessionCount;i++)if(!strcmp(offlineSessions[i].workerQr,workerQr)&&!strcmp(offlineSessions[i].operationQr,opQr))return i;return -1;}
+int findOfflineSessionByLocalId(const char* id){if(!id||!id[0])return -1;for(uint16_t i=0;i<offlineSessionCount;i++)if(!strcmp(offlineSessions[i].localSessionId,id))return i;return -1;}
+// True when the server has answered (ACK or REJECT) the event, i.e. the local
+// START is no longer the only record of that session.
+bool eventAnswered(const char* eventId){
+  if(!fsReady||!eventId||!eventId[0])return false;
+  File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return false;OfflineLogRecord r;
+  while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){if(validObject(r)&&(r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&!strcmp(r.eventId,eventId)){f.close();return true;}}
+  f.close();return false;
+}
+void removeOfflineSessionAt(uint16_t si){for(uint16_t i=si+1;i<offlineSessionCount;i++)offlineSessions[i-1]=offlineSessions[i];offlineSessionCount--;}
+// Local sessions of this worker that the list does not have yet. Online
+// (serverKnown=true): only STARTs the server has not answered -- an answered
+// START is in the server list while open, and a local record the server no
+// longer lists was finished elsewhere: it is dropped (it used to come back as a
+// "ghost" session after an online finish). Offline: every local session.
+void mergeLocalOpenOps(const char* workerQr,bool serverKnown){
+  bool changed=false;
+  for(uint16_t i=0;i<offlineSessionCount;i++){
+    OfflineSession&s=offlineSessions[i];
+    if(strcmp(s.workerQr,workerQr)||s.finishPending)continue;
+    if(serverKnown&&eventAnswered(s.startEventId)){
+      if(findOpenOp(s.operationQr)<0){Serial.printf("[MULTI-OP] bo session cuc bo da dong: %s\n",s.localSessionId);removeOfflineSessionAt(i);i--;changed=true;}
+      continue;
+    }
+    if(findOpenOp(s.operationQr)>=0)continue;
+    OpenOp o;o.sessionId=-1;safeCopy(o.localId,sizeof(o.localId),s.localSessionId);safeCopy(o.opQr,sizeof(o.opQr),s.operationQr);safeCopy(o.opName,sizeof(o.opName),s.operationName);
+    addOpenOp(o);
+  }
+  if(changed)saveOfflineSessions();
+}
+void selectOpenOp(uint8_t i){
+  OpenOp&o=openOps[i];
+  rt.activeSessionId=o.sessionId;rt.operationId=o.operationId;rt.hasOperation=true;
+  safeCopy(rt.activeGroupId,sizeof(rt.activeGroupId),o.sessionId<0?o.localId:"");
+  safeCopy(rt.operationQr,sizeof(rt.operationQr),o.opQr);safeCopy(rt.operationName,sizeof(rt.operationName),o.opName);
+  safeCopy(rt.po,sizeof(rt.po),o.po);safeCopy(rt.part,sizeof(rt.part),o.part);
+  demoGoodQty=0;demoReworkQty=0;demoDefectQty=0;
+}
+// After an employee scan: one open OP -> straight to its quantity (unchanged
+// behaviour); several -> the employee screen lists them and an OP scan picks one.
+void enterAfterWorkerScan(){
+  rt.activeSessionId=0;rt.activeGroupId[0]='\0';
+  if(openOpCount==1){selectOpenOp(0);setUi(UiState::INPUT_GOOD);}
+  else setUi(UiState::WORKER_OK);
+}
+
 bool offlineLookupWorker(const char* qr){
   CachedWorker* w=findCachedWorker(qr);if(!w){setError(-43,"THE CHUA CO CACHE");return false;}
   clearRuntimeSelection();rt.hasWorker=true;safeCopy(rt.workerQr,sizeof(rt.workerQr),qr);safeCopy(rt.workerCode,sizeof(rt.workerCode),w->code);safeCopy(rt.workerName,sizeof(rt.workerName),w->name);
-  int si=findOfflineSession(qr);if(si>=0){OfflineSession&s=offlineSessions[si];rt.activeSessionId=-1;safeCopy(rt.activeGroupId,sizeof(rt.activeGroupId),s.localSessionId);safeCopy(rt.operationQr,sizeof(rt.operationQr),s.operationQr);safeCopy(rt.operationName,sizeof(rt.operationName),s.operationName);rt.hasOperation=true;demoGoodQty=0;demoReworkQty=0;demoDefectQty=0;setUi(UiState::INPUT_GOOD);}else setUi(UiState::WORKER_OK);
+  clearOpenOps();mergeLocalOpenOps(qr,false);enterAfterWorkerScan();
   return true;
 }
 bool offlineLookupOperationAndStart(const char* qr){
@@ -979,14 +1060,15 @@ bool offlineLookupOperationAndStart(const char* qr){
 }
 
 bool offlineFinishSession(){
-  int si=findOfflineSession(rt.workerQr);if(si<0){setError(-47,"KHONG CO SESSION OFFLINE");return false;}OfflineSession &s=offlineSessions[si];
+  int si=findOfflineSessionByLocalId(rt.activeGroupId);if(si<0)si=findOfflineSessionFor(rt.workerQr,rt.operationQr);
+  if(si<0){setError(-47,"KHONG CO SESSION OFFLINE");return false;}OfflineSession &s=offlineSessions[si];
   safeCopy(rt.operationQr,sizeof(rt.operationQr),s.operationQr);safeCopy(rt.operationName,sizeof(rt.operationName),s.operationName);
   // Phase 1: persist finish intent inside session record.
   if(!s.finishPending){s.finishPending=1;s.finishSequence=nextDeviceSequence();snprintf(s.finishEventId,sizeof(s.finishEventId),"%s-%010lu",DEVICE_ID,(unsigned long)s.finishSequence);s.finishGoodQty=demoGoodQty;s.finishDefectQty=demoDefectQty;s.finishEpoch=currentEpoch();snprintf(s.workerName,sizeof(s.workerName),"RW:%d",demoReworkQty);sealObject(s);if(!saveOfflineSessions()){setError(-48,"LOI LUU FINISH");return false;}}
   // Phase 2: append immutable event. Reboot recovery repeats safely using the same event_id.
   if(!appendOfflineEventWithIdentity(OfflineEventType::FINISH,s.finishEventId,s.finishSequence,s.localSessionId,s.workerQr,s.workerName,s.operationQr,s.operationName,s.finishGoodQty,s.finishDefectQty,s.finishEpoch,demoReworkQty)){setError(-42,"KHONG LUU FINISH EVENT");return false;}
   // Phase 3: only after event is durable, remove open local session.
-  for(uint16_t i=si+1;i<offlineSessionCount;i++)offlineSessions[i-1]=offlineSessions[i];offlineSessionCount--;if(!saveOfflineSessions()){setError(-48,"LOI CAP NHAT SESSION");return false;}
+  removeOfflineSessionAt(si);if(!saveOfflineSessions()){setError(-48,"LOI CAP NHAT SESSION");return false;}
   drawSimple("ĐÃ LƯU TẠM",rt.workerName,"SẢN LƯỢNG ĐÃ LƯU","SẼ TỰ ĐỘNG GỬI",C_WARN);delay(1600);resetForNextWorker();return true;
 }
 
@@ -1011,6 +1093,17 @@ bool readOldestPendingEvent(OfflineLogRecord &out){
   f.close();return false;
 }
 
+// Catalog download blocks loop() (15 s connect + 35 s read): keep it rare.
+constexpr uint32_t CATALOG_EMPTY_RETRY_MS = 15UL * 60UL * 1000UL;
+constexpr uint32_t CATALOG_FAIL_RETRY_MS = 5UL * 60UL * 1000UL;
+
+// A background sync problem is logged, not shown: it used to switch the
+// operator's screen to ERROR in the middle of other work. Only a REJECTED
+// event (the operator must know) still goes to the screen.
+static void backgroundError(int status,const char* message){
+  const bool previous=suppressNetworkUiErrors;suppressNetworkUiErrors=true;setError(status,message);suppressNetworkUiErrors=previous;
+}
+
 bool syncOneOfflineEvent(){
   if(!rt.bound||WiFi.status()!=WL_CONNECTED)return false;OfflineLogRecord e;if(!readOldestPendingEvent(e))return true;
   DynamicJsonDocument req(2304),resp(2048);req["device_id"]=DEVICE_ID;req["kiosk_id"]=DEVICE_ID;req["station_code"]=STATION_CODE;req["app_version"]=APP_VERSION;
@@ -1019,9 +1112,9 @@ bool syncOneOfflineEvent(){
   const bool posted=httpPostJson(OFFLINE_SYNC_PATH,req,resp,true,true);
   suppressNetworkUiErrors=false;
   if(!posted)return false;
-  JsonArray results=resp["results"].as<JsonArray>();if(results.isNull()||!results.size()){setError(-49,"SYNC KHONG CO ACK");return false;}
+  JsonArray results=resp["results"].as<JsonArray>();if(results.isNull()||!results.size()){backgroundError(-49,"SYNC KHONG CO ACK");return false;}
   const char* status=results[0]["status"]|"";const char* ackId=results[0]["event_id"]|"";
-  if(strcmp(ackId,e.eventId)!=0){setError(-50,"ACK SAI EVENT");return false;}
+  if(strcmp(ackId,e.eventId)!=0){backgroundError(-50,"ACK SAI EVENT");return false;}
   if(!strcmp(status,"rejected")){
     // BUG (found 2026-08-22, round 3): the server correctly rejects a
     // business-invalid offline START/FINISH (e.g. Operation's PO already
@@ -1046,7 +1139,7 @@ bool syncOneOfflineEvent(){
     // create an admin notification row, unlike the RECONCILE_REPLAY-only
     // Session Exceptions path which never covers an ordinary offline reject).
     sendKioskEvent("OFFLINE_SYNC_REJECTED","ERROR",notifyMsg,"Kiem tra OP/PO va bao quan doc",0);
-    if(!appendReject(e.eventId,reasonCode)){setError(-52,"KHONG LUU DUOC REJECT");return false;}
+    if(!appendReject(e.eventId,reasonCode)){backgroundError(-52,"KHONG LUU DUOC REJECT");return false;}
     lastOfflineSyncEpoch=currentEpoch();
     // On-device visibility for whoever is at the kiosk right now. Short,
     // no-diacritic text -- same convention as every other setError() call
@@ -1055,8 +1148,8 @@ bool syncOneOfflineEvent(){
     setError(0,isStart?"BI TU CHOI - PO CHUA/DA XONG":"BI TU CHOI - BAO QUAN DOC");
     return true;
   }
-  if(strcmp(status,"accepted")&&strcmp(status,"duplicate")){setError(-51,"SERVER TAM THOI TU CHOI");return false;}
-  if(!appendAck(e.eventId)){setError(-52,"KHONG LUU DUOC ACK");return false;}
+  if(strcmp(status,"accepted")&&strcmp(status,"duplicate")){backgroundError(-51,"SERVER TAM THOI TU CHOI");return false;}
+  if(!appendAck(e.eventId)){backgroundError(-52,"KHONG LUU DUOC ACK");return false;}
   lastOfflineSyncEpoch=currentEpoch();Serial.printf("[OFFLINE SYNC] %s -> %s, pending=%u\n",e.eventId,status,countPendingOfflineEvents());return true;
 }
 
@@ -2946,8 +3039,18 @@ void drawWorker(uint8_t frame = 0) {
   tft.fillScreen(C_BG);
   drawIndustrialHeader(C_OK);
   drawSectionLabel("NHÂN VIÊN");
-  drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 82, 216, 58, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
-  drawCenteredTextFit("QUÉT CÔNG ĐOẠN", SCREEN_LEFT_MARGIN, 166, 216, 58, FONT_TITLE, FONT_TITLE - 1, 2, C_INFO, true);
+  if (openOpCount == 0) {
+    drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 82, 216, 58, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
+    drawCenteredTextFit("QUÉT CÔNG ĐOẠN", SCREEN_LEFT_MARGIN, 166, 216, 58, FONT_TITLE, FONT_TITLE - 1, 2, C_INFO, true);
+  } else {
+    drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 64, 216, 34, FONT_SECTION, FONT_SECTION - 1, 1, C_TEXT, true);
+    char head[40]; snprintf(head, sizeof(head), "ĐANG CHẠY %u VIỆC", openOpCount);
+    drawCenteredTextFit(head, SCREEN_LEFT_MARGIN, 100, 216, 30, FONT_SECTION, FONT_SECTION - 1, 1, C_WARN, true);
+    const uint8_t shown = openOpCount < 3 ? openOpCount : 3;
+    for (uint8_t i = 0; i < shown; i++)
+      drawCenteredTextFit(openOps[i].opName, SCREEN_LEFT_MARGIN, 132 + i * 28, 216, 26, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED, false);
+    drawCenteredTextFit("QUÉT MÃ: CHỐT / THÊM VIỆC", SCREEN_LEFT_MARGIN, 220, 216, 26, FONT_SECTION, FONT_SECTION - 1, 1, C_INFO, true);
+  }
   drawFooter("* HỦY", "");
 }
 
@@ -4258,7 +4361,7 @@ bool lookupQr(const char* qr, bool expectingWorker) {
     filter["active_sessions"][0][key] = true;
   }
 
-  DynamicJsonDocument response(3072);
+  DynamicJsonDocument response(6144);   // up to MAX_OPEN_OPS sessions
   if (!httpGetJson(path, response, true, &filter)) {
     emitActionEvent(expectingWorker ? "EMPLOYEE_REJECTED" : "OPERATION_REJECTED",
                     "API_RESULT", "FAILED", rt.lastHttpStatus,
@@ -4285,29 +4388,25 @@ bool lookupQr(const char* qr, bool expectingWorker) {
 
     JsonArray active = response["active_sessions"].as<JsonArray>();
     JsonObject activeSingle = response["active_session"].as<JsonObject>();
-    rt.activeSessionId = 0;
-    rt.activeGroupId[0] = '\0';
-    rt.activeStartTime[0] = '\0';
-
-    if ((!active.isNull() && active.size() > 0) || !activeSingle.isNull()) {
-      JsonObject s = (!active.isNull() && active.size() > 0) ? active[0].as<JsonObject>() : activeSingle;
-      rt.activeSessionId = s["id"] | 0;
-      safeCopy(rt.activeGroupId, sizeof(rt.activeGroupId), s["session_group_id"] | "");
-      safeCopy(rt.activeStartTime, sizeof(rt.activeStartTime), s["start_time"] | "");
-      rt.operationId = s["operation_id"] | 0;
-      safeCopy(rt.operationCode, sizeof(rt.operationCode), s["operation_code"] | "");
-      safeCopy(rt.operationName, sizeof(rt.operationName), s["operation_name"] | "Operation dang mo");
-      safeCopy(rt.operationQr, sizeof(rt.operationQr), s["operation_qr"] | "");
-      rt.hasOperation = true;
-      safeCopy(rt.po, sizeof(rt.po), s["po"] | "");
-      safeCopy(rt.part, sizeof(rt.part), s["part"] | "");
-      demoGoodQty = 0;
-      demoReworkQty = 0;
-      demoDefectQty = 0;
-      setUi(UiState::INPUT_GOOD);
-    } else {
-      setUi(UiState::WORKER_OK);
-    }
+    clearOpenOps();
+    auto addServerSession = [](JsonObject s) {
+      OpenOp o;
+      o.sessionId = s["id"] | 0;
+      if (o.sessionId <= 0) return;
+      o.operationId = s["operation_id"] | 0;
+      safeCopy(o.opQr, sizeof(o.opQr), s["operation_qr"] | "");
+      safeCopy(o.opName, sizeof(o.opName), s["operation_name"] | "Cong doan dang mo");
+      safeCopy(o.po, sizeof(o.po), s["po"] | "");
+      safeCopy(o.part, sizeof(o.part), s["part"] | "");
+      if (!addOpenOp(o)) Serial.printf("[MULTI-OP] bo qua session %d (trung hoac qua %u)\n", o.sessionId, MAX_OPEN_OPS);
+    };
+    if (!active.isNull()) for (JsonObject s : active) addServerSession(s);
+    if (openOpCount == 0 && !activeSingle.isNull()) addServerSession(activeSingle);
+    // START is local-first: a session started a moment ago may not be on the
+    // server yet. Add those, and drop local records the server already closed.
+    mergeLocalOpenOps(rt.workerQr, true);
+    Serial.printf("[MULTI-OP] %s co %u viec dang mo\n", rt.workerCode, openOpCount);
+    enterAfterWorkerScan();
 
     emitActionEvent("EMPLOYEE_ACCEPTED", "API_RESULT", "SUCCESS", 200, millis() - actionStartedAt);
     return true;
@@ -4470,6 +4569,10 @@ bool finishSession() {
       demoDefectQty,epoch,demoReworkQty)){
     setError(-30,"KHÔNG LƯU ĐƯỢC - BÁO QUẢN LÝ");return false;
   }
+  {
+    int si=findOfflineSessionFor(rt.workerQr,rt.operationQr);
+    if(si>=0&&!offlineSessions[si].finishPending){removeOfflineSessionAt(si);saveOfflineSessions();}
+  }
   Serial.printf("[OFFLINE] local-first FINISH event=%s pending=%u\n",eventId,countPendingOfflineEvents());
   drawSimple("ĐÃ GHI NHẬN",countPendingOfflineEvents()>0?"CHỜ ĐỒNG BỘ":"","","",C_OK);
   delay(900);resetForNextWorker();return true;
@@ -4520,6 +4623,7 @@ bool sendHeartbeat() {
     if (rt.po[0]) request["po_code"] = rt.po;
   }
   request["ui_state"] = stateName(uiState);
+  if (rt.hasWorker) request["open_operations"] = openOpCount;
   request["session_elapsed_seconds"] = 0;
 
   // Thong tin chan doan thiet bi.
@@ -4761,6 +4865,15 @@ static void otaCheckTask(void*) {
 }
 
 static void scheduleOtaCheck() {
+  // An HTTPS agent without a CA in the build can only fail (fail-closed), and
+  // every attempt also POSTed an OTA_CHECK event from the other core and
+  // logged "http.begin that bai" every 12-25 s. Build with MESFLOW_OTA_CA_FILE
+  // to enable OTA; without it the kiosk does not poll at all.
+  static bool otaDisabledLogged = false;
+  if (strncmp(otaAgentBase(), "https://", 8) == 0 && strlen(MESFLOW_ROOT_CA_PEM) == 0) {
+    if (!otaDisabledLogged) { Serial.println("[OTA] TAT: agent HTTPS nhung ban build khong co CA -> khong kiem tra OTA."); otaDisabledLogged = true; }
+    return;
+  }
   if (otaCheckTaskRunning || !rt.bound || WiFi.status() != WL_CONNECTED || !rt.online) return;
   const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? OTA_RETRY_INTERVAL_MS : OTA_CHECK_INTERVAL_MS;
   if (lastOtaCheckAt && millis() - lastOtaCheckAt < interval) return;
@@ -5208,47 +5321,18 @@ void handleSerialLine(String line) {
     } else {
       if (!rt.bound && !bindKiosk()) return;
       clearRuntimeSelection();
-      if (!lookupQr(line.c_str(), true)) return;
+      if (!lookupQr(line.c_str(), true)) return;   // fills openOps (server + unsynced local) and picks the screen
     }
-
-    // BUG (found 2026-08-22): the online lookupQr() above trusts ONLY the
-    // server's view of active_session. But START is LOCAL-FIRST -- it's
-    // written to the local offline journal instantly and only synced to the
-    // server after a backoff delay (starts at 5s). If this same worker's
-    // card is re-scanned before that sync lands (very plausible -- scan
-    // worker, scan OP, then immediately re-scan the same worker card to
-    // enter quantity), the server still doesn't know about the session yet,
-    // so rt.activeSessionId stays 0 and the operator gets bounced back to
-    // "scan OP" as if no session exists, even though one was already
-    // durably created. Fall back to the local session record, same as the
-    // offline path already does, before deciding there's really no session.
-    if (rt.activeSessionId == 0) {
-      int si = findOfflineSession(rt.workerQr);
-      if (si >= 0) {
-        OfflineSession& s = offlineSessions[si];
-        rt.activeSessionId = -1;
-        safeCopy(rt.activeGroupId, sizeof(rt.activeGroupId), s.localSessionId);
-        safeCopy(rt.operationQr, sizeof(rt.operationQr), s.operationQr);
-        safeCopy(rt.operationName, sizeof(rt.operationName), s.operationName);
-        rt.hasOperation = true;
-        Serial.println("[KIOSK] Session cuc bo chua sync nhung van con hieu luc.");
-      }
-    }
-
     if (rt.activeSessionId != 0) {
       emitActionEvent("FINISH_REQUESTED", "USER_ACTION", "PENDING");
-      demoGoodQty = 0;
-      demoReworkQty = 0;
-      demoDefectQty = 0;
-      Serial.println("[KIOSK] Co session mo -> nhap so dat.");
-      setUi(UiState::INPUT_GOOD);
+      Serial.println("[KIOSK] 1 viec dang mo -> nhap so dat.");
     } else {
-      Serial.println("[KIOSK] Cho quet operation.");
+      Serial.printf("[KIOSK] %u viec dang mo -> cho quet cong doan.\n", openOpCount);
     }
     return;
   }
 
-  if (line.startsWith("WF|OP|")) {
+  if (isOperationQr(line.c_str())) {
     emitActionEvent("OPERATION_SCANNED", "USER_ACTION", "RECEIVED");
     Serial.printf("[SCAN OP] %s\n", line.c_str());
     if (!rt.hasWorker || !rt.workerQr[0]) {
@@ -5258,12 +5342,23 @@ void handleSerialLine(String line) {
                       "WORKER_REQUIRED", "OPERATION_QR");
       return;
     }
-    if (rt.activeSessionId != 0) {
-      setError(0, "DANG CO SESSION");
-      emitActionEvent("OPERATION_REJECTED", "USER_ERROR", "REJECTED", 0, 0,
-                      "Quet operation trong khi nhan vien dang co session",
-                      "ACTIVE_SESSION_EXISTS", "OPERATION_QR");
-      return;
+    {
+      const int open = findOpenOp(line.c_str());
+      if (open >= 0) {   // an operation this employee already runs -> finish it
+        selectOpenOp(open);
+        emitActionEvent("FINISH_REQUESTED", "USER_ACTION", "PENDING");
+        Serial.printf("[MULTI-OP] chon viec dang mo: %s\n", rt.operationName);
+        setUi(UiState::INPUT_GOOD);
+        return;
+      }
+      if (openOpCount >= MAX_OPEN_OPS) {
+        setError(0, "TOI DA 6 VIEC - CHOT BOT TRUOC");
+        emitActionEvent("OPERATION_REJECTED", "USER_ERROR", "REJECTED", 0, 0,
+                        "Qua so viec mo cung luc", "TOO_MANY_OPEN_OPS", "OPERATION_QR");
+        return;
+      }
+      rt.activeSessionId = 0;   // starting ANOTHER operation; the open ones stay open
+      rt.activeGroupId[0] = '\0';
     }
 
     if (offlineMode || WiFi.status() != WL_CONNECTED || serverLinkState==ServerLinkState::UNREACHABLE || serverLinkState==ServerLinkState::WIFI_DOWN) {
@@ -5364,7 +5459,7 @@ void handleSerialLine(String line) {
     }
     if (uiState == UiState::CONFIRM_QTY) {
       if (line == "1") {
-        if (offlineMode || rt.activeSessionId < 0) offlineFinishSession();
+        if (rt.activeSessionId < 0) offlineFinishSession();
         else finishSession();
         return;
       }
@@ -5484,7 +5579,7 @@ void dispatchScannerFrame(const char* reason) {
                 static_cast<unsigned>(scannerText.length()),
                 scannerText.c_str());
 
-  if (scannerText.startsWith("WF|EMP|") || scannerText.startsWith("WF|OP|")) {
+  if (scannerText.startsWith("WF|EMP|") || isOperationQr(scannerText.c_str())) {
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
     handleSerialLine(scannerText);
@@ -6157,8 +6252,10 @@ void maintainConnection() {
   }
   offlineMode = false;
   if(rt.bound&&uiState==UiState::READY&&!hasPendingTransaction()&&countPendingOfflineEvents()==0){
-    const bool due=workerCacheCount==0||operationCacheCount==0||!lastCatalogAutoRefreshAt||millis()-lastCatalogAutoRefreshAt>=6UL*60UL*60UL*1000UL;
-    if(due&&millis()-lastCatalogAutoAttemptAt>=60000UL){
+    const uint32_t sinceOk=millis()-lastCatalogAutoRefreshAt;
+    const bool empty=workerCacheCount==0||operationCacheCount==0;
+    const bool due=!lastCatalogAutoRefreshAt||sinceOk>=6UL*60UL*60UL*1000UL||(empty&&sinceOk>=CATALOG_EMPTY_RETRY_MS);
+    if(due&&(!lastCatalogAutoAttemptAt||millis()-lastCatalogAutoAttemptAt>=CATALOG_FAIL_RETRY_MS)){
       lastCatalogAutoAttemptAt=millis();String message;uint16_t workers=0,operations=0;
       if(refreshCatalogFromMes(message,workers,operations)){lastCatalogAutoRefreshAt=millis();Serial.printf("[OFFLINE] snapshot revision=%s workers=%u operations=%u\n",offlineSnapshotRevision,workers,operations);}
       else Serial.printf("[OFFLINE] snapshot refresh failed: %s\n",message.c_str());
