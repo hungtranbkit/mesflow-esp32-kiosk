@@ -3146,9 +3146,11 @@ void drawAskRework() {
   drawKeyValueRow("LỖI TỔNG", demoDefectQty, 46);
   drawCenteredTextFit("CÓ LỖI SỬA ĐƯỢC?", SCREEN_LEFT_MARGIN, 86, 216, 58,
                       FONT_TITLE, FONT_TITLE - 1, 2, C_TEXT, true);
-  drawOptionRow("1", "KHÔNG, XONG", 164);
-  drawOptionRow("2", "CÓ, NHẬP SỐ", 208);
-  drawFooter("* QUAY LẠI", "");
+  // Repairable defects are rare: '#' (the key used everywhere to go on) means
+  // NO and continues; '1' opens the repairable-quantity input (user, 2026-10-07).
+  drawOptionRow("#", "KHÔNG, TIẾP TỤC", 164);
+  drawOptionRow("1", "CÓ, NHẬP SỐ", 208);
+  drawFooter("* QUAY LẠI", "# TIẾP");
 }
 
 void drawConfirmQty() {
@@ -5488,14 +5490,14 @@ void handleSerialLine(String line) {
       return;
     }
     if (uiState == UiState::ASK_REWORK) {
-      if (line == "1") {
-        demoReworkQty = 0;
-        setUi(UiState::CONFIRM_QTY);
-      } else if (line == "2") {
+      if (line == "1") {                       // CO loi sua duoc -> nhap so
         demoReworkQty = 0;
         setUi(UiState::INPUT_REWORK);
+      } else if (line == "2" || line == "0") { // KHONG (keypad: '#')
+        demoReworkQty = 0;
+        setUi(UiState::CONFIRM_QTY);
       } else {
-        Serial.println("[QTY] ASK_REWORK chi nhan 1 hoac 2.");
+        Serial.println("[QTY] ASK_REWORK: 1 = CO, 2 = KHONG (keypad: #).");
       }
       return;
     }
@@ -6090,9 +6092,10 @@ void handleKeypadKey(char key) {
   }
 
   if (uiState == UiState::ASK_REWORK) {
-    if (key == '1' || key == '2') handleSerialLine(String(key));
+    if (key == '#') { demoReworkQty = 0; setUi(UiState::CONFIRM_QTY); }      // KHONG -> xac nhan
+    else if (key == '1') { demoReworkQty = 0; setUi(UiState::INPUT_REWORK); } // CO -> nhap so sua duoc
     else if (key == '*') setUi(UiState::INPUT_DEFECT);
-    else Serial.println("[KEYPAD] Chon 1 KHONG hoac 2 CO LOI SUA DUOC.");
+    else Serial.println("[KEYPAD] # = KHONG (tiep tuc), 1 = CO loi sua duoc, * = quay lai.");
     return;
   }
 

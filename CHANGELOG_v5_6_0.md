@@ -45,3 +45,8 @@ re-scan (0 open). All events accepted by `/api/station/events/sync`.
   again (guided 12-key wizard → digits/positions normalized, matrix-shape check, saved in NVS); an unknown pair pressed
   at runtime = rewiring → recalibration when READY; 50 consecutive I2C errors re-begin the bus (as in v2), 250 →
   treated as unplugged. A saved mapping is still used at boot (no forced calibration on every power-up).
+
+## "CÓ LỖI SỬA ĐƯỢC?" screen (user, 2026-10-07)
+- Shown after DEFECT > 0 (as before, same as v2 and the web kiosk). Keys changed because repairable defects are rare:
+  **`#` = KHÔNG, tiếp tục** → confirm screen (then `#` finishes); **`1` = CÓ** → repairable-quantity input (`#` to
+  continue); `*` = back to DEFECT. Was 1 = KHÔNG, 2 = CÓ. Serial/console: 1 = CÓ, 2 (or 0) = KHÔNG.
