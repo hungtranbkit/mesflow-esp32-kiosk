@@ -453,8 +453,8 @@ bool returnToReadyAfterError = false;
 uint32_t lastHeartbeatAt = 0;
 constexpr uint32_t HEARTBEAT_MS = 20000;
 // OTA polling is deliberately short for kiosk/test operation.  A successful
-// check/no-update sleeps 12s; network/Agent errors retry after 25s.
-constexpr uint32_t OTA_CHECK_INTERVAL_MS = 12UL * 1000UL;
+// check/no-update sleeps 5 min (was 12 s); errors back off 25 s -> 30 min.
+constexpr uint32_t OTA_CHECK_INTERVAL_MS = 5UL * 60UL * 1000UL;   // was 12 s: a TLS handshake + event POST every 12 s per kiosk
 constexpr uint32_t OTA_RETRY_INTERVAL_MS = 25UL * 1000UL;
 static uint8_t otaCheckFailures = 0;   // consecutive failed checks -> 25 s, 50 s, ... up to 30 min
 static uint32_t otaRetryIntervalMs() {
