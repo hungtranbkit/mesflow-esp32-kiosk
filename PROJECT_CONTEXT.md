@@ -49,9 +49,11 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   (web kiosk: SETUP skips the quantity screens).
 
 ## Known gaps / next
-- One transient `ui_state=ERROR` at 08:02:31 with no server event — likely a cache/lookup call failing because
-  DEV has no stations/operations data for this kiosk. Confirm with the feature audit (in progress).
-- Feature parity audit vs Kiosk Web requested (incl. several OPs open at once — DEV migration
-  `0054_multi_open_session_per_employee`); v1 is single-session. Keep the ESP lean: map only what the shop floor needs.
+- The transient `ui_state=ERROR` (08:02:31) matched background-sync `setError` calls hijacking the screen
+  (audit finding) — now logged only (v5.6.0). DEV does have catalog data (27 workers / 319 operations).
+- Feature audit vs Kiosk Web done (2026-10-07): web kiosk F1–F12 incl. multi-OP, SETUP skips quantities, error
+  screen with server message/action, version auto-reload; ESP lacked multi-OP (done in 5.6.0). Remaining gaps to
+  consider, keeping the ESP lean: SETUP operations should skip the quantity screens (server zeroes quantities);
+  event-log compaction; LAN console auth.
 - To roll back to v2: rebuild `../mesflow-kiosk-runtime-v2` (`scripts/build-dev.sh`) and flash; its NVS keys
   (`kiosk_v2`, `kiosk_identity`) are in the backup above.
