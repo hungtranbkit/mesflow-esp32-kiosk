@@ -152,12 +152,33 @@ static bool validScannerBaud(uint32_t b){return b==1200||b==2400||b==4800||b==96
 constexpr uint32_t SCANNER_FRAME_TIMEOUT_MS = 50;
 constexpr size_t SCANNER_FRAME_MAX = 256;
 HardwareSerial ScannerSerial(1);
+// Auto-detect: the module's baud is unknown per unit and a wrong one only shows
+// as garbage. Until a valid MESFlow frame has been read at the current baud,
+// each garbage frame moves to the next candidate; the first valid frame
+// stores that baud in NVS (mesflow_cfg/scan_baud).
+static const uint32_t SCANNER_BAUD_CANDIDATES[] = {115200, 9600, 57600, 38400, 19200};
+static bool scannerBaudConfirmed = false;
+static void reattachScanner(uint32_t b){scannerBaud=b;ScannerSerial.end();ScannerSerial.begin(scannerBaud,SERIAL_8N1,44,-1);while(ScannerSerial.available()>0)ScannerSerial.read();}
+void noteScannerFrameGarbage(){
+  if(scannerBaudConfirmed)return;
+  const size_t n=sizeof(SCANNER_BAUD_CANDIDATES)/sizeof(SCANNER_BAUD_CANDIDATES[0]);
+  size_t i=0;while(i<n&&SCANNER_BAUD_CANDIDATES[i]!=scannerBaud)i++;
+  const uint32_t next=SCANNER_BAUD_CANDIDATES[(i+1)%n];
+  Serial.printf("[SCANNER] khung rac o baud=%lu -> thu baud=%lu (quet lai)\n",(unsigned long)scannerBaud,(unsigned long)next);
+  reattachScanner(next);
+}
+void noteScannerFrameValid(){
+  if(scannerBaudConfirmed)return;
+  scannerBaudConfirmed=true;
+  Preferences p;p.begin("mesflow_cfg",false);
+  if(p.getUInt("scan_baud",0)!=scannerBaud){p.putUInt("scan_baud",scannerBaud);Serial.printf("[SCANNER] baud=%lu hop le -> luu NVS\n",(unsigned long)scannerBaud);}
+  p.end();
+}
 String applyScannerBaudCommand(const String& arg){
   const uint32_t b=(uint32_t)arg.toInt();
   if(!validScannerBaud(b))return "scanner-baud: gia tri khong hop le (1200/2400/4800/9600/19200/38400/57600/115200)\n";
   Preferences p;p.begin("mesflow_cfg",false);p.putUInt("scan_baud",b);p.end();
-  scannerBaud=b;ScannerSerial.end();ScannerSerial.begin(scannerBaud,SERIAL_8N1,44,-1);
-  while(ScannerSerial.available()>0)ScannerSerial.read();
+  reattachScanner(b);scannerBaudConfirmed=false;
   Serial.printf("[SCANNER] baud=%lu (luu NVS)\n",(unsigned long)scannerBaud);
   return String("scanner-baud => ")+String(scannerBaud)+" (da luu, ap dung ngay)\n";
 }
@@ -5616,11 +5637,16 @@ void dispatchScannerFrame(const char* reason) {
                 scannerText.c_str());
 
   if (scannerText.startsWith("WF|EMP|") || isOperationQr(scannerText.c_str())) {
+    noteScannerFrameValid();
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
     handleSerialLine(scannerText);
   } else {
     Serial.println("[SCANNER DROP] Frame khong co chuoi QR MESFlow hop le; khong gui vao MES.");
+    // Garbage (unprintable bytes, or only a couple of characters for a whole
+    // scan) is what a wrong baud looks like: try the next likely baud. A clean
+    // non-MESFlow barcode at the right baud is all printable and is ignored.
+    if (decodedLength < 4 || decodedLength * 10 < scannerFrameLength * 8) noteScannerFrameGarbage();
   }
 
   scannerFrameLength = 0;
@@ -6113,7 +6139,53 @@ void handleKeypadKey(char key) {
   Serial.println("[KEYPAD] Phim A/B/C/D khong duoc gan chuc nang.");
 }
 
+// Keypad hot-plug + rewiring (ported idea from v2, plus the part neither had):
+// the 7 keypad wires can land on P0..P7 in any order per unit. The guided
+// 12-key calibration turns whatever order into the right digits/positions.
+//  - not found: probe the bus every 3 s; a keypad that (re)appears gets a
+//    fresh calibration -- it may have been rewired while away;
+//  - found but not calibrated: calibrate as soon as the kiosk is READY;
+//  - a pressed pair that is not in the saved map = wiring changed -> recalibrate;
+//  - sustained I2C errors: re-begin the bus (v2: 50 errors); still failing
+//    -> treat the keypad as unplugged and go back to probing.
+static uint32_t keypadLastProbeAt = 0;
+static bool keypadWantsCalibration = false;
+static uint16_t keypadI2cErrors = 0;
+static const char* keypadCalibrationReason = "";
+static void markKeypadNeedsCalibration(const char* reason) {
+  if (!keypadWantsCalibration) Serial.printf("[KEYPAD] Can hieu chinh lai: %s\n", reason);
+  keypadWantsCalibration = true;
+  keypadCalibrationReason = reason;
+}
+static void serviceKeypadPresence() {
+  if (!keypadAvailable) {
+    if (millis() - keypadLastProbeAt < 3000) return;
+    keypadLastProbeAt = millis();
+    for (uint8_t address = KEYPAD_ADDRESS_FIRST; address <= KEYPAD_ADDRESS_LAST; ++address) {
+      touchWire.beginTransmission(address);
+      if (touchWire.endTransmission() == 0) {
+        keypadAddress = address;
+        keypadAvailable = true;
+        keypadI2cErrors = 0;
+        keypadReleaseAll();
+        keypadCandidatePair = -1;
+        keypadEmittedPair = -1;
+        Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong) -> hieu chinh lai vi tri phim.\n", address);
+        markKeypadNeedsCalibration("KEYPAD_ATTACHED");
+        break;
+      }
+    }
+    return;
+  }
+  if (!keypadMappingReady && !keypadWantsCalibration) markKeypadNeedsCalibration("NO_MAPPING");
+  if (keypadWantsCalibration && uiState == UiState::READY && !keypadCalibrationRequested &&
+      !keypadCalibrationInProgress && !hasPendingTransaction()) {
+    if (requestRuntimeKeypadCalibration(keypadCalibrationReason)) keypadWantsCalibration = false;
+  }
+}
+
 void serviceKeypad() {
+  serviceKeypadPresence();
   if (!keypadAvailable || !keypadMappingReady || millis() - keypadLastPollAt < 12) return;
   keypadLastPollAt = millis();
 
@@ -6125,6 +6197,22 @@ void serviceKeypad() {
   }
 
   const int pair = scanKeypadPair();
+  if (pair == -3) {
+    if (++keypadI2cErrors == 50) {
+      Serial.println("[KEYPAD] 50 loi I2C lien tiep -> khoi dong lai bus.");
+      touchWire.begin(TOUCH_SDA, TOUCH_SCL, 100000);
+      keypadReleaseAll();
+    } else if (keypadI2cErrors >= 250) {
+      Serial.println("[KEYPAD] Mat ket noi PCF8574T (rut ra?) -> chuyen sang do lai.");
+      keypadAvailable = false;
+      keypadMappingReady = false;
+      keypadI2cErrors = 0;
+      keypadLastProbeAt = millis();
+      return;
+    }
+  } else {
+    keypadI2cErrors = 0;
+  }
   if (pair != keypadCandidatePair) {
     keypadCandidatePair = pair;
     keypadCandidateSince = millis();
@@ -6174,6 +6262,9 @@ void serviceKeypad() {
       Serial.print("[KEYPAD] Cap chan chua duoc map: ");
       printKeypadPair(static_cast<uint8_t>(keypadCandidatePair));
       Serial.println();
+      // A pair the saved map does not know can only come from different
+      // wiring: normalize again instead of silently ignoring keys.
+      markKeypadNeedsCalibration("UNKNOWN_KEY_PAIR");
     }
     keypadEmittedPair = keypadCandidatePair;
   } else if (keypadCandidatePair == -1) {

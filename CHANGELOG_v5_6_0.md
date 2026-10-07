@@ -35,3 +35,13 @@ re-scan (0 open). All events accepted by `/api/station/events/sync`.
   that is why the scanner "stopped scanning" after going back to v1. `status` now prints `Scanner: baud=… bytes=…`.
 - **Event log compaction**: once every event is answered and the log is ≥ 48 KB it is deleted (on queue drain and
   at boot). Fixes the ~250-cycle ACK-scratch overflow (old events resent forever / "BO NHO OFFLINE DAY").
+
+## Scanner baud auto-detect + keypad hot-plug/rewiring (same release)
+- Scanner: until a valid MESFlow frame is read at the current baud, a garbage frame (unprintable / too short)
+  moves to the next candidate (115200 → 9600 → 57600 → 38400 → 19200); the first valid frame stores the baud in NVS.
+  Clean non-MESFlow barcodes do not trigger a switch. (The bench module turned out to be at 115200; a 9600 setting
+  read 2 bytes of a 12-byte card.)
+- Keypad (PCF8574T, 7 wires in any order): probed every 3 s while absent; a keypad that (re)appears is calibrated
+  again (guided 12-key wizard → digits/positions normalized, matrix-shape check, saved in NVS); an unknown pair pressed
+  at runtime = rewiring → recalibration when READY; 50 consecutive I2C errors re-begin the bus (as in v2), 250 →
+  treated as unplugged. A saved mapping is still used at boot (no forced calibration on every power-up).
