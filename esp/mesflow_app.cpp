@@ -371,6 +371,8 @@ static void handleDebugShowScreen();
 // -------------------- UNIFIED HTTP/HTTPS TRANSPORT ----------
 // One transport wrapper for LAN HTTP and Internet HTTPS.
 // HTTPClient creates Host, Content-Length/Transfer-Encoding and Connection.
+constexpr uint32_t KEEPALIVE_IDLE_MS = 45000;      // heartbeat every 20 s keeps the link warm
+constexpr unsigned long TLS_HANDSHAKE_TIMEOUT_S = 8;
 class MesHttpSession {
 public:
   bool begin(const String& url,
@@ -388,6 +390,9 @@ public:
     if (secure_ && strlen(MESFLOW_ROOT_CA_PEM) == 0) return false;
     if (secure_) secureClient_.setCACert(MESFLOW_ROOT_CA_PEM);
     secureClient_.setTimeout(clientTimeoutSeconds);
+    // The core's default TLS handshake timeout is 120 s: a stalled handshake
+    // froze the kiosk until the 40 s task watchdog reset it.
+    secureClient_.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);
 
     http_.setConnectTimeout(connectTimeoutMs);
     http_.setTimeout(requestTimeoutMs);
@@ -421,6 +426,68 @@ private:
   HTTPClient http_;
   bool secure_ = false;
   bool begun_ = false;
+};
+
+// One kept-alive connection to SERVER_BASE for the UI loop only (lookup,
+// START/FINISH, heartbeat, telemetry). A new HTTPS request costs a ~1.5 s TLS
+// handshake; reusing the socket makes a scan answer in a few hundred ms.
+// Never used from the OTA task (those calls pass baseOverride) -- one owner.
+class MesKeepAlive {
+public:
+  bool begin(const String& url, uint16_t connectTimeoutMs, uint16_t requestTimeoutMs,
+             uint16_t clientTimeoutSeconds) {
+    const bool secure = url.startsWith("https://");
+    if (secure && strlen(MESFLOW_ROOT_CA_PEM) == 0) return false;
+    // The heartbeat (20 s) keeps it warm; after a longer gap the server or a
+    // NAT may have dropped it silently, so start clean instead of timing out.
+    if (secure != secure_ || millis() - lastUsedAt_ > KEEPALIVE_IDLE_MS) drop();
+    secure_ = secure;
+    if (secure) tls_.setCACert(MESFLOW_ROOT_CA_PEM);
+    tls_.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);
+    tls_.setTimeout(clientTimeoutSeconds);
+    plain_.setTimeout(clientTimeoutSeconds);
+    http_.setConnectTimeout(connectTimeoutMs);
+    http_.setTimeout(requestTimeoutMs);
+    http_.setReuse(true);
+    http_.useHTTP10(false);   // keep-alive needs HTTP/1.1; bodies are read with getString() (chunked-safe)
+    reused_ = http_.connected();
+    began_ = secure ? http_.begin(tls_, url) : http_.begin(plain_, url);
+    Serial.printf("[HTTP] keep-alive %s\n", reused_ ? "REUSE" : "NEW");
+    return began_;
+  }
+  HTTPClient& http() { return http_; }
+  bool reused() const { return reused_; }
+  // Success: HTTPClient keeps the socket when the server allowed keep-alive.
+  void release() { if (began_) http_.end(); began_ = false; lastUsedAt_ = millis(); }
+  // Any error: close for real so the next request starts a fresh connection.
+  void drop() { if (began_) http_.end(); began_ = false; tls_.stop(); plain_.stop(); lastUsedAt_ = 0; }
+
+private:
+  WiFiClient plain_;
+  WiFiClientSecure tls_;
+  HTTPClient http_;
+  bool secure_ = false;
+  bool began_ = false;
+  bool reused_ = false;
+  uint32_t lastUsedAt_ = 0;
+};
+MesKeepAlive mesKeepAlive;
+
+// Per-call handle: the kept-alive link for SERVER_BASE, a one-shot session otherwise.
+class MesRequest {
+public:
+  explicit MesRequest(bool keepAlive) : keep_(keepAlive) {}
+  bool begin(const String& url, uint16_t connectTimeoutMs, uint16_t requestTimeoutMs, uint16_t clientTimeoutSeconds) {
+    return keep_ ? mesKeepAlive.begin(url, connectTimeoutMs, requestTimeoutMs, clientTimeoutSeconds)
+                 : own_.begin(url, connectTimeoutMs, requestTimeoutMs, clientTimeoutSeconds);
+  }
+  HTTPClient& http() { return keep_ ? mesKeepAlive.http() : own_.http(); }
+  bool keepAlive() const { return keep_; }
+  void end() { if (keep_) mesKeepAlive.release(); else own_.end(); }
+  void fail() { if (keep_) mesKeepAlive.drop(); else own_.end(); }
+private:
+  bool keep_;
+  MesHttpSession own_;
 };
 
 static void addJsonHeaders(HTTPClient& http) {
@@ -2494,6 +2561,7 @@ static bool refreshCatalogFromMes(String& message, uint16_t& workersLoaded, uint
   catalogDebug.url = url;
   remoteLogf("CATDBG url=%s wifi=%s ip=%s rssi=%d fs_total=%u fs_used=%u", url.c_str(), WIFI_SSID, WiFi.localIP().toString().c_str(), WiFi.RSSI(), static_cast<unsigned>(LittleFS.totalBytes()), static_cast<unsigned>(LittleFS.usedBytes()));
   catalogStage("http-begin");
+  mesKeepAlive.drop();   // free the kept TLS context (~45 KB) for the 110 KB snapshot download
 
   MesHttpSession net;
   // Flask/nginx may return a chunked HTTP/1.1 body. HTTP/1.0 makes the
@@ -3571,15 +3639,15 @@ void nextClientEventId(char* out, size_t outSize) {
 
 bool postActionPayload(const String& payload) {
   if (!rt.bound || WiFi.status() != WL_CONNECTED) return false;
-  MesHttpSession net;
+  MesRequest net(true);
   char url[320];
   snprintf(url, sizeof(url), "%s/api/kiosk/events", SERVER_BASE);
-  if (!net.begin(url, 1200, 2500, 3)) return false;
+  if (!net.begin(url, 1200, 2500, 3)) { net.fail(); return false; }
   HTTPClient& http = net.http();
   addJsonHeaders(http);
   addAuthHeaders(http);
   int status = http.POST(payload);
-  net.end();
+  if (status > 0) { http.getString(); net.end(); } else net.fail();
   // Deliberately do not call setError(): telemetry must never change kiosk UI.
   return status >= 200 && status < 300;
 }
@@ -4053,7 +4121,18 @@ void addAuthHeaders(HTTPClient& http) {
   if (rt.kioskToken[0]) http.addHeader("X-Kiosk-Token", rt.kioskToken);
 }
 
-bool decodeResponse(HTTPClient& http, int status, DynamicJsonDocument& response, JsonDocument* filter = nullptr) {
+bool decodeResponse(HTTPClient& http, int status, DynamicJsonDocument& response, JsonDocument* filter = nullptr,
+                    bool wholeBody = false) {
+  if (wholeBody) {
+    // HTTP/1.1 keep-alive: the body may be chunked and must be read to the end
+    // before the socket is reused. These responses are a few KB.
+    String body = http.getString();
+    DeserializationError err = filter
+        ? deserializeJson(response, body, DeserializationOption::Filter(*filter))
+        : deserializeJson(response, body);
+    if (err) { setError(status, err.c_str()); return false; }
+    return true;
+  }
   DeserializationError err = filter
       ? deserializeJson(response, http.getStream(), DeserializationOption::Filter(*filter))
       : deserializeJson(response, http.getStream());
@@ -4138,7 +4217,8 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
   // chay lan thu 2, nen 1 lan HTTP 0 thoang qua la lap tuc bao "MAT KET
   // NOI MAY CHU" va bat nguoi dung phai quet lai ma.
   for (int attempt = 1; attempt <= 2; ++attempt) {
-    MesHttpSession net;
+    MesRequest net(!(baseOverride && baseOverride[0]));
+    esp_task_wdt_reset();
 
     // Do lac lo: measured server TTFB alone is ~0.6-0.9s on a good link; the
     // old 1200ms connect / 2200ms request budget leaves almost no margin for
@@ -4146,7 +4226,7 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
     // real (not just the transient "HTTP 0" case above) even on strong WiFi.
     // Match httpPostJson()'s non-quick budget -- this GET gates the live
     // scan UX just as much as those POSTs do.
-    if (!net.begin(url, 4000, 6000, 15)) {
+    if (!net.begin(url, 4000, 6000, 8)) {
       lastStatus = -2;
       lastMessage = "http.begin that bai";
     } else {
@@ -4159,8 +4239,8 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
 
       if (status > 0) {
         response.clear();
-        bool decoded = decodeResponse(http, status, response, filter);
-        net.end();
+        bool decoded = decodeResponse(http, status, response, filter, net.keepAlive());
+        if (decoded) net.end(); else net.fail();
 
         if (!decoded){if (trackLinkState) recordServerResult(false,false,status,"GET-decode");return false;}
         if (trackLinkState) recordServerResult(status < 500,false,status,"GET");
@@ -4177,7 +4257,7 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
 
       lastMessage = HTTPClient::errorToString(status);
       Serial.printf("[GET RETRY] lan %d HTTP %d: %s\n", attempt, status, lastMessage.c_str());
-      net.end();
+      net.fail();
     }
 
     if (attempt < 2) {
@@ -4232,9 +4312,10 @@ bool httpPostJson(const char* path,
   const uint16_t requestTimeoutMs = quick ? 1200 : 6000;
 
   for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
-    MesHttpSession net;
+    MesRequest net(!(baseOverride && baseOverride[0]));
+    esp_task_wdt_reset();
 
-    if (!net.begin(url, connectTimeoutMs, requestTimeoutMs, quick ? 4 : 15)) {
+    if (!net.begin(url, connectTimeoutMs, requestTimeoutMs, quick ? 4 : 8)) {
       lastStatus = -2;
       lastMessage = "http.begin that bai";
     } else {
@@ -4249,8 +4330,8 @@ bool httpPostJson(const char* path,
 
       if (status > 0) {
         response.clear();
-        bool decoded = decodeResponse(http, status, response);
-        net.end();
+        bool decoded = decodeResponse(http, status, response, nullptr, net.keepAlive());
+        if (decoded) net.end(); else net.fail();
 
         if (!decoded){recordServerResult(false,false,status,"POST-decode");return false;}
         recordServerResult(status < 500,false,status,"POST");
@@ -4267,7 +4348,7 @@ bool httpPostJson(const char* path,
 
       lastMessage = HTTPClient::errorToString(status);
       Serial.printf("[POST RETRY] lan %d HTTP %d: %s\n", attempt, status, lastMessage.c_str());
-      net.end();
+      net.fail();
     }
 
     if (attempt < maxAttempts) {
@@ -4729,11 +4810,12 @@ bool sendHeartbeat() {
   request["last_recovery_seconds"] = lastRecoveryAt ? (millis() - lastRecoveryAt) / 1000UL : 0;
   request["last_recovery_reason"] = lastRecoveryReason;
 
-  MesHttpSession net;
+  MesRequest net(true);
   char url[256];
   snprintf(url, sizeof(url), "%s/api/station/heartbeat", SERVER_BASE);
 
   if (!net.begin(url, 1500, 2500, 3)) {
+    net.fail();
     heartbeatFailCount++;
     // BUG (found 2026-08-22): heartbeat used to write rt.online directly with
     // its own private threshold (HEARTBEAT_FAILS_TO_OFFLINE=3), completely
@@ -4785,7 +4867,7 @@ bool sendHeartbeat() {
     Serial.printf("[heartbeat] response: %s\n", preview.length() ? preview.c_str() : "<empty>");
   }
 
-  net.end();
+  if (status > 0) net.end(); else net.fail();
 
   if (status >= 200 && status < 300) {
     heartbeatFailCount = 0;

@@ -95,3 +95,16 @@ Background HTTPS calls on the UI loop made a scan wait for seconds. They are now
 - OTA: no `OTA_CHECK` event per poll, and LINK_READY no longer re-runs a check that is already in flight (it ran
   twice back-to-back after boot).
 - Measured on the bench board after boot: heartbeat every 20 s, catalog once, one OTA check, nothing else.
+
+## HTTPS keep-alive + TLS handshake timeout (2026-10-07)
+- `MesKeepAlive mesKeepAlive` keeps one HTTP/1.1 connection to SERVER_BASE for the UI loop: `httpGetJson` /
+  `httpPostJson` without `baseOverride`, the heartbeat and telemetry, through the `MesRequest` wrapper. Calls with
+  `baseOverride` (OTA agent, OTA task on core 0) and the catalog download keep one-shot `MesHttpSession`s.
+  Success -> `release()` (the socket stays open when the server allows it). Any error -> `drop()`, so the retry
+  connects fresh. The link is also dropped after 45 s idle (`KEEPALIVE_IDLE_MS`; the 20 s heartbeat keeps it warm)
+  and before the catalog download (frees ~45 KB). Keep-alive bodies are read with `getString()` (chunked-safe).
+- TLS handshake timeout is 8 s (`TLS_HANDSHAKE_TIMEOUT_S`). The core default is 120 s: a stalled handshake froze
+  the kiosk until the 40 s task watchdog. GET/POST socket read timeout is 15 -> 8 s, and the WDT is fed before
+  each attempt.
+- Measured on the bench board: lookup 0.35 s (was 1.65 s), whole employee scan 0.9 s (was 2.3 s), heartbeat
+  0.2-0.4 s (was ~2.2 s), log shows `[HTTP] keep-alive REUSE`. Free heap 162 KB idle (was 207 KB), min free 78 KB.

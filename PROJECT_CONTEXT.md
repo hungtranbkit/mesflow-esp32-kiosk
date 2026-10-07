@@ -65,6 +65,10 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
 - Lean telemetry (2026-10-07): only failure/rejection events are logged, system events are queued, the queue is
   sent only after 20 s idle on READY, no OTA_CHECK event. Remaining loop blockers: heartbeat (20 s, HTTPS) and the
   6-hourly catalog refresh (~7 s on READY).
+- HTTPS keep-alive (2026-10-07): `mesKeepAlive` (UI-loop only; never call it from the OTA task) + TLS handshake
+  timeout 8 s (core default 120 s caused freeze-then-WDT-reset). Idle heap is ~45 KB lower (162 KB), min ~78 KB.
+  A passive serial logger may be running on dell: `/home/dell/aigw-probe/longlog.py` (pid in longlog.pid),
+  writing esp-dell-serial.log; stop it before flashing (two readers break esptool).
 - Bench-test caution: never inject serial input while the user is testing on the device (a stray `*` on READY shows
   "DU LIEU KHONG HOP LE"; two readers on /dev/ttyACM0 steal each other's bytes).
 
