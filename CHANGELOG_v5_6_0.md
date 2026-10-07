@@ -61,3 +61,9 @@ re-scan (0 open). All events accepted by `/api/station/events/sync`.
   **7 Bảo trì (đổi server)** = v1's maintenance page, kept.
 - Console (serial/LAN): `recovery-menu`, `key <c>` (inject a keypad key, for tests). Verified over serial: open, 6,
   any key back, 2, reopen, 4. The physical 5 s / 10 s hold needs a person at the keypad.
+
+## Scanner baud auto-detect: silent wrong baud + hot-swap (2026-10-07)
+- UART frame/break/parity errors (a scanner much slower than the UART can yield no bytes at all, only errors) now
+  count as a garbage scan for the auto-detect.
+- A confirmed baud is re-detected after 2 garbage scans in a row (scanner swapped while running).
+- OTA: successful check every 5 min (was 12 s).

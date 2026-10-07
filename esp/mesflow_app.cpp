@@ -158,9 +158,18 @@ HardwareSerial ScannerSerial(1);
 // stores that baud in NVS (mesflow_cfg/scan_baud).
 static const uint32_t SCANNER_BAUD_CANDIDATES[] = {115200, 9600, 57600, 38400, 19200};
 static bool scannerBaudConfirmed = false;
-static void reattachScanner(uint32_t b){scannerBaud=b;ScannerSerial.end();ScannerSerial.begin(scannerBaud,SERIAL_8N1,44,-1);while(ScannerSerial.available()>0)ScannerSerial.read();}
+void installScannerErrorHook();
+static void reattachScanner(uint32_t b){scannerBaud=b;ScannerSerial.end();ScannerSerial.begin(scannerBaud,SERIAL_8N1,44,-1);installScannerErrorHook();while(ScannerSerial.available()>0)ScannerSerial.read();}
+static uint8_t scannerGarbageStreak = 0;
 void noteScannerFrameGarbage(){
-  if(scannerBaudConfirmed)return;
+  // A confirmed baud is kept unless two scans in a row come out as garbage
+  // (scanner swapped for one with another baud while the kiosk is running).
+  if(scannerBaudConfirmed){
+    if(++scannerGarbageStreak<2)return;
+    Serial.println("[SCANNER] 2 lan quet rac lien tiep -> do lai baud.");
+    scannerBaudConfirmed=false;
+  }
+  scannerGarbageStreak=0;
   const size_t n=sizeof(SCANNER_BAUD_CANDIDATES)/sizeof(SCANNER_BAUD_CANDIDATES[0]);
   size_t i=0;while(i<n&&SCANNER_BAUD_CANDIDATES[i]!=scannerBaud)i++;
   const uint32_t next=SCANNER_BAUD_CANDIDATES[(i+1)%n];
@@ -168,6 +177,7 @@ void noteScannerFrameGarbage(){
   reattachScanner(next);
 }
 void noteScannerFrameValid(){
+  scannerGarbageStreak=0;
   if(scannerBaudConfirmed)return;
   scannerBaudConfirmed=true;
   Preferences p;p.begin("mesflow_cfg",false);
@@ -5681,7 +5691,28 @@ void dispatchScannerFrame(const char* reason) {
   scannerFrameLength = 0;
 }
 
+// A scanner at a much LOWER baud than the UART can produce no bytes at all,
+// only frame/break errors (the "silent wrong baud" case). Those errors count as
+// garbage for the auto-detect too. Set from the UART event task -> volatile.
+static volatile uint32_t scannerRxErrors = 0;
+static uint32_t scannerRxErrorsSeen = 0;
+static uint32_t scannerRxErrorAt = 0;
+void installScannerErrorHook() {
+  ScannerSerial.onReceiveError([](hardwareSerial_error_t e) {
+    if (e == UART_FRAME_ERROR || e == UART_BREAK_ERROR || e == UART_PARITY_ERROR) scannerRxErrors++;
+  });
+}
+
 void readScannerCommands() {
+  if (scannerRxErrors != scannerRxErrorsSeen) {
+    scannerRxErrorsSeen = scannerRxErrors;
+    scannerRxErrorAt = millis();
+  } else if (scannerRxErrorAt && millis() - scannerRxErrorAt > 300) {
+    // one burst of line errors = one scan at the wrong baud
+    scannerRxErrorAt = 0;
+    Serial.printf("[SCANNER] loi khung UART o baud=%lu (may quet khac baud?)\n", (unsigned long)scannerBaud);
+    noteScannerFrameGarbage();
+  }
   while (ScannerSerial.available() > 0) {
     const int raw = ScannerSerial.read();
     if (raw < 0) continue;
@@ -6621,6 +6652,7 @@ void setup() {
     if (validScannerBaud(stored)) scannerBaud = stored;
   }
   ScannerSerial.begin(scannerBaud, SERIAL_8N1, SCANNER_RX_PIN, -1);
+  installScannerErrorHook();
   delay(100);
   while (ScannerSerial.available() > 0) ScannerSerial.read();
   delay(800);
