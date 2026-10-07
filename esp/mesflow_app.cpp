@@ -456,6 +456,12 @@ constexpr uint32_t HEARTBEAT_MS = 20000;
 // check/no-update sleeps 12s; network/Agent errors retry after 25s.
 constexpr uint32_t OTA_CHECK_INTERVAL_MS = 12UL * 1000UL;
 constexpr uint32_t OTA_RETRY_INTERVAL_MS = 25UL * 1000UL;
+static uint8_t otaCheckFailures = 0;   // consecutive failed checks -> 25 s, 50 s, ... up to 30 min
+static uint32_t otaRetryIntervalMs() {
+  uint32_t ms = OTA_RETRY_INTERVAL_MS;
+  for (uint8_t i = 0; i < otaCheckFailures && ms < 30UL * 60UL * 1000UL; i++) ms *= 2;
+  return ms < 30UL * 60UL * 1000UL ? ms : 30UL * 60UL * 1000UL;
+}
 uint32_t lastOtaCheckAt = 0;
 bool otaAvailableWaitingIdle = false;
 bool otaCheckSucceeded = false;
@@ -4879,7 +4885,7 @@ static void checkForOta() {
     Serial.println("[OTA] WAITING_TIME_SYNC");
     return;
   }
-  const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? OTA_RETRY_INTERVAL_MS : OTA_CHECK_INTERVAL_MS;
+  const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? otaRetryIntervalMs() : OTA_CHECK_INTERVAL_MS;
   if (lastOtaCheckAt && millis() - lastOtaCheckAt < interval) return;
   lastOtaCheckAt = millis(); otaEvent("OTA_CHECK");
   Serial.printf("[OTA] CHECK agent=%s version=%s model=%s\n", otaAgentBase(), FW_VERSION, HW_MODEL);
@@ -4896,13 +4902,15 @@ static void checkForOta() {
   suppressNetworkUiErrors = previousSuppress;
   if (!checked) {
     otaCheckSucceeded = false;
+    if (otaCheckFailures < 16) otaCheckFailures++;
     // Consume the retry cooldown.  Setting the timestamp in the past creates
     // a tight request loop when the Agent/network is unavailable.
     lastOtaCheckAt = millis();
     Serial.printf("[OTA] CHECK_FAILED status=%d; retry in %lus\n", rt.lastHttpStatus,
-                  static_cast<unsigned long>(OTA_RETRY_INTERVAL_MS / 1000UL));
+                  static_cast<unsigned long>(otaRetryIntervalMs() / 1000UL));
     return;
   }
+  otaCheckFailures = 0;
   if (!(response["update_available"] | false)) { otaAvailableWaitingIdle = false; otaCheckSucceeded = true; Serial.println("[OTA] NO_UPDATE"); return; }
   otaCheckSucceeded = true;
   const char* model = response["hardware_model"] | "";
@@ -4934,7 +4942,7 @@ static void scheduleOtaCheck() {
     return;
   }
   if (otaCheckTaskRunning || !rt.bound || WiFi.status() != WL_CONNECTED || !rt.online) return;
-  const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? OTA_RETRY_INTERVAL_MS : OTA_CHECK_INTERVAL_MS;
+  const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? otaRetryIntervalMs() : OTA_CHECK_INTERVAL_MS;
   if (lastOtaCheckAt && millis() - lastOtaCheckAt < interval) return;
   otaCheckTaskRunning = true;
   // HTTPS + ArduinoJson parsing uses more stack than the normal UI task.
@@ -6630,7 +6638,11 @@ void setup() {
   }
 
   loadDeviceConfig();
-  if (PREFER_PLAIN_HTTP_FOR_MESFLOW && String(SERVER_BASE).equalsIgnoreCase("https://mesflow.net")) {
+  // Downgrade only when this build cannot verify HTTPS at all (no CA compiled
+  // in). With a CA bundle (MESFLOW_OTA_CA_FILE at build time) the kiosk keeps
+  // https:// -- the reference board has 8 MB PSRAM, TLS memory is not the issue.
+  if (PREFER_PLAIN_HTTP_FOR_MESFLOW && strlen(MESFLOW_ROOT_CA_PEM) == 0 &&
+      String(SERVER_BASE).equalsIgnoreCase("https://mesflow.net")) {
     safeCopy(SERVER_BASE, sizeof(SERVER_BASE), "http://mesflow.net");
     saveDeviceConfig();
     Serial.println("[CONFIG] Switched mesflow.net transport HTTPS -> HTTP to reduce TLS memory usage.");
