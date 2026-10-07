@@ -48,13 +48,16 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   LAN console (port 17892) incl. factory-reset; device_secret over plain HTTP. No QC / pause / setup-skip-qty
   (web kiosk: SETUP skips the quantity screens).
 
-## Scanner + peripherals (2026-10-07)
-- Scanner silent after the v1 flash: the module is at **9600** baud (v2's default), v1 hard-coded 115200. Now
-  per-device NVS `mesflow_cfg/scan_baud` + console `scanner-baud <baud>`; the bench board is set to 9600 (persists).
-  A physical scan has NOT been confirmed yet (0 bytes during a 2-minute watch — nobody scanned or a cable issue).
-- I2C bus (SDA16/SCL15) answers only at 0x18: **touch FT6336G (0x38) and keypad PCF8574T (0x20–0x27) not found**
-  → check the peripheral cable/power; without the keypad quantities cannot be typed on the device.
-- Event log compaction added (≥ 48 KB and fully answered → deleted).
+## Scanner + peripherals (2026-10-07, verified on the bench board)
+- Scanner: the module is at **115200** (a 9600 setting read 2 bytes of a 12-byte card). Firmware now auto-detects the
+  baud (garbage frame -> next candidate; first valid `WF|...` frame saved to NVS `mesflow_cfg/scan_baud`); manual
+  override `scanner-baud <baud>`. Real scans confirmed (`WF|EMP|NV001`, `WF|OP|1111-KM-967-232006L-01-OP01/OP02`).
+- Keypad PCF8574T @0x20: hot-plug probe every 3 s + recalibration when it (re)appears or an unknown pair is pressed;
+  the user calibrated it on the device (mapping in NVS) and used it to finish sessions #20/#21.
+- "CÓ LỖI SỬA ĐƯỢC?" (only when defect > 0): `#` = KHÔNG -> confirm, `1` = CÓ -> repairable qty. Verified:
+  #22 (4/1/1, CÓ) and #23 (3/2/0, KHÔNG).
+- Touch FT6336G (0x38) is still not found on I2C (only 0x18 besides the keypad) — touch is optional; not investigated.
+- Event log compaction added (>= 48 KB and fully answered -> deleted).
 
 ## Known gaps / next
 - The transient `ui_state=ERROR` (08:02:31) matched background-sync `setError` calls hijacking the screen
