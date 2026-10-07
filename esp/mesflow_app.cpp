@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_wifi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -64,6 +65,14 @@ using PsramJsonDocument = BasicJsonDocument<PsramJsonAllocator>;
 // phone setup or LAN provisioning from MESFlow Admin Center.
 char WIFI_SSID[33]       = "panda";
 char WIFI_PASSWORD[65]   = "12345678a";
+// Up to two more known networks (NVS wifi_ssid2/3, wifi_pass2/3), in priority
+// order after the primary: e.g. another area's Wi-Fi, so a kiosk moved there
+// connects without setup, or the office Wi-Fi behind a kiosk-PC hotspot.
+char WIFI_SSID2[33]      = "";
+char WIFI_PASSWORD2[65]  = "";
+char WIFI_SSID3[33]      = "";
+char WIFI_PASSWORD3[65]  = "";
+int8_t wifiSlot = 0;     // 0 = primary, 1/2 = WIFI_SSID2/3
 char SERVER_BASE[192]    = "";  // Bat buoc cau hinh qua Setup Portal/NVS; khong co fallback hardcode
 // Deploy Agent is the OTA control plane. NVS/maintenance can override this
 // per environment, but a fresh kiosk is immediately OTA-capable by default.
@@ -73,10 +82,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.5.7"
+#define FW_VERSION "5.6.0"
 #define FW_BUILD "20260813.0015"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.5.7-KIMEX-OTA-DEFAULT";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.0-KIMEX-MULTI-OP";
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -140,14 +149,63 @@ constexpr uint32_t FINISH_SUCCESS_HOLD_MS = 0; // Finish xong ve QUET THE ngay
 // "WF|EMP|NV002", then reconfirmed clean over the real UART1 peripheral
 // (13/13 frames exact). 9600 (the datasheet's factory default) produced
 // zero bytes on real hardware.
-constexpr uint32_t SCANNER_BAUD = 115200;
+constexpr uint32_t SCANNER_BAUD = 115200;   // compile-time default only
+// The GM65/GM865 baud lives in the MODULE's own EEPROM and differs per unit
+// (one bench unit 115200, another factory 9600). A wrong baud is total
+// silence, not an error. Per-device override in NVS mesflow_cfg/scan_baud,
+// set live with the console command `scanner-baud <baud>` (2026-10-07: the
+// reference board's module is at 9600 -- v2 ran it at 9600 -- and v1's fixed
+// 115200 made the scanner look dead).
+uint32_t scannerBaud = SCANNER_BAUD;
+static bool validScannerBaud(uint32_t b){return b==1200||b==2400||b==4800||b==9600||b==19200||b==38400||b==57600||b==115200;}
 constexpr uint32_t SCANNER_FRAME_TIMEOUT_MS = 50;
 constexpr size_t SCANNER_FRAME_MAX = 256;
 HardwareSerial ScannerSerial(1);
+// Auto-detect: the module's baud is unknown per unit and a wrong one only shows
+// as garbage. Until a valid MESFlow frame has been read at the current baud,
+// each garbage frame moves to the next candidate; the first valid frame
+// stores that baud in NVS (mesflow_cfg/scan_baud).
+static const uint32_t SCANNER_BAUD_CANDIDATES[] = {115200, 9600, 57600, 38400, 19200};
+static bool scannerBaudConfirmed = false;
+void installScannerErrorHook();
+static void reattachScanner(uint32_t b){scannerBaud=b;ScannerSerial.end();ScannerSerial.begin(scannerBaud,SERIAL_8N1,44,-1);installScannerErrorHook();while(ScannerSerial.available()>0)ScannerSerial.read();}
+static uint8_t scannerGarbageStreak = 0;
+void noteScannerFrameGarbage(){
+  // A confirmed baud is kept unless two scans in a row come out as garbage
+  // (scanner swapped for one with another baud while the kiosk is running).
+  if(scannerBaudConfirmed){
+    if(++scannerGarbageStreak<2)return;
+    Serial.println("[SCANNER] 2 lan quet rac lien tiep -> do lai baud.");
+    scannerBaudConfirmed=false;
+  }
+  scannerGarbageStreak=0;
+  const size_t n=sizeof(SCANNER_BAUD_CANDIDATES)/sizeof(SCANNER_BAUD_CANDIDATES[0]);
+  size_t i=0;while(i<n&&SCANNER_BAUD_CANDIDATES[i]!=scannerBaud)i++;
+  const uint32_t next=SCANNER_BAUD_CANDIDATES[(i+1)%n];
+  Serial.printf("[SCANNER] khung rac o baud=%lu -> thu baud=%lu (quet lai)\n",(unsigned long)scannerBaud,(unsigned long)next);
+  reattachScanner(next);
+}
+void noteScannerFrameValid(){
+  scannerGarbageStreak=0;
+  if(scannerBaudConfirmed)return;
+  scannerBaudConfirmed=true;
+  Preferences p;p.begin("mesflow_cfg",false);
+  if(p.getUInt("scan_baud",0)!=scannerBaud){p.putUInt("scan_baud",scannerBaud);Serial.printf("[SCANNER] baud=%lu hop le -> luu NVS\n",(unsigned long)scannerBaud);}
+  p.end();
+}
+String applyScannerBaudCommand(const String& arg){
+  const uint32_t b=(uint32_t)arg.toInt();
+  if(!validScannerBaud(b))return "scanner-baud: gia tri khong hop le (1200/2400/4800/9600/19200/38400/57600/115200)\n";
+  Preferences p;p.begin("mesflow_cfg",false);p.putUInt("scan_baud",b);p.end();
+  reattachScanner(b);scannerBaudConfirmed=true;
+  Serial.printf("[SCANNER] baud=%lu (luu NVS)\n",(unsigned long)scannerBaud);
+  return String("scanner-baud => ")+String(scannerBaud)+" (da luu, ap dung ngay)\n";
+}
 static uint8_t scannerFrame[SCANNER_FRAME_MAX] = {0};
 static size_t scannerFrameLength = 0;
 static uint32_t scannerLastByteAt = 0;
 static uint32_t scannerByteCount = 0;
+static volatile uint32_t scannerRxErrors = 0;   // UART frame/break/parity errors (event task)
 static uint32_t scannerFrameCount = 0;
 
 // Capacitive touch (FT6336G capacitive touch, I2C address 0x38)
@@ -306,6 +364,8 @@ void readScannerCommands();
 static bool requestRuntimeKeypadCalibration(const char* source);
 static void serviceRuntimeKeypadCalibration();
 static void enterMaintenanceMode(bool duringBoot);
+static void openRecoveryMenu();
+void handleKeypadKey(char key);
 static void exitMaintenanceMode();
 static void drawMaintenanceScreen();
 static void serviceMaintenanceMode();
@@ -320,6 +380,21 @@ static void handleDebugShowScreen();
 // -------------------- UNIFIED HTTP/HTTPS TRANSPORT ----------
 // One transport wrapper for LAN HTTP and Internet HTTPS.
 // HTTPClient creates Host, Content-Length/Transfer-Encoding and Connection.
+// Set from the Wi-Fi event task on disconnect / new IP: a kept socket is dead
+// then even if connected() still says yes. Consumed on the loop task.
+volatile bool keepAliveInvalidated = false;
+// Bumped on every change of the offline event log (see countPendingOfflineEvents).
+volatile uint32_t eventLogGeneration = 1;
+// The UI loop task. Screen/state changes from any other task (the OTA check on
+// core 0) are refused -- drawing from two cores corrupts the display.
+TaskHandle_t uiLoopTask = nullptr;
+inline bool onUiLoopTask() { return !uiLoopTask || xTaskGetCurrentTaskHandle() == uiLoopTask; }
+constexpr uint32_t WORKER_IDLE_RELEASE_MS = 90000;
+constexpr uint32_t WIFI_SWITCH_AFTER_MS = 45000;
+constexpr uint32_t WIFI_PRIMARY_RECHECK_MS = 10UL * 60UL * 1000UL;
+constexpr int32_t WIFI_GOOD_RSSI = -70;
+constexpr uint32_t KEEPALIVE_IDLE_MS = 45000;      // heartbeat every 20 s keeps the link warm
+constexpr unsigned long TLS_HANDSHAKE_TIMEOUT_S = 8;
 class MesHttpSession {
 public:
   bool begin(const String& url,
@@ -328,6 +403,7 @@ public:
              uint16_t clientTimeoutSeconds,
              bool useHttp10 = true,
              bool followRedirects = false) {
+    esp_task_wdt_reset();   // no-op on the OTA task (not subscribed)
     end();
     secure_ = url.startsWith("https://");
 
@@ -337,6 +413,9 @@ public:
     if (secure_ && strlen(MESFLOW_ROOT_CA_PEM) == 0) return false;
     if (secure_) secureClient_.setCACert(MESFLOW_ROOT_CA_PEM);
     secureClient_.setTimeout(clientTimeoutSeconds);
+    // The core's default TLS handshake timeout is 120 s: a stalled handshake
+    // froze the kiosk until the 40 s task watchdog reset it.
+    secureClient_.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);
 
     http_.setConnectTimeout(connectTimeoutMs);
     http_.setTimeout(requestTimeoutMs);
@@ -370,6 +449,96 @@ private:
   HTTPClient http_;
   bool secure_ = false;
   bool begun_ = false;
+};
+
+// One kept-alive connection to SERVER_BASE for the UI loop only (lookup,
+// START/FINISH, heartbeat, telemetry). A new HTTPS request costs a ~1.5 s TLS
+// handshake; reusing the socket makes a scan answer in a few hundred ms.
+// Never used from the OTA task (those calls pass baseOverride) -- one owner.
+class MesKeepAlive {
+public:
+  bool begin(const String& url, uint16_t connectTimeoutMs, uint16_t requestTimeoutMs,
+             uint16_t clientTimeoutSeconds) {
+    esp_task_wdt_reset();
+    const bool secure = url.startsWith("https://");
+    if (secure && strlen(MESFLOW_ROOT_CA_PEM) == 0) return false;
+    if (keepAliveInvalidated) { keepAliveInvalidated = false; drop(); }   // Wi-Fi dropped/re-associated
+    // The heartbeat (20 s) keeps it warm; after a longer gap the server or a
+    // NAT may have dropped it silently, so start clean instead of timing out.
+    if (secure != secure_ || millis() - lastUsedAt_ > KEEPALIVE_IDLE_MS) drop();
+    secure_ = secure;
+    if (secure) tls_.setCACert(MESFLOW_ROOT_CA_PEM);
+    tls_.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_S);
+    tls_.setTimeout(clientTimeoutSeconds);
+    plain_.setTimeout(clientTimeoutSeconds);
+    http_.setConnectTimeout(connectTimeoutMs);
+    http_.setTimeout(requestTimeoutMs);
+    http_.setReuse(true);
+    http_.useHTTP10(false);   // keep-alive needs HTTP/1.1; bodies are read with getString() (chunked-safe)
+    reused_ = http_.connected();
+    began_ = secure ? http_.begin(tls_, url) : http_.begin(plain_, url);
+    static const char* teHeader[] = {"Transfer-Encoding"};
+    if (began_) http_.collectHeaders(teHeader, 1);
+    Serial.printf("[HTTP] keep-alive %s\n", reused_ ? "REUSE" : "NEW");
+    return began_;
+  }
+  HTTPClient& http() { return http_; }
+  bool reused() const { return reused_; }
+  // HTTP/1.1 body with neither Content-Length nor chunked encoding ends only
+  // when the server closes the socket: getString() would wait for the server's
+  // idle timeout (tens of seconds). Such a response is read briefly and closed.
+  bool bodyDelimited(int status) {
+    if (status == 204 || status == 304 || http_.getSize() >= 0) return true;
+    return http_.header("Transfer-Encoding").indexOf("chunked") >= 0;
+  }
+  String readBody(int status) {
+    if (status == 204 || status == 304) return String();
+    if (bodyDelimited(status)) return http_.getString();
+    String out; NetworkClient* in = http_.getStreamPtr(); const uint32_t t0 = millis();
+    while (in && millis() - t0 < 1500 && out.length() < 8192) {
+      while (in->available() && out.length() < 8192) out += static_cast<char>(in->read());
+      if (!in->connected()) break;
+      delay(5);
+    }
+    closeAfterUse_ = true;
+    return out;
+  }
+  // Success: HTTPClient keeps the socket when the server allowed keep-alive.
+  void release() {
+    if (closeAfterUse_) { closeAfterUse_ = false; drop(); return; }
+    if (began_) http_.end(); began_ = false; lastUsedAt_ = millis();
+  }
+  // Any error: close for real so the next request starts a fresh connection.
+  void drop() { if (began_) http_.end(); began_ = false; tls_.stop(); plain_.stop(); lastUsedAt_ = 0; }
+
+private:
+  WiFiClient plain_;
+  WiFiClientSecure tls_;
+  HTTPClient http_;
+  bool secure_ = false;
+  bool began_ = false;
+  bool reused_ = false;
+  bool closeAfterUse_ = false;
+  uint32_t lastUsedAt_ = 0;
+};
+MesKeepAlive mesKeepAlive;
+
+// Per-call handle: the kept-alive link for SERVER_BASE, a one-shot session otherwise.
+class MesRequest {
+public:
+  explicit MesRequest(bool keepAlive) : keep_(keepAlive) {}
+  bool begin(const String& url, uint16_t connectTimeoutMs, uint16_t requestTimeoutMs, uint16_t clientTimeoutSeconds) {
+    return keep_ ? mesKeepAlive.begin(url, connectTimeoutMs, requestTimeoutMs, clientTimeoutSeconds)
+                 : own_.begin(url, connectTimeoutMs, requestTimeoutMs, clientTimeoutSeconds);
+  }
+  HTTPClient& http() { return keep_ ? mesKeepAlive.http() : own_.http(); }
+  bool keepAlive() const { return keep_; }
+  void end() { if (keep_) mesKeepAlive.release(); else own_.end(); }
+  String readBody(int status) { return keep_ ? mesKeepAlive.readBody(status) : own_.http().getString(); }
+  void fail() { if (keep_) mesKeepAlive.drop(); else own_.end(); }
+private:
+  bool keep_;
+  MesHttpSession own_;
 };
 
 static void addJsonHeaders(HTTPClient& http) {
@@ -413,9 +582,15 @@ bool returnToReadyAfterError = false;
 uint32_t lastHeartbeatAt = 0;
 constexpr uint32_t HEARTBEAT_MS = 20000;
 // OTA polling is deliberately short for kiosk/test operation.  A successful
-// check/no-update sleeps 12s; network/Agent errors retry after 25s.
-constexpr uint32_t OTA_CHECK_INTERVAL_MS = 12UL * 1000UL;
+// check/no-update sleeps 5 min (was 12 s); errors back off 25 s -> 30 min.
+constexpr uint32_t OTA_CHECK_INTERVAL_MS = 5UL * 60UL * 1000UL;   // was 12 s: a TLS handshake + event POST every 12 s per kiosk
 constexpr uint32_t OTA_RETRY_INTERVAL_MS = 25UL * 1000UL;
+static uint8_t otaCheckFailures = 0;   // consecutive failed checks -> 25 s, 50 s, ... up to 30 min
+static uint32_t otaRetryIntervalMs() {
+  uint32_t ms = OTA_RETRY_INTERVAL_MS;
+  for (uint8_t i = 0; i < otaCheckFailures && ms < 30UL * 60UL * 1000UL; i++) ms *= 2;
+  return ms < 30UL * 60UL * 1000UL ? ms : 30UL * 60UL * 1000UL;
+}
 uint32_t lastOtaCheckAt = 0;
 bool otaAvailableWaitingIdle = false;
 bool otaCheckSucceeded = false;
@@ -448,6 +623,7 @@ constexpr char ACTION_QUEUE_PATH[] = "/kiosk_action_queue.jsonl";
 constexpr char ACTION_QUEUE_TMP_PATH[] = "/kiosk_action_queue.tmp";
 constexpr uint16_t ACTION_QUEUE_MAX = 100;
 constexpr uint32_t ACTION_QUEUE_RETRY_MS = 15000;
+constexpr uint32_t ACTION_QUEUE_IDLE_MS = 20000;
 char sessionTraceId[96] = "";
 uint32_t clientEventCounter = 0;
 uint32_t lastActionQueueRetryAt = 0;
@@ -520,6 +696,23 @@ struct RuntimeData {
 };
 
 RuntimeData rt;
+
+// Several operations open at once for one employee (server migration
+// 0054_multi_open_session_per_employee: at most ONE open session per
+// operation, any number of operations). The kiosk keeps a short list and
+// picks one by SCANNING its operation QR, never by position.
+constexpr uint8_t MAX_OPEN_OPS = 6;
+struct OpenOp {
+  int sessionId = 0;          // > 0 server session id, -1 local (start not acked yet)
+  int operationId = 0;
+  char localId[56] = "";      // local session id when sessionId == -1
+  char opQr[96] = "";
+  char opName[72] = "";
+  char po[40] = "";
+  char part[40] = "";
+};
+OpenOp openOps[MAX_OPEN_OPS];
+uint8_t openOpCount = 0;
 
 
 // ============================================================
@@ -643,6 +836,8 @@ bool loadPendingTransaction() {
 void safeCopy(char* dst, size_t size, const char* src);
 void setError(int status, const char* message);
 void setUi(UiState next);
+extern bool recoveryMenuActive;
+extern bool recoveryInfoActive;
 void resetForNextWorker();
 void drawSimple(const char* title, const char* line1, const char* line2, const char* footer, uint16_t accent);
 void drawTopClock(bool force = false);
@@ -821,6 +1016,7 @@ bool allocateOfflineBuffers() {
       offlineAckCapacity, 64, caps));
 
   offlineBuffersReady = workerCache && operationCache && offlineSessions && offlineAckScratch;
+  eventLogGeneration++;   // the cached pending count was computed without buffers
   if (!offlineBuffersReady) {
     freeOfflineBuffers();
     Serial.printf("[MEM] Buffer allocation failed mode=%s heap=%u psram=%u\n",
@@ -918,7 +1114,22 @@ int findOfflineSession(const char* workerQr){for(uint16_t i=0;i<offlineSessionCo
 
 bool saveOfflineSessions(){for(uint16_t i=0;i<offlineSessionCount;i++)sealObject(offlineSessions[i]);return saveArray(SESSION_FILE,offlineSessions,offlineSessionCount);}
 
+// The log changes only through appendLogRecord / the two removes below, which
+// bump eventLogGeneration; the count is recomputed only after a change.
+static uint32_t pendingCountGeneration = 0;
+static volatile uint16_t pendingCountCache = 0;
+// For the OTA task: never touches the file or the shared scratch buffer.
+bool offlineEventsMaybePending() { return pendingCountGeneration != eventLogGeneration || pendingCountCache != 0; }
+uint16_t countPendingOfflineEventsUncached();
 uint16_t countPendingOfflineEvents() {
+  if (!onUiLoopTask()) return offlineEventsMaybePending() ? 1 : 0;
+  const uint32_t gen = eventLogGeneration;
+  if (pendingCountGeneration == gen) return pendingCountCache;
+  pendingCountCache = countPendingOfflineEventsUncached();
+  pendingCountGeneration = gen;
+  return pendingCountCache;
+}
+uint16_t countPendingOfflineEventsUncached() {
   if(!fsReady || !offlineBuffersReady)return 0; uint16_t ackCount=0,eventCount=0;
   File f=LittleFS.open(EVENT_LOG_FILE,"r"); if(!f)return 0; OfflineLogRecord r;
   while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){if(!validObject(r))continue;if((r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&ackCount<offlineAckCapacity)safeCopy(offlineAckScratch[ackCount++],64,r.eventId);}
@@ -932,7 +1143,7 @@ bool appendLogRecord(OfflineLogRecord &r) {
   if(total&&used*100U/total>=95U){setError(-41,"BỘ NHỚ ĐÃ ĐẦY - BÁO QUẢN LÝ");return false;}
   if(total&&used*100U/total>=85U)Serial.printf("[OFFLINE] storage warning used=%u%%\n",(unsigned)(used*100U/total));
   sealObject(r); File f=LittleFS.open(EVENT_LOG_FILE,"a");if(!f)return false;
-  size_t n=f.write((uint8_t*)&r,sizeof(r));f.flush();f.close();return n==sizeof(r);
+  size_t n=f.write((uint8_t*)&r,sizeof(r));f.flush();f.close();eventLogGeneration++;return n==sizeof(r);
 }
 bool appendAck(const char* eventId){OfflineLogRecord a;memset(&a,0,sizeof(a));a.magic=OFF_MAGIC;a.version=OFF_VERSION;a.recordType=(uint8_t)LogRecordType::ACK;safeCopy(a.eventId,sizeof(a.eventId),eventId);return appendLogRecord(a);}
 bool appendReject(const char* eventId,const char* reason){OfflineLogRecord a;memset(&a,0,sizeof(a));a.magic=OFF_MAGIC;a.version=OFF_VERSION;a.recordType=(uint8_t)LogRecordType::REJECT;safeCopy(a.eventId,sizeof(a.eventId),eventId);safeCopy(a.operationName,sizeof(a.operationName),reason);return appendLogRecord(a);}
@@ -961,10 +1172,99 @@ bool enqueueOfflineEvent(OfflineEventType type,const char* localSessionId,int go
   Serial.printf("[OFFLINE] queued %s seq=%lu pending=%u\n",type==OfflineEventType::START?"START":"FINISH",(unsigned long)seq,countPendingOfflineEvents());return true;
 }
 
+bool isOperationQr(const char* qr){return qr&&(strncmp(qr,"WF|OP|",6)==0||strncmp(qr,"WF|OPID|",8)==0);}
+int operationIdFromQr(const char* qr){return (qr&&strncmp(qr,"WF|OPID|",8)==0)?atoi(qr+8):0;}
+void clearOpenOps(){openOpCount=0;}
+int findOpenOp(const char* qr){
+  const int id=operationIdFromQr(qr);
+  for(uint8_t i=0;i<openOpCount;i++){
+    if(openOps[i].opQr[0]&&!strcmp(openOps[i].opQr,qr))return i;
+    if(id>0&&openOps[i].operationId==id)return i;
+  }
+  return -1;
+}
+bool addOpenOp(const OpenOp& o){
+  if(openOpCount>=MAX_OPEN_OPS)return false;
+  if(o.opQr[0]&&findOpenOp(o.opQr)>=0)return false;
+  if(o.operationId>0)for(uint8_t i=0;i<openOpCount;i++)if(openOps[i].operationId==o.operationId)return false;
+  openOps[openOpCount++]=o;return true;
+}
+int findOfflineSessionFor(const char* workerQr,const char* opQr){for(uint16_t i=0;i<offlineSessionCount;i++)if(!strcmp(offlineSessions[i].workerQr,workerQr)&&!strcmp(offlineSessions[i].operationQr,opQr))return i;return -1;}
+int findOfflineSessionByLocalId(const char* id){if(!id||!id[0])return -1;for(uint16_t i=0;i<offlineSessionCount;i++)if(!strcmp(offlineSessions[i].localSessionId,id))return i;return -1;}
+// True when the server has answered (ACK or REJECT) the event, i.e. the local
+// START is no longer the only record of that session.
+bool eventAnswered(const char* eventId){
+  if(!fsReady||!eventId||!eventId[0])return false;
+  File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return false;OfflineLogRecord r;
+  while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){if(validObject(r)&&(r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&!strcmp(r.eventId,eventId)){f.close();return true;}}
+  f.close();return false;
+}
+// Same as findOfflineSessionFor, but also matches a session started with the
+// other label of the same operation (WF|OPID|<id> vs the server's operation_qr).
+int findOfflineSessionForOp(const char* workerQr,const char* opQr,int opId){
+  const int byQr=findOfflineSessionFor(workerQr,opQr);if(byQr>=0||opId<=0)return byQr;
+  for(uint16_t i=0;i<offlineSessionCount;i++)if(!strcmp(offlineSessions[i].workerQr,workerQr)&&operationIdFromQr(offlineSessions[i].operationQr)==opId)return i;
+  return -1;
+}
+// A FINISH saved here that the server has not answered yet: the server still
+// lists that session as open, but the worker already closed it on this kiosk.
+// Only the log is scanned, and only while something is pending.
+bool finishPendingFor(const char* workerQr,const char* opQr,int opId){
+  if(!fsReady||!offlineBuffersReady||countPendingOfflineEvents()==0)return false;
+  File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return false;OfflineLogRecord r;uint16_t ackCount=0;
+  while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r))if(validObject(r)&&(r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&ackCount<offlineAckCapacity)safeCopy(offlineAckScratch[ackCount++],64,r.eventId);
+  f.seek(0);
+  while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){
+    if(!validObject(r)||r.recordType!=(uint8_t)LogRecordType::EVENT||r.eventType!=(uint8_t)OfflineEventType::FINISH)continue;
+    if(strcmp(r.workerQr,workerQr))continue;
+    const bool sameOp=(opQr&&opQr[0]&&!strcmp(r.operationQr,opQr))||(opId>0&&operationIdFromQr(r.operationQr)==opId);
+    if(!sameOp)continue;
+    bool answered=false;for(uint16_t i=0;i<ackCount;i++)if(!strcmp(offlineAckScratch[i],r.eventId)){answered=true;break;}
+    if(!answered){f.close();return true;}
+  }
+  f.close();return false;
+}
+void removeOfflineSessionAt(uint16_t si){for(uint16_t i=si+1;i<offlineSessionCount;i++)offlineSessions[i-1]=offlineSessions[i];offlineSessionCount--;}
+// Local sessions of this worker that the list does not have yet. Online
+// (serverKnown=true): only STARTs the server has not answered -- an answered
+// START is in the server list while open, and a local record the server no
+// longer lists was finished elsewhere: it is dropped (it used to come back as a
+// "ghost" session after an online finish). Offline: every local session.
+void mergeLocalOpenOps(const char* workerQr,bool serverKnown){
+  bool changed=false;
+  for(uint16_t i=0;i<offlineSessionCount;i++){
+    OfflineSession&s=offlineSessions[i];
+    if(strcmp(s.workerQr,workerQr)||s.finishPending)continue;
+    if(serverKnown&&eventAnswered(s.startEventId)){
+      if(findOpenOp(s.operationQr)<0){Serial.printf("[MULTI-OP] bo session cuc bo da dong: %s\n",s.localSessionId);removeOfflineSessionAt(i);i--;changed=true;}
+      continue;
+    }
+    if(findOpenOp(s.operationQr)>=0)continue;
+    OpenOp o;o.sessionId=-1;o.operationId=operationIdFromQr(s.operationQr);safeCopy(o.localId,sizeof(o.localId),s.localSessionId);safeCopy(o.opQr,sizeof(o.opQr),s.operationQr);safeCopy(o.opName,sizeof(o.opName),s.operationName);
+    addOpenOp(o);
+  }
+  if(changed)saveOfflineSessions();
+}
+void selectOpenOp(uint8_t i){
+  OpenOp&o=openOps[i];
+  rt.activeSessionId=o.sessionId;rt.operationId=o.operationId;rt.hasOperation=true;
+  safeCopy(rt.activeGroupId,sizeof(rt.activeGroupId),o.sessionId<0?o.localId:"");
+  safeCopy(rt.operationQr,sizeof(rt.operationQr),o.opQr);safeCopy(rt.operationName,sizeof(rt.operationName),o.opName);
+  safeCopy(rt.po,sizeof(rt.po),o.po);safeCopy(rt.part,sizeof(rt.part),o.part);
+  demoGoodQty=0;demoReworkQty=0;demoDefectQty=0;keypadNumberLength=0;keypadNumberBuffer[0]='\0';
+}
+// After an employee scan: one open OP -> straight to its quantity (unchanged
+// behaviour); several -> the employee screen lists them and an OP scan picks one.
+void enterAfterWorkerScan(){
+  rt.activeSessionId=0;rt.activeGroupId[0]='\0';
+  if(openOpCount==1){selectOpenOp(0);setUi(UiState::INPUT_GOOD);}
+  else setUi(UiState::WORKER_OK);
+}
+
 bool offlineLookupWorker(const char* qr){
   CachedWorker* w=findCachedWorker(qr);if(!w){setError(-43,"THE CHUA CO CACHE");return false;}
   clearRuntimeSelection();rt.hasWorker=true;safeCopy(rt.workerQr,sizeof(rt.workerQr),qr);safeCopy(rt.workerCode,sizeof(rt.workerCode),w->code);safeCopy(rt.workerName,sizeof(rt.workerName),w->name);
-  int si=findOfflineSession(qr);if(si>=0){OfflineSession&s=offlineSessions[si];rt.activeSessionId=-1;safeCopy(rt.activeGroupId,sizeof(rt.activeGroupId),s.localSessionId);safeCopy(rt.operationQr,sizeof(rt.operationQr),s.operationQr);safeCopy(rt.operationName,sizeof(rt.operationName),s.operationName);rt.hasOperation=true;demoGoodQty=0;demoReworkQty=0;demoDefectQty=0;setUi(UiState::INPUT_GOOD);}else setUi(UiState::WORKER_OK);
+  clearOpenOps();mergeLocalOpenOps(qr,false);enterAfterWorkerScan();
   return true;
 }
 bool offlineLookupOperationAndStart(const char* qr){
@@ -979,14 +1279,15 @@ bool offlineLookupOperationAndStart(const char* qr){
 }
 
 bool offlineFinishSession(){
-  int si=findOfflineSession(rt.workerQr);if(si<0){setError(-47,"KHONG CO SESSION OFFLINE");return false;}OfflineSession &s=offlineSessions[si];
+  int si=findOfflineSessionByLocalId(rt.activeGroupId);if(si<0)si=findOfflineSessionFor(rt.workerQr,rt.operationQr);
+  if(si<0){setError(-47,"KHONG CO SESSION OFFLINE");return false;}OfflineSession &s=offlineSessions[si];
   safeCopy(rt.operationQr,sizeof(rt.operationQr),s.operationQr);safeCopy(rt.operationName,sizeof(rt.operationName),s.operationName);
   // Phase 1: persist finish intent inside session record.
   if(!s.finishPending){s.finishPending=1;s.finishSequence=nextDeviceSequence();snprintf(s.finishEventId,sizeof(s.finishEventId),"%s-%010lu",DEVICE_ID,(unsigned long)s.finishSequence);s.finishGoodQty=demoGoodQty;s.finishDefectQty=demoDefectQty;s.finishEpoch=currentEpoch();snprintf(s.workerName,sizeof(s.workerName),"RW:%d",demoReworkQty);sealObject(s);if(!saveOfflineSessions()){setError(-48,"LOI LUU FINISH");return false;}}
   // Phase 2: append immutable event. Reboot recovery repeats safely using the same event_id.
   if(!appendOfflineEventWithIdentity(OfflineEventType::FINISH,s.finishEventId,s.finishSequence,s.localSessionId,s.workerQr,s.workerName,s.operationQr,s.operationName,s.finishGoodQty,s.finishDefectQty,s.finishEpoch,demoReworkQty)){setError(-42,"KHONG LUU FINISH EVENT");return false;}
   // Phase 3: only after event is durable, remove open local session.
-  for(uint16_t i=si+1;i<offlineSessionCount;i++)offlineSessions[i-1]=offlineSessions[i];offlineSessionCount--;if(!saveOfflineSessions()){setError(-48,"LOI CAP NHAT SESSION");return false;}
+  removeOfflineSessionAt(si);if(!saveOfflineSessions()){setError(-48,"LOI CAP NHAT SESSION");return false;}
   drawSimple("ĐÃ LƯU TẠM",rt.workerName,"SẢN LƯỢNG ĐÃ LƯU","SẼ TỰ ĐỘNG GỬI",C_WARN);delay(1600);resetForNextWorker();return true;
 }
 
@@ -1003,12 +1304,39 @@ void recoverOfflineSessionIntents(){
   if(changed)saveOfflineSessions();
 }
 
+// The append-only log was never compacted: after ~250 START/FINISH cycles the
+// 500-entry ACK scratch overflowed, answered events looked pending again and
+// were resent forever ("BO NHO OFFLINE DAY"), and every loop re-read a growing
+// file. Once EVERYTHING is answered the log carries no information the server
+// does not have, so it is dropped. Open local sessions are kept (their own
+// file); a START re-added at boot by recoverOfflineSessionIntents() is
+// answered "duplicate" by the server (same client_event_id).
+constexpr size_t EVENT_LOG_COMPACT_BYTES = 48U * 1024U;
+void compactEventLogIfDrained(){
+  if(!fsReady||!LittleFS.exists(EVENT_LOG_FILE))return;
+  File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return;const size_t size=f.size();f.close();
+  // Only with no open local session: their "already synced" state lives in the ACKs.
+  if(size<EVENT_LOG_COMPACT_BYTES||countPendingOfflineEvents()!=0||offlineSessionCount!=0)return;
+  if(LittleFS.remove(EVENT_LOG_FILE))eventLogGeneration++,Serial.printf("[OFFLINE] nhat ky da dong bo het (%u bytes) -> xoa\n",(unsigned)size);
+}
+
 bool readOldestPendingEvent(OfflineLogRecord &out){
   if (!fsReady || !offlineBuffersReady) return false;
   uint16_t ackCount=0;File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return false;OfflineLogRecord r;
   while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r))if(validObject(r)&&(r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&ackCount<offlineAckCapacity)safeCopy(offlineAckScratch[ackCount++],64,r.eventId);
   f.seek(0);while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){if(!validObject(r)||r.recordType!=(uint8_t)LogRecordType::EVENT)continue;bool ack=false;for(uint16_t i=0;i<ackCount;i++)if(!strcmp(offlineAckScratch[i],r.eventId)){ack=true;break;}if(!ack){out=r;f.close();return true;}}
   f.close();return false;
+}
+
+// Catalog download blocks loop() (15 s connect + 35 s read): keep it rare.
+constexpr uint32_t CATALOG_EMPTY_RETRY_MS = 15UL * 60UL * 1000UL;
+constexpr uint32_t CATALOG_FAIL_RETRY_MS = 5UL * 60UL * 1000UL;
+
+// A background sync problem is logged, not shown: it used to switch the
+// operator's screen to ERROR in the middle of other work. Only a REJECTED
+// event (the operator must know) still goes to the screen.
+static void backgroundError(int status,const char* message){
+  const bool previous=suppressNetworkUiErrors;suppressNetworkUiErrors=true;setError(status,message);suppressNetworkUiErrors=previous;
 }
 
 bool syncOneOfflineEvent(){
@@ -1019,9 +1347,9 @@ bool syncOneOfflineEvent(){
   const bool posted=httpPostJson(OFFLINE_SYNC_PATH,req,resp,true,true);
   suppressNetworkUiErrors=false;
   if(!posted)return false;
-  JsonArray results=resp["results"].as<JsonArray>();if(results.isNull()||!results.size()){setError(-49,"SYNC KHONG CO ACK");return false;}
+  JsonArray results=resp["results"].as<JsonArray>();if(results.isNull()||!results.size()){backgroundError(-49,"SYNC KHONG CO ACK");return false;}
   const char* status=results[0]["status"]|"";const char* ackId=results[0]["event_id"]|"";
-  if(strcmp(ackId,e.eventId)!=0){setError(-50,"ACK SAI EVENT");return false;}
+  if(strcmp(ackId,e.eventId)!=0){backgroundError(-50,"ACK SAI EVENT");return false;}
   if(!strcmp(status,"rejected")){
     // BUG (found 2026-08-22, round 3): the server correctly rejects a
     // business-invalid offline START/FINISH (e.g. Operation's PO already
@@ -1046,17 +1374,19 @@ bool syncOneOfflineEvent(){
     // create an admin notification row, unlike the RECONCILE_REPLAY-only
     // Session Exceptions path which never covers an ordinary offline reject).
     sendKioskEvent("OFFLINE_SYNC_REJECTED","ERROR",notifyMsg,"Kiem tra OP/PO va bao quan doc",0);
-    if(!appendReject(e.eventId,reasonCode)){setError(-52,"KHONG LUU DUOC REJECT");return false;}
+    if(!appendReject(e.eventId,reasonCode)){backgroundError(-52,"KHONG LUU DUOC REJECT");return false;}
+    if(isStart){const int si=findOfflineSessionByLocalId(e.localSessionId);if(si>=0){removeOfflineSessionAt(si);saveOfflineSessions();}}
     lastOfflineSyncEpoch=currentEpoch();
     // On-device visibility for whoever is at the kiosk right now. Short,
     // no-diacritic text -- same convention as every other setError() call
     // in this file -- rather than the raw (possibly long, diacritic) server
     // reason, which is already sent in full via sendKioskEvent above.
-    setError(0,isStart?"BI TU CHOI - PO CHUA/DA XONG":"BI TU CHOI - BAO QUAN DOC");
+    if(uiState==UiState::READY) setError(0,isStart?"BI TU CHOI - PO CHUA/DA XONG":"BI TU CHOI - BAO QUAN DOC");
+    else backgroundError(0,isStart?"BI TU CHOI - PO CHUA/DA XONG":"BI TU CHOI - BAO QUAN DOC");
     return true;
   }
-  if(strcmp(status,"accepted")&&strcmp(status,"duplicate")){setError(-51,"SERVER TAM THOI TU CHOI");return false;}
-  if(!appendAck(e.eventId)){setError(-52,"KHONG LUU DUOC ACK");return false;}
+  if(strcmp(status,"accepted")&&strcmp(status,"duplicate")){backgroundError(-51,"SERVER TAM THOI TU CHOI");return false;}
+  if(!appendAck(e.eventId)){backgroundError(-52,"KHONG LUU DUOC ACK");return false;}
   lastOfflineSyncEpoch=currentEpoch();Serial.printf("[OFFLINE SYNC] %s -> %s, pending=%u\n",e.eventId,status,countPendingOfflineEvents());return true;
 }
 
@@ -1655,8 +1985,16 @@ bool loadDeviceConfig() {
   String deviceId = prefs.getString("device_id", DEVICE_ID);
   String deviceName = prefs.getString("device_name", DEVICE_NAME);
   String station = prefs.getString("station", STATION_CODE);
+  String ssid2 = prefs.getString("wifi_ssid2", "");
+  String pass2 = prefs.getString("wifi_pass2", "");
+  String ssid3 = prefs.getString("wifi_ssid3", "");
+  String pass3 = prefs.getString("wifi_pass3", "");
   prefs.end();
 
+  copyConfigValue(WIFI_SSID2, sizeof(WIFI_SSID2), ssid2);
+  copyConfigValue(WIFI_PASSWORD2, sizeof(WIFI_PASSWORD2), pass2);
+  copyConfigValue(WIFI_SSID3, sizeof(WIFI_SSID3), ssid3);
+  copyConfigValue(WIFI_PASSWORD3, sizeof(WIFI_PASSWORD3), pass3);
   copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
   copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), pass);
   copyConfigValue(SERVER_BASE, sizeof(SERVER_BASE), server);
@@ -1672,6 +2010,10 @@ bool saveDeviceConfig() {
   bool ok = true;
   ok &= prefs.putString("wifi_ssid", WIFI_SSID) > 0;
   prefs.putString("wifi_pass", WIFI_PASSWORD); // empty password is valid for open Wi-Fi
+  prefs.putString("wifi_ssid2", WIFI_SSID2);
+  prefs.putString("wifi_pass2", WIFI_PASSWORD2);
+  prefs.putString("wifi_ssid3", WIFI_SSID3);
+  prefs.putString("wifi_pass3", WIFI_PASSWORD3);
   if (!SERVER_BASE[0]) { prefs.end(); return false; }
   ok &= prefs.putString("server", SERVER_BASE) > 0;
   ok &= prefs.putString("ota_agent", OTA_AGENT_BASE) > 0;
@@ -1978,6 +2320,7 @@ static String buildRemoteStatusText() {
     out += "Keypad   : PCF8574T " + String(keypadMappingReady ? "READY" : "NEEDS CALIBRATION") +
            " @ 0x" + String(keypadAddress, HEX) + "\n";
   } else out += "Keypad   : NOT FOUND\n";
+  out += "Scanner  : baud=" + String(scannerBaud) + " bytes=" + String(scannerByteCount) + "\n";
   out += "Queue    : " + String(countPendingOfflineEvents()) + "\n";
   out += "OfflineQ : " + String(countPendingOfflineEvents()) + "\n";
   out += "Cache    : workers=" + String(workerCacheCount) + " operations=" + String(operationCacheCount) + " sessions=" + String(offlineSessionCount) + "\n";
@@ -2055,6 +2398,7 @@ static String executeRemoteCommand(String line, bool& delayedReboot, bool& openS
     return "Da gui vao kiosk nhu may quet: " + payload + "\n" + buildRemoteStatusText();
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); return "Da mo man hinh test cam ung.\n"; }
+  if (cmd.startsWith("scanner-baud")) return cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n";
   if (cmd == "keypad-calibrate confirm" || cmd == "calibrate-keypad confirm") {
     if (!requestRuntimeKeypadCalibration("WEB")) {
       return "Khong the hieu chinh luc nay. Dua kiosk ve READY, dam bao khong co giao dich dang cho va thu lai.\n";
@@ -2326,11 +2670,12 @@ static bool refreshCatalogFromMes(String& message, uint16_t& workersLoaded, uint
   catalogDebug.url = url;
   remoteLogf("CATDBG url=%s wifi=%s ip=%s rssi=%d fs_total=%u fs_used=%u", url.c_str(), WIFI_SSID, WiFi.localIP().toString().c_str(), WiFi.RSSI(), static_cast<unsigned>(LittleFS.totalBytes()), static_cast<unsigned>(LittleFS.usedBytes()));
   catalogStage("http-begin");
+  mesKeepAlive.drop();   // free the kept TLS context (~45 KB) for the 110 KB snapshot download
 
   MesHttpSession net;
   // Flask/nginx may return a chunked HTTP/1.1 body. HTTP/1.0 makes the
   // response easier and more reliable to persist before JSON parsing.
-  if (!net.begin(url, 15000, 35000, 35, true, true)) {
+  if (!net.begin(url, 5000, 12000, 12, true, true)) {
     message = "http.begin that bai: " + url;
     remoteLogf("CATALOG BEGIN FAIL url=%s", url.c_str());
     return false;
@@ -2371,7 +2716,15 @@ static bool refreshCatalogFromMes(String& message, uint16_t& workersLoaded, uint
   // Download first, parse second. This avoids deserializeJson() reading a
   // temporarily empty/chunked WiFi stream and also leaves exact byte diagnostics.
   catalogStage("body-download");
-  int written = http.writeToStream(&temp);
+  // Feed the 40 s watchdog per chunk: a slow 110 KB download must not reset the kiosk.
+  struct WdtFeedingFile : public Stream {
+    File& f; explicit WdtFeedingFile(File& file) : f(file) {}
+    size_t write(uint8_t b) override { esp_task_wdt_reset(); return f.write(b); }
+    size_t write(const uint8_t* b, size_t n) override { esp_task_wdt_reset(); return f.write(b, n); }
+    int available() override { return 0; } int read() override { return -1; } int peek() override { return -1; }
+    void flush() override { f.flush(); }
+  } wdtFile(temp);
+  int written = http.writeToStream(&wdtFile);
   temp.flush();
   size_t actualLength = temp.size();
   catalogDebug.written = written;
@@ -2946,8 +3299,19 @@ void drawWorker(uint8_t frame = 0) {
   tft.fillScreen(C_BG);
   drawIndustrialHeader(C_OK);
   drawSectionLabel("NHÂN VIÊN");
-  drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 82, 216, 58, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
-  drawCenteredTextFit("QUÉT CÔNG ĐOẠN", SCREEN_LEFT_MARGIN, 166, 216, 58, FONT_TITLE, FONT_TITLE - 1, 2, C_INFO, true);
+  if (openOpCount == 0) {
+    // Fixed size (no auto-shrink): every name renders the same, wrapping to 2 lines (user, 2026-10-07).
+    drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 80, 216, 62, FONT_VALUE, FONT_VALUE, 2, C_TEXT, true);
+    drawCenteredTextFit("QUÉT CÔNG ĐOẠN", SCREEN_LEFT_MARGIN, 166, 216, 58, FONT_TITLE, FONT_TITLE - 1, 2, C_INFO, true);
+  } else {
+    drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 62, 216, 44, FONT_SECTION, FONT_SECTION, 2, C_TEXT, true);
+    char head[40]; snprintf(head, sizeof(head), "ĐANG CHẠY %u VIỆC", openOpCount);
+    drawCenteredTextFit(head, SCREEN_LEFT_MARGIN, 106, 216, 28, FONT_SECTION, FONT_SECTION - 1, 1, C_WARN, true);
+    const uint8_t shown = openOpCount < 3 ? openOpCount : 3;
+    for (uint8_t i = 0; i < shown; i++)
+      drawCenteredTextFit(openOps[i].opName, SCREEN_LEFT_MARGIN, 134 + i * 27, 216, 26, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED, false);
+    drawCenteredTextFit("QUÉT MÃ: CHỐT / THÊM VIỆC", SCREEN_LEFT_MARGIN, 220, 216, 26, FONT_SECTION, FONT_SECTION - 1, 1, C_INFO, true);
+  }
   drawFooter("* HỦY", "");
 }
 
@@ -2965,10 +3329,10 @@ void drawStartSuccess() {
   tft.fillScreen(C_BG);
   drawIndustrialHeader(C_OK);
   drawSectionLabel("ĐANG LÀM");
-  drawCenteredTextFit(rt.workerName, SCREEN_LEFT_MARGIN, 70, 216, 50, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
-  drawCenteredTextFit(rt.operationName, SCREEN_LEFT_MARGIN, 132, 216, 58, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
+  drawCenteredTextFit(rt.workerName, SCREEN_LEFT_MARGIN, 66, 216, 62, FONT_VALUE, FONT_VALUE, 2, C_TEXT, true);
+  drawCenteredTextFit(rt.operationName, SCREEN_LEFT_MARGIN, 132, 216, 62, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
   char context[82]; snprintf(context, sizeof(context), "%s  %s", rt.po, rt.part);
-  drawCenteredTextFit(context, SCREEN_LEFT_MARGIN, 208, 216, 30, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED);
+  drawCenteredTextFit(context, SCREEN_LEFT_MARGIN, 210, 216, 30, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED);
   drawFooter("* HỦY", "# KẾT THÚC");
 }
 
@@ -2988,9 +3352,11 @@ void drawAskRework() {
   drawKeyValueRow("LỖI TỔNG", demoDefectQty, 46);
   drawCenteredTextFit("CÓ LỖI SỬA ĐƯỢC?", SCREEN_LEFT_MARGIN, 86, 216, 58,
                       FONT_TITLE, FONT_TITLE - 1, 2, C_TEXT, true);
-  drawOptionRow("1", "KHÔNG, XONG", 164);
-  drawOptionRow("2", "CÓ, NHẬP SỐ", 208);
-  drawFooter("* QUAY LẠI", "");
+  // Repairable defects are rare: '#' (the key used everywhere to go on) means
+  // NO and continues; '1' opens the repairable-quantity input (user, 2026-10-07).
+  drawOptionRow("#", "KHÔNG, TIẾP TỤC", 164);
+  drawOptionRow("1", "CÓ, NHẬP SỐ", 208);
+  drawFooter("* QUAY LẠI", "# TIẾP");
 }
 
 void drawConfirmQty() {
@@ -3390,19 +3756,22 @@ void nextClientEventId(char* out, size_t outSize) {
 
 bool postActionPayload(const String& payload) {
   if (!rt.bound || WiFi.status() != WL_CONNECTED) return false;
-  MesHttpSession net;
+  MesRequest net(true);
   char url[320];
   snprintf(url, sizeof(url), "%s/api/kiosk/events", SERVER_BASE);
-  if (!net.begin(url, 1200, 2500, 3)) return false;
+  if (!net.begin(url, 1200, 2500, 3)) { net.fail(); return false; }
   HTTPClient& http = net.http();
   addJsonHeaders(http);
   addAuthHeaders(http);
   int status = http.POST(payload);
-  net.end();
+  if (status > 0) { net.readBody(status); net.end(); } else net.fail();
   // Deliberately do not call setError(): telemetry must never change kiosk UI.
   return status >= 200 && status < 300;
 }
 
+// Conservative flag for the OTA task (it must not read the queue file): true
+// until the loop has seen the queue empty, set again by every enqueue.
+volatile bool actionQueueMaybeNonEmpty = true;
 uint16_t actionQueueCount() {
   if (!LittleFS.exists(ACTION_QUEUE_PATH)) return 0;
   File f = LittleFS.open(ACTION_QUEUE_PATH, "r");
@@ -3434,6 +3803,7 @@ bool enqueueActionPayload(const String& payload) {
   }
   File f = LittleFS.open(ACTION_QUEUE_PATH, "a");
   if (!f) return false;
+  actionQueueMaybeNonEmpty = true;
   bool ok = f.println(payload) > 0;
   f.close();
   return ok;
@@ -3443,6 +3813,13 @@ bool emitActionEvent(const char* eventType, const char* category,
                      const char* result, int httpStatus,
                      uint32_t durationMs, const char* message,
                      const char* errorCode, const char* inputType) {
+  // Lean telemetry (user, 2026-10-07): routine steps (scanned / accepted /
+  // pending / recovered) are not logged -- production data already goes
+  // through the business API, and every queued event costs a ~1.7 s HTTPS
+  // POST on the UI loop. Only failures and rejections are kept.
+  if (strcmp(eventType, "KIOSK_BOOT") != 0 &&
+      (!result || !strcmp(result, "RECEIVED") || !strcmp(result, "SUCCESS") ||
+       !strcmp(result, "PENDING") || !strcmp(result, "RECOVERED"))) return true;
   DynamicJsonDocument event(2048);
   char eventId[112]; nextClientEventId(eventId, sizeof(eventId));
   event["client_event_id"] = eventId;
@@ -3480,9 +3857,11 @@ void serviceActionEventQueue() {
   if (uiState == UiState::STARTING || uiState == UiState::FINISHING ||
       uiState == UiState::SYNC_PENDING || uiState == UiState::LOOKUP_WORKER ||
       uiState == UiState::LOOKUP_OPERATION) return;
+  // Only from an idle READY screen, so a scan rarely waits behind a telemetry POST.
+  if (uiState != UiState::READY || millis() - stateEnteredAt < ACTION_QUEUE_IDLE_MS) return;
   if (millis() - lastActionQueueRetryAt < ACTION_QUEUE_RETRY_MS) return;
   lastActionQueueRetryAt = millis();
-  if (!LittleFS.exists(ACTION_QUEUE_PATH)) return;
+  if (!LittleFS.exists(ACTION_QUEUE_PATH)) { actionQueueMaybeNonEmpty = false; return; }
 
   // Send at most one telemetry event per pass. Never drain the entire file in
   // one loop because repeated POST/open/close cycles can starve the scanner UI
@@ -3511,7 +3890,7 @@ void serviceActionEventQueue() {
     const bool hasRemaining = check && check.size() > 0;
     if (check) check.close();
     if (hasRemaining) LittleFS.rename(ACTION_QUEUE_TMP_PATH, ACTION_QUEUE_PATH);
-    else LittleFS.remove(ACTION_QUEUE_TMP_PATH);
+    else { LittleFS.remove(ACTION_QUEUE_TMP_PATH); actionQueueMaybeNonEmpty = false; }
   }
 }
 
@@ -3549,7 +3928,7 @@ uint32_t maxStateDurationMs(UiState state) {
 
 bool sendKioskEvent(const char* eventType, const char* severity, const char* message,
                     const char* recoveryAction, uint32_t stateAgeMs) {
-  if (!rt.bound || WiFi.status() != WL_CONNECTED) return false;
+  if (!strcmp(eventType, "USER_FORCED_EXIT")) return true;   // '*' cancel is routine
   DynamicJsonDocument request(1536);
   request["device_id"] = DEVICE_ID;
   request["device_name"] = DEVICE_NAME;
@@ -3578,8 +3957,9 @@ bool sendKioskEvent(const char* eventType, const char* severity, const char* mes
   request["recovery_action"] = recoveryAction;
   request["recovery_count"] = stateRecoveryCount;
 
-  DynamicJsonDocument response(256);
-  return httpPostJson("/api/kiosk/events", request, response, true, true);
+  // Queued like telemetry: an inline POST here blocked the scanner for up to 7 s.
+  String payload; serializeJson(request, payload);
+  return enqueueActionPayload(payload);
 }
 
 void recoverUiFromStuck(const char* reason, bool userRequested) {
@@ -3624,6 +4004,14 @@ void recoverUiFromStuck(const char* reason, bool userRequested) {
 void serviceStateWatchdog() {
   if (millis() - lastStateWatchdogAt < STATE_WATCHDOG_CHECK_MS) return;
   lastStateWatchdogAt = millis();
+  // A worker screen left alone must not let the next person's OP scan be booked
+  // to the previous worker. Not an incident: release quietly.
+  if (uiState == UiState::WORKER_OK && !hasPendingTransaction() &&
+      millis() - stateEnteredAt > WORKER_IDLE_RELEASE_MS) {
+    Serial.println("[KIOSK] Man hinh nhan vien bo trong qua lau -> ve QUET THE.");
+    resetForNextWorker();
+    return;
+  }
   const uint32_t limit = maxStateDurationMs(uiState);
   if (!limit) return;
   const uint32_t age = millis() - stateEnteredAt;
@@ -3688,6 +4076,11 @@ void drawError() {
 }
 
 void setUi(UiState next) {
+  if (!onUiLoopTask()) { Serial.printf("[UI] bo qua setUi tu task khac (state=%d)\n", (int)next); return; }
+  // Any screen change closes the hold-'*' recovery menu: otherwise a scan or
+  // the state watchdog drew over it while its flag stayed set, and the next
+  // worker's digits went to the menu ('5' = reboot).
+  if (recoveryMenuActive || recoveryInfoActive) { recoveryMenuActive = false; recoveryInfoActive = false; }
   const UiState previous = uiState;
   uiState = next;
   stateEnteredAt = millis();
@@ -3841,7 +4234,7 @@ void setError(int status, const char* message) {
   const char* technical = message && message[0] ? message : "UNKNOWN ERROR";
   Serial.printf("[ERROR] HTTP %d: %s\n", status, technical);
   remoteLogf("ERROR HTTP %d: %s", status, technical);
-  if (suppressNetworkUiErrors) {
+  if (suppressNetworkUiErrors || !onUiLoopTask()) {
     safeCopy(rt.lastError, sizeof(rt.lastError), technical);
     return;
   }
@@ -3863,7 +4256,18 @@ void addAuthHeaders(HTTPClient& http) {
   if (rt.kioskToken[0]) http.addHeader("X-Kiosk-Token", rt.kioskToken);
 }
 
-bool decodeResponse(HTTPClient& http, int status, DynamicJsonDocument& response, JsonDocument* filter = nullptr) {
+bool decodeResponse(HTTPClient& http, int status, DynamicJsonDocument& response, JsonDocument* filter = nullptr,
+                    bool wholeBody = false) {
+  if (wholeBody) {
+    // HTTP/1.1 keep-alive: the body may be chunked and must be read to the end
+    // before the socket is reused. These responses are a few KB.
+    String body = mesKeepAlive.readBody(status);
+    DeserializationError err = filter
+        ? deserializeJson(response, body, DeserializationOption::Filter(*filter))
+        : deserializeJson(response, body);
+    if (err) { setError(status, err.c_str()); return false; }
+    return true;
+  }
   DeserializationError err = filter
       ? deserializeJson(response, http.getStream(), DeserializationOption::Filter(*filter))
       : deserializeJson(response, http.getStream());
@@ -3948,7 +4352,8 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
   // chay lan thu 2, nen 1 lan HTTP 0 thoang qua la lap tuc bao "MAT KET
   // NOI MAY CHU" va bat nguoi dung phai quet lai ma.
   for (int attempt = 1; attempt <= 2; ++attempt) {
-    MesHttpSession net;
+    MesRequest net(!(baseOverride && baseOverride[0]));
+    esp_task_wdt_reset();
 
     // Do lac lo: measured server TTFB alone is ~0.6-0.9s on a good link; the
     // old 1200ms connect / 2200ms request budget leaves almost no margin for
@@ -3956,7 +4361,7 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
     // real (not just the transient "HTTP 0" case above) even on strong WiFi.
     // Match httpPostJson()'s non-quick budget -- this GET gates the live
     // scan UX just as much as those POSTs do.
-    if (!net.begin(url, 4000, 6000, 15)) {
+    if (!net.begin(url, 4000, 6000, 8)) {
       lastStatus = -2;
       lastMessage = "http.begin that bai";
     } else {
@@ -3969,8 +4374,8 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
 
       if (status > 0) {
         response.clear();
-        bool decoded = decodeResponse(http, status, response, filter);
-        net.end();
+        bool decoded = decodeResponse(http, status, response, filter, net.keepAlive());
+        if (decoded) net.end(); else net.fail();
 
         if (!decoded){if (trackLinkState) recordServerResult(false,false,status,"GET-decode");return false;}
         if (trackLinkState) recordServerResult(status < 500,false,status,"GET");
@@ -3987,7 +4392,7 @@ bool httpGetJson(const char* path, DynamicJsonDocument& response, bool auth = tr
 
       lastMessage = HTTPClient::errorToString(status);
       Serial.printf("[GET RETRY] lan %d HTTP %d: %s\n", attempt, status, lastMessage.c_str());
-      net.end();
+      net.fail();
     }
 
     if (attempt < 2) {
@@ -4016,7 +4421,7 @@ bool httpPostJson(const char* path,
   // START/FINISH (quick=false) is an operator-facing action and gets the wait.
   const bool wifiUp = quick ? (WiFi.status() == WL_CONNECTED) : waitForWifiBriefly();
   if (!wifiUp) {
-    recordServerResult(false,true,-1,"POST-wifi");
+    if (!(baseOverride && baseOverride[0])) recordServerResult(false,true,-1,"POST-wifi");
     setError(-1, "WiFi chua ket noi");
     return false;
   }
@@ -4042,9 +4447,10 @@ bool httpPostJson(const char* path,
   const uint16_t requestTimeoutMs = quick ? 1200 : 6000;
 
   for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
-    MesHttpSession net;
+    MesRequest net(!(baseOverride && baseOverride[0]));
+    esp_task_wdt_reset();
 
-    if (!net.begin(url, connectTimeoutMs, requestTimeoutMs, quick ? 4 : 15)) {
+    if (!net.begin(url, connectTimeoutMs, requestTimeoutMs, quick ? 4 : 8)) {
       lastStatus = -2;
       lastMessage = "http.begin that bai";
     } else {
@@ -4059,11 +4465,11 @@ bool httpPostJson(const char* path,
 
       if (status > 0) {
         response.clear();
-        bool decoded = decodeResponse(http, status, response);
-        net.end();
+        bool decoded = decodeResponse(http, status, response, nullptr, net.keepAlive());
+        if (decoded) net.end(); else net.fail();
 
-        if (!decoded){recordServerResult(false,false,status,"POST-decode");return false;}
-        recordServerResult(status < 500,false,status,"POST");
+        if (!decoded){if (net.keepAlive()) recordServerResult(false,false,status,"POST-decode");return false;}
+        if (net.keepAlive()) recordServerResult(status < 500,false,status,"POST");
         Serial.printf("[GET OK] HTTP=%d json_used=%u heap=%u\n", status,
                       static_cast<unsigned>(response.memoryUsage()),
                       static_cast<unsigned>(ESP.getFreeHeap()));
@@ -4077,7 +4483,7 @@ bool httpPostJson(const char* path,
 
       lastMessage = HTTPClient::errorToString(status);
       Serial.printf("[POST RETRY] lan %d HTTP %d: %s\n", attempt, status, lastMessage.c_str());
-      net.end();
+      net.fail();
     }
 
     if (attempt < maxAttempts) {
@@ -4090,7 +4496,7 @@ bool httpPostJson(const char* path,
   }
 
   setError(lastStatus, lastMessage.c_str());
-  recordServerResult(false,false,lastStatus,"POST");
+  if (!(baseOverride && baseOverride[0])) recordServerResult(false,false,lastStatus,"POST");
   return false;
 }
 
@@ -4116,17 +4522,75 @@ void urlEncode(const char* input, char* output, size_t outputSize) {
 // ============================================================
 // API operations
 // ============================================================
+static const char* wifiSlotSsid(int8_t i) { return i == 0 ? WIFI_SSID : i == 1 ? WIFI_SSID2 : WIFI_SSID3; }
+static const char* wifiSlotPass(int8_t i) { return i == 0 ? WIFI_PASSWORD : i == 1 ? WIFI_PASSWORD2 : WIFI_PASSWORD3; }
+static bool wifiExtraNetworks() { return WIFI_SSID2[0] || WIFI_SSID3[0]; }
+uint32_t wifiPreferredCheckAt = 0;   // next "better network?" scan not before 10 min after this
+static bool wifiDriverSsidIs(const char* ssid) {
+  wifi_config_t conf;
+  return esp_wifi_get_config(WIFI_IF_STA, &conf) == ESP_OK && !strncmp(reinterpret_cast<const char*>(conf.sta.ssid), ssid, 32);
+}
+static void wifiBeginSlot(int8_t slot) {
+  wifiSlot = slot;
+  wifiPreferredCheckAt = millis();
+  mesKeepAlive.drop();
+  Serial.printf("[NETWORK] Ket noi WiFi %s (uu tien %d)\n", wifiSlotSsid(slot), slot + 1);
+  // While the driver is still (auto-)connecting, setting a new config is
+  // refused silently and it keeps the old network: stop that attempt first,
+  // then check the driver really took the new SSID.
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    WiFi.disconnect(false, false);
+    delay(150);
+    WiFi.begin(wifiSlotSsid(slot), wifiSlotPass(slot));
+    if (wifiDriverSsidIs(wifiSlotSsid(slot))) return;
+    delay(500);
+  }
+  Serial.printf("[NETWORK] Driver khong nhan cau hinh %s\n", wifiSlotSsid(slot));
+}
+// After any (re)connect, trust the driver over our bookkeeping.
+static void wifiSyncSlotFromDriver() {
+  const String now = WiFi.SSID();
+  for (int8_t k = 0; k < 3; k++) if (wifiSlotSsid(k)[0] && now == wifiSlotSsid(k)) { wifiSlot = k; return; }
+}
+// From finished scan results: the first known network in priority order that
+// is in good range, else the strongest known one; -1 when none is visible.
+static int8_t pickKnownNetwork(int16_t n) {
+  int32_t best[3] = {-127, -127, -127};
+  for (int16_t i = 0; i < n; i++)
+    for (int8_t k = 0; k < 3; k++)
+      if (wifiSlotSsid(k)[0] && WiFi.SSID(i) == wifiSlotSsid(k) && WiFi.RSSI(i) > best[k]) best[k] = WiFi.RSSI(i);
+  for (int8_t k = 0; k < 3; k++) if (best[k] >= WIFI_GOOD_RSSI) return k;
+  int8_t pick = -1;
+  for (int8_t k = 0; k < 3; k++) if (best[k] > -127 && (pick < 0 || best[k] > best[pick])) pick = k;
+  return pick;
+}
+
 bool connectWifi() {
   setUi(UiState::WIFI);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  uint32_t started = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
-    delay(250);
+  // With extra networks configured, scan once and start with the best one
+  // here; then try the others in priority order.
+  int8_t first = 0;
+  if (wifiExtraNetworks()) {
+    const int16_t n = WiFi.scanNetworks(false, true);
+    esp_task_wdt_reset();
+    const int8_t pick = n > 0 ? pickKnownNetwork(n) : -1;
+    WiFi.scanDelete();
+    if (pick >= 0) first = pick;
+  }
+  uint32_t started = 0;
+  for (int8_t k = 0; k < 3 && WiFi.status() != WL_CONNECTED; ++k) {
+    const int8_t slot = k == 0 ? first : (k <= first ? k - 1 : k);
+    if (!wifiSlotSsid(slot)[0]) continue;
+    wifiBeginSlot(slot);
+    started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < (k == 0 ? 20000UL : 15000UL)) {
+      delay(250);
+      esp_task_wdt_reset();
+    }
   }
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -4136,7 +4600,8 @@ bool connectWifi() {
   }
 
   rt.online = true;
-  Serial.printf("WiFi OK. IP=%s RSSI=%d dBm\n",
+  wifiSyncSlotFromDriver();
+  Serial.printf("WiFi OK. SSID=%s IP=%s RSSI=%d dBm\n", WiFi.SSID().c_str(),
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   return true;
 }
@@ -4258,7 +4723,7 @@ bool lookupQr(const char* qr, bool expectingWorker) {
     filter["active_sessions"][0][key] = true;
   }
 
-  DynamicJsonDocument response(3072);
+  DynamicJsonDocument response(6144);   // up to MAX_OPEN_OPS sessions
   if (!httpGetJson(path, response, true, &filter)) {
     emitActionEvent(expectingWorker ? "EMPLOYEE_REJECTED" : "OPERATION_REJECTED",
                     "API_RESULT", "FAILED", rt.lastHttpStatus,
@@ -4285,29 +4750,29 @@ bool lookupQr(const char* qr, bool expectingWorker) {
 
     JsonArray active = response["active_sessions"].as<JsonArray>();
     JsonObject activeSingle = response["active_session"].as<JsonObject>();
-    rt.activeSessionId = 0;
-    rt.activeGroupId[0] = '\0';
-    rt.activeStartTime[0] = '\0';
-
-    if ((!active.isNull() && active.size() > 0) || !activeSingle.isNull()) {
-      JsonObject s = (!active.isNull() && active.size() > 0) ? active[0].as<JsonObject>() : activeSingle;
-      rt.activeSessionId = s["id"] | 0;
-      safeCopy(rt.activeGroupId, sizeof(rt.activeGroupId), s["session_group_id"] | "");
-      safeCopy(rt.activeStartTime, sizeof(rt.activeStartTime), s["start_time"] | "");
-      rt.operationId = s["operation_id"] | 0;
-      safeCopy(rt.operationCode, sizeof(rt.operationCode), s["operation_code"] | "");
-      safeCopy(rt.operationName, sizeof(rt.operationName), s["operation_name"] | "Operation dang mo");
-      safeCopy(rt.operationQr, sizeof(rt.operationQr), s["operation_qr"] | "");
-      rt.hasOperation = true;
-      safeCopy(rt.po, sizeof(rt.po), s["po"] | "");
-      safeCopy(rt.part, sizeof(rt.part), s["part"] | "");
-      demoGoodQty = 0;
-      demoReworkQty = 0;
-      demoDefectQty = 0;
-      setUi(UiState::INPUT_GOOD);
-    } else {
-      setUi(UiState::WORKER_OK);
-    }
+    clearOpenOps();
+    auto addServerSession = [](JsonObject s) {
+      OpenOp o;
+      o.sessionId = s["id"] | 0;
+      if (o.sessionId <= 0) return;
+      o.operationId = s["operation_id"] | 0;
+      safeCopy(o.opQr, sizeof(o.opQr), s["operation_qr"] | "");
+      if (finishPendingFor(rt.workerQr, o.opQr, o.operationId)) {
+        Serial.printf("[MULTI-OP] session %d da ket thuc tren may, cho dong bo -> an\n", o.sessionId);
+        return;
+      }
+      safeCopy(o.opName, sizeof(o.opName), s["operation_name"] | "Cong doan dang mo");
+      safeCopy(o.po, sizeof(o.po), s["po"] | "");
+      safeCopy(o.part, sizeof(o.part), s["part"] | "");
+      if (!addOpenOp(o)) Serial.printf("[MULTI-OP] bo qua session %d (trung hoac qua %u)\n", o.sessionId, MAX_OPEN_OPS);
+    };
+    if (!active.isNull()) for (JsonObject s : active) addServerSession(s);
+    if (openOpCount == 0 && !activeSingle.isNull()) addServerSession(activeSingle);
+    // START is local-first: a session started a moment ago may not be on the
+    // server yet. Add those, and drop local records the server already closed.
+    mergeLocalOpenOps(rt.workerQr, true);
+    Serial.printf("[MULTI-OP] %s co %u viec dang mo\n", rt.workerCode, openOpCount);
+    enterAfterWorkerScan();
 
     emitActionEvent("EMPLOYEE_ACCEPTED", "API_RESULT", "SUCCESS", 200, millis() - actionStartedAt);
     return true;
@@ -4470,6 +4935,10 @@ bool finishSession() {
       demoDefectQty,epoch,demoReworkQty)){
     setError(-30,"KHÔNG LƯU ĐƯỢC - BÁO QUẢN LÝ");return false;
   }
+  {
+    int si=findOfflineSessionForOp(rt.workerQr,rt.operationQr,rt.operationId);
+    if(si>=0&&!offlineSessions[si].finishPending){removeOfflineSessionAt(si);saveOfflineSessions();}
+  }
   Serial.printf("[OFFLINE] local-first FINISH event=%s pending=%u\n",eventId,countPendingOfflineEvents());
   drawSimple("ĐÃ GHI NHẬN",countPendingOfflineEvents()>0?"CHỜ ĐỒNG BỘ":"","","",C_OK);
   delay(900);resetForNextWorker();return true;
@@ -4520,6 +4989,7 @@ bool sendHeartbeat() {
     if (rt.po[0]) request["po_code"] = rt.po;
   }
   request["ui_state"] = stateName(uiState);
+  if (rt.hasWorker) request["open_operations"] = openOpCount;
   request["session_elapsed_seconds"] = 0;
 
   // Thong tin chan doan thiet bi.
@@ -4538,11 +5008,12 @@ bool sendHeartbeat() {
   request["last_recovery_seconds"] = lastRecoveryAt ? (millis() - lastRecoveryAt) / 1000UL : 0;
   request["last_recovery_reason"] = lastRecoveryReason;
 
-  MesHttpSession net;
+  MesRequest net(true);
   char url[256];
   snprintf(url, sizeof(url), "%s/api/station/heartbeat", SERVER_BASE);
 
   if (!net.begin(url, 1500, 2500, 3)) {
+    net.fail();
     heartbeatFailCount++;
     // BUG (found 2026-08-22): heartbeat used to write rt.online directly with
     // its own private threshold (HEARTBEAT_FAILS_TO_OFFLINE=3), completely
@@ -4576,7 +5047,7 @@ bool sendHeartbeat() {
   int status = http.POST(payload);
   String responseBody;
   if (status > 0) {
-    responseBody = http.getString();
+    responseBody = net.readBody(status);
     if (responseBody.length()) {
       DeserializationError err = deserializeJson(response, responseBody);
       if (err && status >= 200 && status < 300) {
@@ -4594,7 +5065,7 @@ bool sendHeartbeat() {
     Serial.printf("[heartbeat] response: %s\n", preview.length() ? preview.c_str() : "<empty>");
   }
 
-  net.end();
+  if (status > 0) net.end(); else net.fail();
 
   if (status >= 200 && status < 300) {
     heartbeatFailCount = 0;
@@ -4652,7 +5123,7 @@ static void otaEvent(const char* status, const char* errorCode = "", const char*
 static bool otaIdleSafe() {
   return WiFi.status() == WL_CONNECTED && rt.bound && rt.online && uiState == UiState::READY &&
          !rt.hasWorker && !rt.hasOperation && rt.activeSessionId <= 0 &&
-         !hasPendingTransaction() && countPendingOfflineEvents() == 0 && actionQueueCount() == 0 &&
+         !hasPendingTransaction() && !offlineEventsMaybePending() && !actionQueueMaybeNonEmpty &&
          !offlineMode && !maintenanceMode && !keypadCalibrationRequested && !keypadCalibrationInProgress;
 }
 
@@ -4705,7 +5176,11 @@ static bool performOtaUpdate() {
   if (strcasecmp(actual, otaExpectedSha256) != 0) { Update.abort(); otaEvent("OTA_VERIFY_FAILED", "OTA_HASH_MISMATCH", actual); return false; }
   otaEvent("OTA_DOWNLOAD_COMPLETE"); otaEvent("OTA_VERIFY_OK");
   if (!Update.end(true) || !Update.isFinished()) { otaEvent("OTA_FAILED", "OTA_FLASH_ERROR", Update.errorString()); return false; }
-  rememberOtaBoot(); otaEvent("OTA_REBOOTING"); delay(300); ESP.restart(); return true;
+  rememberOtaBoot();
+  // Idle was checked before the download; an operator may have started since.
+  // This runs on the OTA task, so waiting here does not block the kiosk.
+  for (uint16_t waited = 0; !otaIdleSafe() && waited < 600; ++waited) vTaskDelay(pdMS_TO_TICKS(1000));
+  otaEvent("OTA_REBOOTING"); delay(300); ESP.restart(); return true;
 }
 
 static void checkForOta() {
@@ -4716,9 +5191,9 @@ static void checkForOta() {
     Serial.println("[OTA] WAITING_TIME_SYNC");
     return;
   }
-  const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? OTA_RETRY_INTERVAL_MS : OTA_CHECK_INTERVAL_MS;
+  const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? otaRetryIntervalMs() : OTA_CHECK_INTERVAL_MS;
   if (lastOtaCheckAt && millis() - lastOtaCheckAt < interval) return;
-  lastOtaCheckAt = millis(); otaEvent("OTA_CHECK");
+  lastOtaCheckAt = millis();   // no OTA_CHECK event: a POST per poll is noise
   Serial.printf("[OTA] CHECK agent=%s version=%s model=%s\n", otaAgentBase(), FW_VERSION, HW_MODEL);
   char path[320]; snprintf(path, sizeof(path), "/api/esp-ota/check?kiosk_id=%s&current_version=%s&hardware_model=%s",
                            DEVICE_UUID[0] ? DEVICE_UUID : DEVICE_ID, FW_VERSION, HW_MODEL);
@@ -4733,13 +5208,15 @@ static void checkForOta() {
   suppressNetworkUiErrors = previousSuppress;
   if (!checked) {
     otaCheckSucceeded = false;
+    if (otaCheckFailures < 16) otaCheckFailures++;
     // Consume the retry cooldown.  Setting the timestamp in the past creates
     // a tight request loop when the Agent/network is unavailable.
     lastOtaCheckAt = millis();
     Serial.printf("[OTA] CHECK_FAILED status=%d; retry in %lus\n", rt.lastHttpStatus,
-                  static_cast<unsigned long>(OTA_RETRY_INTERVAL_MS / 1000UL));
+                  static_cast<unsigned long>(otaRetryIntervalMs() / 1000UL));
     return;
   }
+  otaCheckFailures = 0;
   if (!(response["update_available"] | false)) { otaAvailableWaitingIdle = false; otaCheckSucceeded = true; Serial.println("[OTA] NO_UPDATE"); return; }
   otaCheckSucceeded = true;
   const char* model = response["hardware_model"] | "";
@@ -4761,8 +5238,17 @@ static void otaCheckTask(void*) {
 }
 
 static void scheduleOtaCheck() {
+  // An HTTPS agent without a CA in the build can only fail (fail-closed), and
+  // every attempt also POSTed an OTA_CHECK event from the other core and
+  // logged "http.begin that bai" every 12-25 s. Build with MESFLOW_OTA_CA_FILE
+  // to enable OTA; without it the kiosk does not poll at all.
+  static bool otaDisabledLogged = false;
+  if (strncmp(otaAgentBase(), "https://", 8) == 0 && strlen(MESFLOW_ROOT_CA_PEM) == 0) {
+    if (!otaDisabledLogged) { Serial.println("[OTA] TAT: agent HTTPS nhung ban build khong co CA -> khong kiem tra OTA."); otaDisabledLogged = true; }
+    return;
+  }
   if (otaCheckTaskRunning || !rt.bound || WiFi.status() != WL_CONNECTED || !rt.online) return;
-  const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? OTA_RETRY_INTERVAL_MS : OTA_CHECK_INTERVAL_MS;
+  const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? otaRetryIntervalMs() : OTA_CHECK_INTERVAL_MS;
   if (lastOtaCheckAt && millis() - lastOtaCheckAt < interval) return;
   otaCheckTaskRunning = true;
   // HTTPS + ArduinoJson parsing uses more stack than the normal UI task.
@@ -4964,6 +5450,8 @@ static void consolePrintStatus() {
   Serial.printf("Server   : %s\n", SERVER_BASE);
   Serial.printf("WiFi     : %s\n", WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
   Serial.printf("SSID     : %s\n", WIFI_SSID[0] ? WIFI_SSID : "<NOT SET>");
+  Serial.printf("WiFi 1/2/3: %s | %s | %s  (dang dung: %d)\n", WIFI_SSID, WIFI_SSID2[0] ? WIFI_SSID2 : "-",
+                WIFI_SSID3[0] ? WIFI_SSID3 : "-", wifiSlot + 1);
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("IP       : %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("RSSI     : %d dBm\n", WiFi.RSSI());
@@ -4975,6 +5463,7 @@ static void consolePrintStatus() {
   Serial.printf("Cache    : workers=%u operations=%u sessions=%u\n",
                 workerCacheCount, operationCacheCount, offlineSessionCount);
   Serial.printf("LittleFS : %s\n", fsReady ? "READY" : "NOT READY");
+  Serial.printf("Scanner  : UART1 GPIO44 baud=%lu bytes=%lu\n", (unsigned long)scannerBaud, (unsigned long)scannerByteCount);
   Serial.printf("Keypad   : %s", !keypadAvailable ? "NOT FOUND" :
                 (keypadMappingReady ? "READY" : "NEEDS CALIBRATION"));
   if (keypadAvailable) Serial.printf(" @ 0x%02X", keypadAddress);
@@ -5085,7 +5574,7 @@ static void consoleClearOffline() {
     return;
   }
   LittleFS.remove(SESSION_FILE);
-  LittleFS.remove(EVENT_LOG_FILE);
+  LittleFS.remove(EVENT_LOG_FILE); eventLogGeneration++;
   offlineSessionCount = 0;
   clearPendingTransaction();
   Serial.println("[CONSOLE] DA XOA queue va offline sessions. Du lieu chua sync khong the phuc hoi.");
@@ -5140,6 +5629,86 @@ static bool handleConsoleCommand(String line) {
     return true;
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); Serial.println("Da mo test cam ung."); return true; }
+  if (cmd == "recovery-menu") { openRecoveryMenu(); return true; }
+  // Wiring check that does not depend on the baud: count level changes on the
+  // scanner RX pin for 10 s (scan during that time). 0 edges = no signal reaches
+  // GPIO44 (cable / TX wire); edges but no bytes = baud / UART side.
+  if (cmd == "scanner-probe") {
+    Serial.println("[SCANNER PROBE] Quet ma trong 10 giay...");
+    const int pin = SCANNER_RX_PIN;
+    int last = digitalRead(pin), edges = 0, lows = 0;
+    const uint32_t started = millis();
+    uint32_t samples = 0, lastEdgeUs = micros(), minPulseUs = 0xFFFFFFFF;
+    while (millis() - started < 10000) {
+      const int v = digitalRead(pin);
+      if (v != last) {
+        const uint32_t now = micros(), width = now - lastEdgeUs;
+        if (edges > 0 && width >= 2 && width < minPulseUs) minPulseUs = width;
+        lastEdgeUs = now; edges++; last = v;
+      }
+      if (!v) lows++;
+      if ((++samples & 0x3FFF) == 0) esp_task_wdt_reset();
+    }
+    // the shortest pulse is one bit -> baud estimate
+    const uint32_t estBaud = minPulseUs != 0xFFFFFFFF && minPulseUs ? 1000000UL / minPulseUs : 0;
+    Serial.printf("[SCANNER PROBE] GPIO%d edges=%d min_pulse_us=%lu est_baud~%lu uart_baud=%lu bytes_uart=%lu rx_errors=%lu\n",
+                  pin, edges, (unsigned long)(minPulseUs == 0xFFFFFFFF ? 0 : minPulseUs), (unsigned long)estBaud,
+                  (unsigned long)scannerBaud, (unsigned long)scannerByteCount, (unsigned long)scannerRxErrors);
+    return true;
+  }
+  // Serial-only (needs the USB cable): switch server/station/device/token without
+  // touching Wi-Fi, identity, keypad mapping or scanner baud. Same rules as the
+  // LAN provisioning API (applyConfigJson). Example:
+  //   provision {"server_url":"https://mesflow.net","station_code":"111","kiosk_token":"..."}
+  // Serial-only: set the Wi-Fi networks (primary + optional fallback), then restart.
+  //   wifi-set {"ssid":"KIOSK1-ESP","password":"...","fallback_ssid":"OFFICE","fallback_password":"..."}
+  // "fallback_ssid":"" clears the fallback; omitting it keeps the current one.
+  if (cmd == "wifi-scan") {   // ~3 s blocking scan; for choosing a fallback network
+    const int16_t n = WiFi.scanNetworks(false, true);
+    Serial.printf("[WIFI-SCAN] %d mang (2.4 GHz)\n", n);
+    for (int16_t i = 0; i < n; i++)
+      Serial.printf("[WIFI-SCAN] %-32s RSSI %4ld ch %2ld%s\n", WiFi.SSID(i).c_str(), (long)WiFi.RSSI(i), (long)WiFi.channel(i),
+                    WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? " OPEN" : "");
+    WiFi.scanDelete();
+    return true;
+  }
+  if (cmd.startsWith("wifi-set ")) {
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, line.substring(9))) { Serial.println("[WIFI-SET] JSON khong hop le."); return true; }
+    String ssid = doc["ssid"] | ""; String pass = doc["password"] | "";
+    if (!ssid.length() || ssid.length() >= sizeof(WIFI_SSID) || pass.length() >= sizeof(WIFI_PASSWORD)) {
+      Serial.println("[WIFI-SET] Tu choi: ssid/password khong hop le."); return true;
+    }
+    if (doc.containsKey("fallback_ssid")) {
+      String ssid2 = doc["fallback_ssid"] | ""; String pass2 = doc["fallback_password"] | "";
+      if (ssid2.length() >= sizeof(WIFI_SSID2) || pass2.length() >= sizeof(WIFI_PASSWORD2)) { Serial.println("[WIFI-SET] Tu choi: fallback qua dai."); return true; }
+      copyConfigValue(WIFI_SSID2, sizeof(WIFI_SSID2), ssid2);
+      copyConfigValue(WIFI_PASSWORD2, sizeof(WIFI_PASSWORD2), pass2);
+    }
+    if (doc.containsKey("fallback2_ssid")) {
+      String ssid3 = doc["fallback2_ssid"] | ""; String pass3 = doc["fallback2_password"] | "";
+      if (ssid3.length() >= sizeof(WIFI_SSID3) || pass3.length() >= sizeof(WIFI_PASSWORD3)) { Serial.println("[WIFI-SET] Tu choi: fallback2 qua dai."); return true; }
+      copyConfigValue(WIFI_SSID3, sizeof(WIFI_SSID3), ssid3);
+      copyConfigValue(WIFI_PASSWORD3, sizeof(WIFI_PASSWORD3), pass3);
+    }
+    copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
+    copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), pass);
+    if (!saveDeviceConfig()) { Serial.println("[WIFI-SET] Khong ghi duoc NVS."); return true; }
+    Serial.printf("[WIFI-SET] OK 1=%s 2=%s 3=%s -> khoi dong lai de ap dung.\n", WIFI_SSID,
+                  WIFI_SSID2[0] ? WIFI_SSID2 : "<none>", WIFI_SSID3[0] ? WIFI_SSID3 : "<none>");
+    return true;
+  }
+  if (cmd.startsWith("provision ")) {
+    DynamicJsonDocument doc(1024);
+    String error;
+    if (deserializeJson(doc, line.substring(10))) { Serial.println("[PROVISION] JSON khong hop le."); return true; }
+    if (!applyConfigJson(doc, false, error)) { Serial.printf("[PROVISION] Tu choi: %s\n", error.c_str()); return true; }
+    Serial.printf("[PROVISION] OK server=%s station=%s device=%s token=%s -> khoi dong lai de ap dung.\n",
+                  SERVER_BASE, STATION_CODE, DEVICE_ID, rt.kioskToken[0] ? "STORED" : "EMPTY");
+    return true;
+  }
+  if (cmd.startsWith("key ") && cmd.length() == 5) { handleKeypadKey(line.charAt(4)); return true; }
+  if (cmd.startsWith("scanner-baud")) { Serial.print(cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n"); return true; }
   if (cmd == "bind") { bindKiosk(); return true; }
   if (cmd == "heartbeat") { sendHeartbeat(); return true; }
   if (cmd == "retry" || cmd == "dongbo") {
@@ -5164,7 +5733,9 @@ void handleSerialLine(String line) {
   if (!line.length()) return;
   lastInputAtMs = millis();
   inputEventCount++;
-  safeCopy(lastInputPreview, sizeof(lastInputPreview), line.c_str());
+  // `provision {json}` carries a kiosk token: never keep it as the input preview
+  // (that preview is reported in heartbeats/diagnostics).
+  safeCopy(lastInputPreview, sizeof(lastInputPreview), line.startsWith("provision ") ? "provision ***" : line.startsWith("wifi-set ") ? "wifi-set ***" : line.c_str());
 
   // Console administration always has priority over QR/session state.
   if (handleConsoleCommand(line)) return;
@@ -5202,53 +5773,37 @@ void handleSerialLine(String line) {
     beginSessionTrace();
     emitActionEvent("EMPLOYEE_SCANNED", "USER_ACTION", "RECEIVED");
     Serial.printf("[SCAN EMP] %s\n", line.c_str());
-    if (offlineMode || WiFi.status() != WL_CONNECTED || serverLinkState==ServerLinkState::UNREACHABLE || serverLinkState==ServerLinkState::WIFI_DOWN) {
+    // Only a real link problem forces the cache. A non-empty offline queue does
+    // not: lookupQr merges unsynced local STARTs and hides sessions with an
+    // unsynced local FINISH, and sessions opened elsewhere stay visible.
+    if (WiFi.status() != WL_CONNECTED || serverLinkState==ServerLinkState::UNREACHABLE || serverLinkState==ServerLinkState::WIFI_DOWN) {
       offlineMode = true;
       if (!offlineLookupWorker(line.c_str())) return;
     } else {
       if (!rt.bound && !bindKiosk()) return;
       clearRuntimeSelection();
-      if (!lookupQr(line.c_str(), true)) return;
-    }
-
-    // BUG (found 2026-08-22): the online lookupQr() above trusts ONLY the
-    // server's view of active_session. But START is LOCAL-FIRST -- it's
-    // written to the local offline journal instantly and only synced to the
-    // server after a backoff delay (starts at 5s). If this same worker's
-    // card is re-scanned before that sync lands (very plausible -- scan
-    // worker, scan OP, then immediately re-scan the same worker card to
-    // enter quantity), the server still doesn't know about the session yet,
-    // so rt.activeSessionId stays 0 and the operator gets bounced back to
-    // "scan OP" as if no session exists, even though one was already
-    // durably created. Fall back to the local session record, same as the
-    // offline path already does, before deciding there's really no session.
-    if (rt.activeSessionId == 0) {
-      int si = findOfflineSession(rt.workerQr);
-      if (si >= 0) {
-        OfflineSession& s = offlineSessions[si];
-        rt.activeSessionId = -1;
-        safeCopy(rt.activeGroupId, sizeof(rt.activeGroupId), s.localSessionId);
-        safeCopy(rt.operationQr, sizeof(rt.operationQr), s.operationQr);
-        safeCopy(rt.operationName, sizeof(rt.operationName), s.operationName);
-        rt.hasOperation = true;
-        Serial.println("[KIOSK] Session cuc bo chua sync nhung van con hieu luc.");
+      // The HTTPS lookup takes ~1.5-2 s (TLS handshake per request). Show the
+      // cached name right away; LOOKUP_WORKER only redraws the header, so this
+      // screen stays until the lookup picks the final one (user, 2026-10-07).
+      if (CachedWorker* cached = findCachedWorker(line.c_str())) {
+        safeCopy(rt.workerCode, sizeof(rt.workerCode), cached->code);
+        safeCopy(rt.workerName, sizeof(rt.workerName), cached->name);
+        clearOpenOps();
+        drawWorker();
+        Serial.printf("[KIOSK] Hien ten tu cache: %s\n", rt.workerCode);
       }
+      if (!lookupQr(line.c_str(), true)) return;   // fills openOps (server + unsynced local) and picks the screen
     }
-
     if (rt.activeSessionId != 0) {
       emitActionEvent("FINISH_REQUESTED", "USER_ACTION", "PENDING");
-      demoGoodQty = 0;
-      demoReworkQty = 0;
-      demoDefectQty = 0;
-      Serial.println("[KIOSK] Co session mo -> nhap so dat.");
-      setUi(UiState::INPUT_GOOD);
+      Serial.println("[KIOSK] 1 viec dang mo -> nhap so dat.");
     } else {
-      Serial.println("[KIOSK] Cho quet operation.");
+      Serial.printf("[KIOSK] %u viec dang mo -> cho quet cong doan.\n", openOpCount);
     }
     return;
   }
 
-  if (line.startsWith("WF|OP|")) {
+  if (isOperationQr(line.c_str())) {
     emitActionEvent("OPERATION_SCANNED", "USER_ACTION", "RECEIVED");
     Serial.printf("[SCAN OP] %s\n", line.c_str());
     if (!rt.hasWorker || !rt.workerQr[0]) {
@@ -5258,12 +5813,23 @@ void handleSerialLine(String line) {
                       "WORKER_REQUIRED", "OPERATION_QR");
       return;
     }
-    if (rt.activeSessionId != 0) {
-      setError(0, "DANG CO SESSION");
-      emitActionEvent("OPERATION_REJECTED", "USER_ERROR", "REJECTED", 0, 0,
-                      "Quet operation trong khi nhan vien dang co session",
-                      "ACTIVE_SESSION_EXISTS", "OPERATION_QR");
-      return;
+    {
+      const int open = findOpenOp(line.c_str());
+      if (open >= 0) {   // an operation this employee already runs -> finish it
+        selectOpenOp(open);
+        emitActionEvent("FINISH_REQUESTED", "USER_ACTION", "PENDING");
+        Serial.printf("[MULTI-OP] chon viec dang mo: %s\n", rt.operationName);
+        setUi(UiState::INPUT_GOOD);
+        return;
+      }
+      if (openOpCount >= MAX_OPEN_OPS) {
+        setError(0, "TOI DA 6 VIEC - CHOT BOT TRUOC");
+        emitActionEvent("OPERATION_REJECTED", "USER_ERROR", "REJECTED", 0, 0,
+                        "Qua so viec mo cung luc", "TOO_MANY_OPEN_OPS", "OPERATION_QR");
+        return;
+      }
+      rt.activeSessionId = 0;   // starting ANOTHER operation; the open ones stay open
+      rt.activeGroupId[0] = '\0';
     }
 
     if (offlineMode || WiFi.status() != WL_CONNECTED || serverLinkState==ServerLinkState::UNREACHABLE || serverLinkState==ServerLinkState::WIFI_DOWN) {
@@ -5336,14 +5902,14 @@ void handleSerialLine(String line) {
       return;
     }
     if (uiState == UiState::ASK_REWORK) {
-      if (line == "1") {
-        demoReworkQty = 0;
-        setUi(UiState::CONFIRM_QTY);
-      } else if (line == "2") {
+      if (line == "1") {                       // CO loi sua duoc -> nhap so
         demoReworkQty = 0;
         setUi(UiState::INPUT_REWORK);
+      } else if (line == "2" || line == "0") { // KHONG (keypad: '#')
+        demoReworkQty = 0;
+        setUi(UiState::CONFIRM_QTY);
       } else {
-        Serial.println("[QTY] ASK_REWORK chi nhan 1 hoac 2.");
+        Serial.println("[QTY] ASK_REWORK: 1 = CO, 2 = KHONG (keypad: #).");
       }
       return;
     }
@@ -5364,7 +5930,7 @@ void handleSerialLine(String line) {
     }
     if (uiState == UiState::CONFIRM_QTY) {
       if (line == "1") {
-        if (offlineMode || rt.activeSessionId < 0) offlineFinishSession();
+        if (rt.activeSessionId < 0) offlineFinishSession();
         else finishSession();
         return;
       }
@@ -5414,7 +5980,9 @@ void readSerialCommands() {
     // Chap nhan ca New Line, Carriage Return va Both NL & CR.
     if (c == '\r' || c == '\n') {
       if (line.length() > 0) {
-        Serial.printf("[SERIAL RX] %s\n", line.c_str());
+        // provision / wifi-set carry a token or password: never echo them.
+        Serial.printf("[SERIAL RX] %s\n", line.startsWith("provision ") ? "provision ***"
+                      : line.startsWith("wifi-set ") ? "wifi-set ***" : line.c_str());
         lastInputWasVirtual = false;
         lastInputWasKeypad = false;
         handleSerialLine(line);
@@ -5484,18 +6052,57 @@ void dispatchScannerFrame(const char* reason) {
                 static_cast<unsigned>(scannerText.length()),
                 scannerText.c_str());
 
-  if (scannerText.startsWith("WF|EMP|") || scannerText.startsWith("WF|OP|")) {
+  // Same code scanned again while the kiosk was still busy with it (operator
+  // re-scans when the screen has not reacted yet): handle it once.
+  static String lastDispatchedScan;
+  static uint32_t lastDispatchedScanAt = 0;
+  // Not on READY / ERROR: after '*' or an error the same card must work again.
+  if (scannerText.length() && scannerText == lastDispatchedScan && millis() - lastDispatchedScanAt < 3000 &&
+      uiState != UiState::READY && uiState != UiState::ERROR_STATE) {
+    Serial.printf("[SCANNER DUP] bo qua ma lap lai: %s\n", scannerText.c_str());
+    scannerFrameLength = 0;
+    return;
+  }
+  if (scannerText.startsWith("WF|EMP|") || isOperationQr(scannerText.c_str())) {
+    lastDispatchedScan = scannerText;
+    lastDispatchedScanAt = millis();
+    noteScannerFrameValid();
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
     handleSerialLine(scannerText);
+    lastDispatchedScanAt = millis();   // window counts from the end of a (possibly slow) lookup
   } else {
     Serial.println("[SCANNER DROP] Frame khong co chuoi QR MESFlow hop le; khong gui vao MES.");
+    // Garbage (unprintable bytes, or only a couple of characters for a whole
+    // scan) is what a wrong baud looks like: try the next likely baud. A clean
+    // non-MESFlow barcode at the right baud is all printable and is ignored.
+    if (decodedLength < 4 || decodedLength * 10 < scannerFrameLength * 8) noteScannerFrameGarbage();
   }
 
   scannerFrameLength = 0;
 }
 
+// A scanner at a much LOWER baud than the UART can produce no bytes at all,
+// only frame/break errors (the "silent wrong baud" case). Those errors count as
+// garbage for the auto-detect too. Set from the UART event task -> volatile.
+static uint32_t scannerRxErrorsSeen = 0;
+static uint32_t scannerRxErrorAt = 0;
+void installScannerErrorHook() {
+  ScannerSerial.onReceiveError([](hardwareSerial_error_t e) {
+    if (e == UART_FRAME_ERROR || e == UART_BREAK_ERROR || e == UART_PARITY_ERROR) scannerRxErrors++;
+  });
+}
+
 void readScannerCommands() {
+  if (scannerRxErrors != scannerRxErrorsSeen) {
+    scannerRxErrorsSeen = scannerRxErrors;
+    scannerRxErrorAt = millis();
+  } else if (scannerRxErrorAt && millis() - scannerRxErrorAt > 300) {
+    // one burst of line errors = one scan at the wrong baud
+    scannerRxErrorAt = 0;
+    Serial.printf("[SCANNER] loi khung UART o baud=%lu (may quet khac baud?)\n", (unsigned long)scannerBaud);
+    noteScannerFrameGarbage();
+  }
   while (ScannerSerial.available() > 0) {
     const int raw = ScannerSerial.read();
     if (raw < 0) continue;
@@ -5521,6 +6128,14 @@ void readScannerCommands() {
       Serial.println("[SCANNER WARNING] Frame day; in frame hien tai va bat dau lai.");
       dispatchScannerFrame("BUFFER_FULL");
       scannerFrame[scannerFrameLength++] = value;
+    }
+    // The scanner ends every code with CR. Cut the frame there: bytes read in
+    // one go (the loop was busy in a 1-7 s HTTPS call) used to be glued into one
+    // invalid frame, e.g. "WF|EMP|NV006WF|EMP|NV007WF|EMP|NV008" (2026-10-07).
+    if ((value == '\r' || value == '\n') && scannerFrameLength > 1) {
+      dispatchScannerFrame("CR");
+    } else if ((value == '\r' || value == '\n') && scannerFrameLength == 1) {
+      scannerFrameLength = 0;   // stray terminator (CR LF pair)
     }
   }
 
@@ -5637,7 +6252,9 @@ static void drawKeypadCalibration(uint8_t index, const char* note, uint16_t acce
 
 static void waitKeypadRelease() {
   uint32_t stableSince = 0;
-  while (true) {
+  const uint32_t started = millis();
+  while (millis() - started < 10000) {   // a stuck key must not hang the kiosk
+    esp_task_wdt_reset();
     const int pair = scanKeypadPair();
     if (pair == -1) {
       if (stableSince == 0) stableSince = millis();
@@ -5649,11 +6266,18 @@ static void waitKeypadRelease() {
   }
 }
 
+// Returns the pair, or -9 when nobody pressed anything for KEYPAD_CAL_IDLE_MS.
+// 2026-10-07: the wizard waited forever without feeding the 40 s task
+// watchdog -> an unattended kiosk with a fresh keypad rebooted in a loop.
+constexpr uint32_t KEYPAD_CAL_IDLE_MS = 60000;
 static int waitStableKeypadPair() {
   int candidate = -1;
   uint32_t stableSince = 0;
   uint32_t lastWarningAt = 0;
+  const uint32_t started = millis();
   while (true) {
+    esp_task_wdt_reset();
+    if (candidate < 0 && millis() - started >= KEYPAD_CAL_IDLE_MS) return -9;
     const int pair = scanKeypadPair();
     if (pair >= 0) {
       if (pair != candidate) {
@@ -5684,6 +6308,12 @@ static bool calibrateKeypadInteractive() {
       while (true) {
         drawKeypadCalibration(index, "DANG CHO PHIM");
         const int pair = waitStableKeypadPair();
+        if (pair == -9) {
+          Serial.println("[KEYPAD CAL] Khong ai bam phim trong 60 giay -> huy hieu chinh, giu nguyen ban phim cu.");
+          drawSimple("HỦY HIỆU CHỈNH", "KHÔNG CÓ NGƯỜI BẤM", "BẤM 1 PHÍM ĐỂ LÀM LẠI", "", C_WARN);
+          delay(1500);
+          return false;
+        }
         bool duplicate = false;
         for (uint8_t previous = 0; previous < index; ++previous) {
           if (keypadPairs[previous] == static_cast<uint8_t>(pair)) duplicate = true;
@@ -5771,7 +6401,9 @@ static void serviceRuntimeKeypadCalibration() {
   demoDefectQty = 0;
   keypadNumberLength = 0;
   keypadNumberBuffer[0] = '\0';
-  clearKeypadCalibration();
+  // Keep the saved mapping until a NEW one is complete: an aborted wizard
+  // (nobody pressing) must leave the old calibration in place.
+  keypadMappingReady = false;
   keypadReleaseAll();
 
   drawSimple("HIỆU CHỈNH KEYPAD", "TẠM KHÓA THAO TÁC", "LÀM THEO MÀN HÌNH", "KHÔNG TẮT NGUỒN", C_INFO);
@@ -5794,7 +6426,8 @@ static void serviceRuntimeKeypadCalibration() {
   if (calibrated) {
     Serial.println("[KEYPAD CAL] Hieu chinh runtime thanh cong; kiosk da tro ve READY.");
   } else {
-    Serial.println("[KEYPAD CAL] Hieu chinh runtime that bai; keypad bi vo hieu hoa.");
+    if (loadKeypadMapping()) Serial.println("[KEYPAD CAL] Huy/that bai -> giu nguyen mapping cu.");
+    else Serial.println("[KEYPAD CAL] Huy/that bai; chua co mapping -> bam 1 phim de lam lai.");
   }
 }
 
@@ -5823,8 +6456,9 @@ bool initKeypad() {
   keypadAvailable = true;
   keypadReleaseAll();
   if (!loadKeypadMapping()) {
-    Serial.println("[KEYPAD] Chua co mapping hop le; mo hieu chinh tren LCD.");
-    calibrateKeypadInteractive();
+    // No blocking wizard at boot: an unattended kiosk must still come up
+    // (Wi-Fi, server, scanner). The wizard opens when somebody presses a key.
+    Serial.println("[KEYPAD] Chua co mapping; ban phim tam chua dung -- bam 1 phim bat ky de hieu chinh.");
   }
   keypadCandidatePair = -1;
   keypadEmittedPair = -1;
@@ -5901,6 +6535,116 @@ static void appendKeypadDigit(char key) {
   redrawKeypadQuantity();
 }
 
+// '*'-hold recovery menu, ported from v2 (docs/WIFI_RECOVERY.md there):
+// hold '*' -> countdown from 3 s -> MENU KHOI PHUC at 5 s -> keep holding to
+// 10 s -> Wi-Fi setup portal directly. Released before 3 s, '*' is the normal
+// delete/back key. The menu works from every screen and never depends on the
+// session state. Item 7 keeps v1's maintenance page (server / OTA URL).
+constexpr uint32_t RECOVERY_COUNTDOWN_FROM_MS = 3000;
+constexpr uint32_t RECOVERY_MENU_HOLD_MS = 5000;
+bool recoveryMenuActive = false;
+bool recoveryInfoActive = false;
+static int recoveryCountdownShown = -1;
+
+static void drawRecoveryMenu() {
+  tft.fillScreen(C_BG);
+  drawIndustrialHeader(WiFi.status() == WL_CONNECTED ? C_OK : C_ERR);
+  drawCenteredTextFit("MENU KHÔI PHỤC", SCREEN_LEFT_MARGIN, 34, 216, 26, FONT_TITLE, FONT_TITLE - 1, 1, C_INFO, true);
+  const char* items[] = {"Thử lại mạng", "Đồng bộ lại", "Cài đặt Wi-Fi", "Quay lại", "Khởi động lại",
+                         "Thông tin thiết bị", "Bảo trì (đổi server)"};
+  for (uint8_t i = 0; i < 7; i++) {
+    char number[3]; snprintf(number, sizeof(number), "%u", (unsigned)(i + 1));
+    drawOptionRow(number, items[i], 64 + i * 31);
+  }
+  drawFooter("* GIỮ: WI-FI", "4 QUAY LẠI");
+}
+
+static void drawRecoveryCountdown(int secondsLeft) {
+  tft.fillScreen(C_BG);
+  drawIndustrialHeader(C_INFO);
+  drawCenteredTextFit("ĐANG GIỮ *", SCREEN_LEFT_MARGIN, 80, 216, 40, FONT_TITLE, FONT_TITLE - 1, 1, C_TEXT, true);
+  char line[40]; snprintf(line, sizeof(line), "MENU SAU %d GIÂY", secondsLeft);
+  drawCenteredTextFit(line, SCREEN_LEFT_MARGIN, 140, 216, 40, FONT_SECTION, FONT_SECTION - 1, 1, C_INFO, true);
+  drawCenteredTextFit("THẢ TAY ĐỂ HỦY", SCREEN_LEFT_MARGIN, 200, 216, 30, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED, false);
+}
+
+static void drawRecoveryInfo() {
+  tft.fillScreen(C_BG);
+  drawIndustrialHeader(WiFi.status() == WL_CONNECTED ? C_OK : C_ERR);
+  drawCenteredTextFit("THÔNG TIN THIẾT BỊ", SCREEN_LEFT_MARGIN, 34, 216, 26, FONT_SECTION, FONT_SECTION - 1, 1, C_INFO, true);
+  char lines[9][72];
+  snprintf(lines[0], 72, "FW %s", FW_VERSION);
+  snprintf(lines[1], 72, "ID %s", DEVICE_ID);
+  snprintf(lines[2], 72, "Wi-Fi %s %ddBm", WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "MẤT", (int)WiFi.RSSI());
+  snprintf(lines[3], 72, "IP %s", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-");
+  snprintf(lines[4], 72, "%s", SERVER_BASE[0] ? SERVER_BASE : "SERVER CHƯA ĐẶT");
+  snprintf(lines[5], 72, "Liên kết %s  Chờ gửi %u", rt.bound ? "OK" : "CHƯA", (unsigned)countPendingOfflineEvents());
+  snprintf(lines[6], 72, "Máy quét %lu baud", (unsigned long)scannerBaud);
+  snprintf(lines[7], 72, "Bàn phím %s", keypadAvailable ? (keypadMappingReady ? "OK" : "CHƯA HIỆU CHỈNH") : "KHÔNG THẤY");
+  snprintf(lines[8], 72, "UUID %.8s", DEVICE_UUID);
+  for (uint8_t i = 0; i < 9; i++)
+    drawTextBox(lines[i], 14, 62 + i * 25, 212, 23, FONT_HEADER, FONT_HEADER - 1, 1, TextAlign::LEFT, C_TEXT, false);
+  drawFooter("PHÍM BẤT KỲ", "VỀ MENU");
+}
+
+static void openRecoveryMenu() {
+  recoveryMenuActive = true;
+  recoveryInfoActive = false;
+  Serial.println("[RECOVERY] Mo menu khoi phuc (giu *).");
+  drawRecoveryMenu();
+}
+
+static void closeRecoveryMenu() {
+  recoveryMenuActive = false;
+  recoveryInfoActive = false;
+  redrawProductionUi();
+}
+
+static void handleRecoveryMenuKey(char key) {
+  if (recoveryInfoActive) { recoveryInfoActive = false; drawRecoveryMenu(); return; }
+  Serial.printf("[RECOVERY] chon '%c'\n", key);
+  switch (key) {
+    case '1':   // retry network
+      drawSimple("THỬ LẠI MẠNG", "ĐANG KẾT NỐI LẠI", "", "", C_INFO);
+      WiFi.reconnect();
+      lastHeartbeatAt = 0;
+      delay(800);
+      closeRecoveryMenu();
+      break;
+    case '2':   // resync: send the queue now, refresh the catalog when idle
+      drawSimple("ĐỒNG BỘ LẠI", "ĐANG GỬI DỮ LIỆU", "", "", C_INFO);
+      lastOfflineSyncAt = 0; offlineNextSyncAt = 0;
+      syncOneOfflineEvent();
+      lastCatalogAutoRefreshAt = 0; lastCatalogAutoAttemptAt = 0;
+      delay(600);
+      closeRecoveryMenu();
+      break;
+    case '3':   // Wi-Fi setup portal
+      recoveryMenuActive = false;
+      drawSimple("CÀI ĐẶT WI-FI", "ĐANG KHỞI ĐỘNG...", "", "", C_INFO);
+      startSetupPortal("Recovery menu");
+      break;
+    case '4': case '*': case '#':
+      closeRecoveryMenu();
+      break;
+    case '5':
+      drawSimple("KHỞI ĐỘNG LẠI", "VUI LÒNG CHỜ", "", "", C_WARN);
+      delay(600);
+      ESP.restart();
+      break;
+    case '6':
+      recoveryInfoActive = true;
+      drawRecoveryInfo();
+      break;
+    case '7':
+      recoveryMenuActive = false;
+      enterMaintenanceMode(false);
+      break;
+    default:
+      break;
+  }
+}
+
 void handleKeypadKey(char key) {
   lastUserActionAt = millis();
   stateEnteredAt = millis();  // quantity timeout is idle time, not total screen time
@@ -5910,6 +6654,8 @@ void handleKeypadKey(char key) {
   lastInputWasKeypad = true;
   snprintf(lastInputPreview, sizeof(lastInputPreview), "KEYPAD '%c'", key);
   Serial.printf("[KEYPAD] phim='%c' state=%s\n", key, stateName(uiState));
+
+  if (recoveryMenuActive) { handleRecoveryMenuKey(key); return; }
 
   if (maintenanceMode) {
     if (key == '1') {
@@ -5933,9 +6679,10 @@ void handleKeypadKey(char key) {
   }
 
   if (uiState == UiState::ASK_REWORK) {
-    if (key == '1' || key == '2') handleSerialLine(String(key));
+    if (key == '#') { demoReworkQty = 0; setUi(UiState::CONFIRM_QTY); }      // KHONG -> xac nhan
+    else if (key == '1') { demoReworkQty = 0; setUi(UiState::INPUT_REWORK); } // CO -> nhap so sua duoc
     else if (key == '*') setUi(UiState::INPUT_DEFECT);
-    else Serial.println("[KEYPAD] Chon 1 KHONG hoac 2 CO LOI SUA DUOC.");
+    else Serial.println("[KEYPAD] # = KHONG (tiep tuc), 1 = CO loi sua duoc, * = quay lai.");
     return;
   }
 
@@ -5953,6 +6700,16 @@ void handleKeypadKey(char key) {
     } else {
       Serial.println("[KEYPAD] Man XAC NHAN chi nhan 1/# hoac 2/*.");
     }
+    return;
+  }
+
+  // The employee screen shows "* HUY" but the keypad never handled it
+  // (2026-10-07): '*' there cancels back to "scan card". Open sessions are not
+  // touched -- only the selection on this kiosk is dropped.
+  if (key == '*' && (uiState == UiState::WORKER_OK || uiState == UiState::OPERATION_OK)) {
+    Serial.println("[KEYPAD] * -> huy, quay ve quet the.");
+    emitActionEvent("USER_CANCELLED", "USER_ACTION", "CANCELLED");
+    resetForNextWorker();
     return;
   }
 
@@ -5982,7 +6739,60 @@ void handleKeypadKey(char key) {
   Serial.println("[KEYPAD] Phim A/B/C/D khong duoc gan chuc nang.");
 }
 
+// Keypad hot-plug + rewiring (ported idea from v2, plus the part neither had):
+// the 7 keypad wires can land on P0..P7 in any order per unit. The guided
+// 12-key calibration turns whatever order into the right digits/positions.
+//  - not found: probe the bus every 3 s; a keypad that (re)appears gets a
+//    fresh calibration -- it may have been rewired while away;
+//  - found but not calibrated: calibrate as soon as the kiosk is READY;
+//  - a pressed pair that is not in the saved map = wiring changed -> recalibrate;
+//  - sustained I2C errors: re-begin the bus (v2: 50 errors); still failing
+//    -> treat the keypad as unplugged and go back to probing.
+static uint32_t keypadLastProbeAt = 0;
+static bool keypadWantsCalibration = false;
+static uint16_t keypadI2cErrors = 0;
+static const char* keypadCalibrationReason = "";
+static void markKeypadNeedsCalibration(const char* reason) {
+  if (!keypadWantsCalibration) Serial.printf("[KEYPAD] Can hieu chinh lai: %s\n", reason);
+  keypadWantsCalibration = true;
+  keypadCalibrationReason = reason;
+}
+static void serviceKeypadPresence() {
+  if (!keypadAvailable) {
+    if (millis() - keypadLastProbeAt < 3000) return;
+    keypadLastProbeAt = millis();
+    for (uint8_t address = KEYPAD_ADDRESS_FIRST; address <= KEYPAD_ADDRESS_LAST; ++address) {
+      touchWire.beginTransmission(address);
+      if (touchWire.endTransmission() == 0) {
+        keypadAddress = address;
+        keypadAvailable = true;
+        keypadI2cErrors = 0;
+        keypadReleaseAll();
+        keypadCandidatePair = -1;
+        keypadEmittedPair = -1;
+        if (loadKeypadMapping()) {
+          Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong) -> dung ban phim da hieu chinh.\n", address);
+        } else {
+          Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong), chua hieu chinh -> bam 1 phim de bat dau.\n", address);
+        }
+        break;
+      }
+    }
+    return;
+  }
+  // Not calibrated: wait for a person -- the first key press opens the wizard.
+  if (!keypadMappingReady && !keypadWantsCalibration && millis() - keypadLastPollAt >= 50) {
+    keypadLastPollAt = millis();
+    if (scanKeypadPair() >= 0) markKeypadNeedsCalibration("KEY_PRESSED_UNCALIBRATED");
+  }
+  if (keypadWantsCalibration && uiState == UiState::READY && !keypadCalibrationRequested &&
+      !keypadCalibrationInProgress && !hasPendingTransaction()) {
+    if (requestRuntimeKeypadCalibration(keypadCalibrationReason)) keypadWantsCalibration = false;
+  }
+}
+
 void serviceKeypad() {
+  serviceKeypadPresence();
   if (!keypadAvailable || !keypadMappingReady || millis() - keypadLastPollAt < 12) return;
   keypadLastPollAt = millis();
 
@@ -5994,6 +6804,22 @@ void serviceKeypad() {
   }
 
   const int pair = scanKeypadPair();
+  if (pair == -3) {
+    if (++keypadI2cErrors == 50) {
+      Serial.println("[KEYPAD] 50 loi I2C lien tiep -> khoi dong lai bus.");
+      touchWire.begin(TOUCH_SDA, TOUCH_SCL, 100000);
+      keypadReleaseAll();
+    } else if (keypadI2cErrors >= 250) {
+      Serial.println("[KEYPAD] Mat ket noi PCF8574T (rut ra?) -> chuyen sang do lai.");
+      keypadAvailable = false;
+      keypadMappingReady = false;
+      keypadI2cErrors = 0;
+      keypadLastProbeAt = millis();
+      return;
+    }
+  } else {
+    keypadI2cErrors = 0;
+  }
   if (pair != keypadCandidatePair) {
     keypadCandidatePair = pair;
     keypadCandidateSince = millis();
@@ -6006,14 +6832,28 @@ void serviceKeypad() {
       ? keypadPairToKey(static_cast<uint8_t>(keypadCandidatePair)) : '\0';
   if (wifiSetupHoldActive) {
     if (stableKey == '*') {
-      if (!wifiSetupHoldTriggered && millis() - wifiSetupHoldStartedAt >= WIFI_SETUP_HOLD_MS) {
-        wifiSetupHoldTriggered = true;
-        enterMaintenanceMode(false);
+      const uint32_t held = millis() - wifiSetupHoldStartedAt;
+      if (!wifiSetupHoldTriggered && held >= WIFI_SETUP_HOLD_MS) {
+        wifiSetupHoldTriggered = true;          // held through the menu: Wi-Fi setup (v2)
+        recoveryMenuActive = false; recoveryInfoActive = false;
+        drawSimple("CÀI ĐẶT WI-FI", "ĐANG KHỞI ĐỘNG...", "", "", C_INFO);
+        startSetupPortal("Hold * 10s");
+      } else if (!wifiSetupHoldTriggered && held >= RECOVERY_MENU_HOLD_MS && !recoveryMenuActive) {
+        openRecoveryMenu();
+      } else if (!recoveryMenuActive && held >= RECOVERY_COUNTDOWN_FROM_MS) {
+        const int left = (int)((RECOVERY_MENU_HOLD_MS - held + 999) / 1000);
+        if (left != recoveryCountdownShown) { recoveryCountdownShown = left; drawRecoveryCountdown(left); }
       }
     } else if (keypadCandidatePair == -1) {
-      // A normal '*' action is deferred until release so a maintenance hold
-      // never deletes/cancels anything while its ten-second timer is active.
-      if (!wifiSetupHoldTriggered) handleKeypadKey('*');
+      // A normal '*' action is deferred until release so a hold never
+      // deletes/cancels anything while its timer is running. Released during
+      // the countdown: just restore the screen. The menu stays open on release.
+      const uint32_t held = millis() - wifiSetupHoldStartedAt;
+      if (!wifiSetupHoldTriggered && !recoveryMenuActive) {
+        if (held >= RECOVERY_COUNTDOWN_FROM_MS) redrawProductionUi();
+        else handleKeypadKey('*');
+      }
+      recoveryCountdownShown = -1;
       wifiSetupHoldActive = false;
       wifiSetupHoldTriggered = false;
       wifiSetupHoldStartedAt = 0;
@@ -6043,6 +6883,9 @@ void serviceKeypad() {
       Serial.print("[KEYPAD] Cap chan chua duoc map: ");
       printKeypadPair(static_cast<uint8_t>(keypadCandidatePair));
       Serial.println();
+      // A pair the saved map does not know can only come from different
+      // wiring: normalize again instead of silently ignoring keys.
+      markKeypadNeedsCalibration("UNKNOWN_KEY_PAIR");
     }
     keypadEmittedPair = keypadCandidatePair;
   } else if (keypadCandidatePair == -1) {
@@ -6054,6 +6897,30 @@ void serviceKeypad() {
     Serial.println("[KEYPAD] Loi giao tiep I2C voi PCF8574T.");
     keypadEmittedPair = -3;
   }
+}
+
+// On a lower-priority network, look for a better one every 10 min (async
+// scan, only on an idle READY screen) and move when it is in good range.
+static void serviceWifiPreferredNetwork() {
+  static bool scanning = false;
+  if (wifiSlot == 0 || !wifiExtraNetworks()) { scanning = false; return; }
+  if (!scanning) {
+    if (uiState != UiState::READY || millis() - stateEnteredAt < 20000 || hasPendingTransaction()) return;
+    if (millis() - wifiPreferredCheckAt < WIFI_PRIMARY_RECHECK_MS) return;
+    wifiPreferredCheckAt = millis();
+    if (WiFi.scanNetworks(true) == WIFI_SCAN_FAILED) return;
+    scanning = true;
+    return;
+  }
+  const int16_t n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;
+  scanning = false;
+  const int8_t pick = n > 0 ? pickKnownNetwork(n) : -1;
+  WiFi.scanDelete();
+  if (pick < 0 || pick >= wifiSlot) return;   // pickKnownNetwork only prefers a higher slot when it is in good range
+  if (uiState != UiState::READY || hasPendingTransaction()) return;
+  Serial.printf("[NETWORK] Mang uu tien hon %s da co lai -> chuyen\n", wifiSlotSsid(pick));
+  wifiBeginSlot(pick);
 }
 
 void maintainConnection() {
@@ -6093,6 +6960,23 @@ void maintainConnection() {
     // a non-destructive reconnect request at a controlled interval.
     if (millis() - lastWifiAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
       lastWifiAttempt = millis();
+      // With a second network configured, a 45 s outage switches to the other
+      // one (e.g. the kiosk PC hotspot is off -> office Wi-Fi, and back).
+      static uint32_t lastSsidSwitchAt = 0;
+      if (wifiExtraNetworks() && disconnectedFor >= WIFI_SWITCH_AFTER_MS &&
+          (!lastSsidSwitchAt || millis() - lastSsidSwitchAt >= WIFI_SWITCH_AFTER_MS)) {
+        lastSsidSwitchAt = millis();
+        // Already offline: a ~3 s scan here costs nothing. Pick the best known
+        // network in range; if the scan fails, rotate to the next one.
+        const int16_t n = WiFi.scanNetworks(false, true);
+        esp_task_wdt_reset();
+        int8_t pick = n > 0 ? pickKnownNetwork(n) : -1;
+        WiFi.scanDelete();
+        if (pick < 0) { pick = wifiSlot; do { pick = (pick + 1) % 3; } while (!wifiSlotSsid(pick)[0]); }
+        Serial.printf("[NETWORK] WiFi mat %lu ms -> chon mang %s\n", static_cast<unsigned long>(disconnectedFor), wifiSlotSsid(pick));
+        wifiBeginSlot(pick);
+        return;
+      }
       Serial.printf("[NETWORK] WiFi mat %lu ms, yeu cau reconnect. status=%d\n",
                     static_cast<unsigned long>(disconnectedFor),
                     static_cast<int>(WiFi.status()));
@@ -6100,14 +6984,18 @@ void maintainConnection() {
     }
     return;
   }
+  serviceWifiPreferredNetwork();
 
   // Close out a confirmed outage exactly once, before wifiLostAt is cleared.
   if (wifiLostAt) {
     lastWifiRecoveredAt = millis();
     const uint32_t outage = lastWifiRecoveredAt - wifiLostAt;
     if (outage > longestWifiOutageMs) longestWifiOutageMs = outage;
-    Serial.printf("[NETWORK] WiFi tro lai sau %lu ms (lan mat thu %u).\n",
-                  static_cast<unsigned long>(outage), static_cast<unsigned>(wifiDropCount));
+    wifiSyncSlotFromDriver();
+    wifiPreferredCheckAt = millis();
+    Serial.printf("[NETWORK] WiFi tro lai sau %lu ms (lan mat thu %u) -> %s RSSI %d.\n",
+                  static_cast<unsigned long>(outage), static_cast<unsigned>(wifiDropCount),
+                  WiFi.SSID().c_str(), WiFi.RSSI());
   }
   disconnectObservedAt = 0;
   wifiLostAt = 0;
@@ -6127,10 +7015,14 @@ void maintainConnection() {
   // for the normal cooldown.  This also covers bind completion after boot.
   if (rt.bound && rt.online && !otaLinkReady) {
     otaLinkReady = true;
-    lastOtaCheckAt = 0;
-    otaCheckSucceeded = false;
-    otaAvailableWaitingIdle = false;
-    Serial.println("[OTA] LINK_READY immediate check scheduled");
+    // A check already in flight (it can go online on another core) counts:
+    // resetting here re-ran the whole check right after it finished.
+    if (!otaCheckTaskRunning) {
+      lastOtaCheckAt = 0;
+      otaCheckSucceeded = false;
+      otaAvailableWaitingIdle = false;
+      Serial.println("[OTA] LINK_READY immediate check scheduled");
+    }
   }
   if (rt.bound && hasPendingTransaction()) {
     if (millis() - lastPendingRetryAt >= PENDING_RETRY_MS) { lastPendingRetryAt = millis(); syncPendingTransaction(false); }
@@ -6150,6 +7042,7 @@ void maintainConnection() {
         offlineNextSyncAt=0;
         offlineMode = false;
         Serial.println("[OFFLINE SYNC] Queue da dong bo het; tro lai ONLINE.");
+        compactEventLogIfDrained();
         if (uiState == UiState::READY) drawReady(0);
       }
     }
@@ -6157,8 +7050,10 @@ void maintainConnection() {
   }
   offlineMode = false;
   if(rt.bound&&uiState==UiState::READY&&!hasPendingTransaction()&&countPendingOfflineEvents()==0){
-    const bool due=workerCacheCount==0||operationCacheCount==0||!lastCatalogAutoRefreshAt||millis()-lastCatalogAutoRefreshAt>=6UL*60UL*60UL*1000UL;
-    if(due&&millis()-lastCatalogAutoAttemptAt>=60000UL){
+    const uint32_t sinceOk=millis()-lastCatalogAutoRefreshAt;
+    const bool empty=workerCacheCount==0||operationCacheCount==0;
+    const bool due=!lastCatalogAutoRefreshAt||sinceOk>=6UL*60UL*60UL*1000UL||(empty&&sinceOk>=CATALOG_EMPTY_RETRY_MS);
+    if(due&&(!lastCatalogAutoAttemptAt||millis()-lastCatalogAutoAttemptAt>=CATALOG_FAIL_RETRY_MS)){
       lastCatalogAutoAttemptAt=millis();String message;uint16_t workers=0,operations=0;
       if(refreshCatalogFromMes(message,workers,operations)){lastCatalogAutoRefreshAt=millis();Serial.printf("[OFFLINE] snapshot revision=%s workers=%u operations=%u\n",offlineSnapshotRevision,workers,operations);}
       else Serial.printf("[OFFLINE] snapshot refresh failed: %s\n",message.c_str());
@@ -6172,6 +7067,10 @@ void maintainConnection() {
 // Arduino setup/loop
 // ============================================================
 void setup() {
+  uiLoopTask = xTaskGetCurrentTaskHandle();   // setup() and loop() run on the same Arduino task
+  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED || event == ARDUINO_EVENT_WIFI_STA_GOT_IP) keepAliveInvalidated = true;
+  });
   // Capture BEFORE anything else can reset it. This is the one fact that
   // separates "the watchdog below force-rebooted us" (TASK-WDT) from "the
   // supply sagged when the scanner lit up" (BROWNOUT) from "somebody power
@@ -6208,7 +7107,13 @@ void setup() {
   Serial.begin(115200);
   pinMode(SCANNER_RX_PIN, INPUT_PULLUP);
   ScannerSerial.setRxBufferSize(1024);
-  ScannerSerial.begin(SCANNER_BAUD, SERIAL_8N1, SCANNER_RX_PIN, -1);
+  {
+    Preferences p; p.begin("mesflow_cfg", true);
+    const uint32_t stored = p.getUInt("scan_baud", 0); p.end();
+    if (validScannerBaud(stored)) { scannerBaud = stored; scannerBaudConfirmed = true; }
+  }
+  ScannerSerial.begin(scannerBaud, SERIAL_8N1, SCANNER_RX_PIN, -1);
+  installScannerErrorHook();
   delay(100);
   while (ScannerSerial.available() > 0) ScannerSerial.read();
   delay(800);
@@ -6224,7 +7129,7 @@ void setup() {
                 static_cast<unsigned>(ESP.getFreeHeap()));
   Serial.printf("[SCANNER READY] UART1 RX=GPIO%d TX=DISABLED baud=%lu 8N1 inverted=NO frame_timeout=%lums\n",
                 SCANNER_RX_PIN,
-                static_cast<unsigned long>(SCANNER_BAUD),
+                static_cast<unsigned long>(scannerBaud),
                 static_cast<unsigned long>(SCANNER_FRAME_TIMEOUT_MS));
   Serial.println("[SCANNER WIRING] GM865 TX -> ESP GPIO44/RX; GM865 RX de trong; GND chung; VCC 5V.");
 
@@ -6267,7 +7172,11 @@ void setup() {
   }
 
   loadDeviceConfig();
-  if (PREFER_PLAIN_HTTP_FOR_MESFLOW && String(SERVER_BASE).equalsIgnoreCase("https://mesflow.net")) {
+  // Downgrade only when this build cannot verify HTTPS at all (no CA compiled
+  // in). With a CA bundle (MESFLOW_OTA_CA_FILE at build time) the kiosk keeps
+  // https:// -- the reference board has 8 MB PSRAM, TLS memory is not the issue.
+  if (PREFER_PLAIN_HTTP_FOR_MESFLOW && strlen(MESFLOW_ROOT_CA_PEM) == 0 &&
+      String(SERVER_BASE).equalsIgnoreCase("https://mesflow.net")) {
     safeCopy(SERVER_BASE, sizeof(SERVER_BASE), "http://mesflow.net");
     saveDeviceConfig();
     Serial.println("[CONFIG] Switched mesflow.net transport HTTPS -> HTTP to reduce TLS memory usage.");
@@ -6299,6 +7208,13 @@ void setup() {
                 static_cast<unsigned>(ESP.getFreePsram()));
   allocateOfflineBuffers();
   fsReady = LittleFS.begin(true);
+  esp_task_wdt_reset();
+  // The action queue is rewritten as tmp -> remove -> rename. Power lost in
+  // between leaves only the complete tmp file: take it back.
+  if (fsReady && LittleFS.exists(ACTION_QUEUE_TMP_PATH)) {
+    if (!LittleFS.exists(ACTION_QUEUE_PATH)) LittleFS.rename(ACTION_QUEUE_TMP_PATH, ACTION_QUEUE_PATH);
+    else LittleFS.remove(ACTION_QUEUE_TMP_PATH);
+  }
   prefs.begin("mesflow", true);
   clientEventCounter = prefs.getULong("evt_counter", 0);
   safeCopy(offlineSnapshotRevision,sizeof(offlineSnapshotRevision),prefs.getString("snap_rev","unknown").c_str());
@@ -6306,7 +7222,7 @@ void setup() {
   emitActionEvent("KIOSK_BOOT", "SYSTEM", "SUCCESS");
   if (!fsReady) Serial.println("[OFFLINE] LittleFS mount FAIL; offline mode disabled.");
   else if (!offlineBuffersReady) Serial.println("[OFFLINE] PSRAM buffers unavailable; online mode only.");
-  else { loadOfflineStorage(); recoverOfflineSessionIntents(); }
+  else { loadOfflineStorage(); recoverOfflineSessionIntents(); compactEventLogIfDrained(); }
   loadPendingTransaction();
 
   if (storedToken.length() && storedStation == STATION_CODE) {
