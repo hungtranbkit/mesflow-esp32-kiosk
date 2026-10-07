@@ -73,3 +73,9 @@ re-scan (0 open). All events accepted by `/api/station/events/sync`.
   loop (HTTPS call 1–7 s) were glued into one invalid frame ("WF|EMP|NV006WF|EMP|NV007WF|EMP|NV008"), which looked like
   "the scanner does not work". The same code repeated within 3 s is handled once. Console `scanner-probe` measures the
   raw RX pin for 10 s (edges, shortest pulse -> baud estimate, UART bytes/errors) to tell wiring vs. baud vs. firmware.
+
+## Fixed-size employee name (2026-10-07)
+- The employee name no longer auto-shrinks (24 px for short names, 16 px for long ones). It is always 24 px on the
+  worker screen and the "ĐANG LÀM" screen, wrapping to 2 lines (box 62 px). In the multi-OP list it is always 16 px,
+  on up to 2 lines. Verified on the bench board: "Huỳnh Thị Mơ" (1 line) and "Phạm Hoàng Huyền Linh" (2 lines),
+  same size.

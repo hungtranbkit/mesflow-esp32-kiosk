@@ -3114,15 +3114,16 @@ void drawWorker(uint8_t frame = 0) {
   drawIndustrialHeader(C_OK);
   drawSectionLabel("NHÂN VIÊN");
   if (openOpCount == 0) {
-    drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 82, 216, 58, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
+    // Fixed size (no auto-shrink): every name renders the same, wrapping to 2 lines (user, 2026-10-07).
+    drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 80, 216, 62, FONT_VALUE, FONT_VALUE, 2, C_TEXT, true);
     drawCenteredTextFit("QUÉT CÔNG ĐOẠN", SCREEN_LEFT_MARGIN, 166, 216, 58, FONT_TITLE, FONT_TITLE - 1, 2, C_INFO, true);
   } else {
-    drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 64, 216, 34, FONT_SECTION, FONT_SECTION - 1, 1, C_TEXT, true);
+    drawCenteredTextFit(rt.workerName[0] ? rt.workerName : rt.workerCode, SCREEN_LEFT_MARGIN, 62, 216, 44, FONT_SECTION, FONT_SECTION, 2, C_TEXT, true);
     char head[40]; snprintf(head, sizeof(head), "ĐANG CHẠY %u VIỆC", openOpCount);
-    drawCenteredTextFit(head, SCREEN_LEFT_MARGIN, 100, 216, 30, FONT_SECTION, FONT_SECTION - 1, 1, C_WARN, true);
+    drawCenteredTextFit(head, SCREEN_LEFT_MARGIN, 106, 216, 28, FONT_SECTION, FONT_SECTION - 1, 1, C_WARN, true);
     const uint8_t shown = openOpCount < 3 ? openOpCount : 3;
     for (uint8_t i = 0; i < shown; i++)
-      drawCenteredTextFit(openOps[i].opName, SCREEN_LEFT_MARGIN, 132 + i * 28, 216, 26, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED, false);
+      drawCenteredTextFit(openOps[i].opName, SCREEN_LEFT_MARGIN, 134 + i * 27, 216, 26, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED, false);
     drawCenteredTextFit("QUÉT MÃ: CHỐT / THÊM VIỆC", SCREEN_LEFT_MARGIN, 220, 216, 26, FONT_SECTION, FONT_SECTION - 1, 1, C_INFO, true);
   }
   drawFooter("* HỦY", "");
@@ -3142,10 +3143,10 @@ void drawStartSuccess() {
   tft.fillScreen(C_BG);
   drawIndustrialHeader(C_OK);
   drawSectionLabel("ĐANG LÀM");
-  drawCenteredTextFit(rt.workerName, SCREEN_LEFT_MARGIN, 70, 216, 50, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
-  drawCenteredTextFit(rt.operationName, SCREEN_LEFT_MARGIN, 132, 216, 58, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
+  drawCenteredTextFit(rt.workerName, SCREEN_LEFT_MARGIN, 66, 216, 62, FONT_VALUE, FONT_VALUE, 2, C_TEXT, true);
+  drawCenteredTextFit(rt.operationName, SCREEN_LEFT_MARGIN, 132, 216, 62, FONT_VALUE, FONT_VALUE - 1, 2, C_TEXT, true);
   char context[82]; snprintf(context, sizeof(context), "%s  %s", rt.po, rt.part);
-  drawCenteredTextFit(context, SCREEN_LEFT_MARGIN, 208, 216, 30, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED);
+  drawCenteredTextFit(context, SCREEN_LEFT_MARGIN, 210, 216, 30, FONT_SECTION, FONT_SECTION - 1, 1, C_MUTED);
   drawFooter("* HỦY", "# KẾT THÚC");
 }
 

@@ -58,6 +58,8 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   #22 (4/1/1, CÓ) and #23 (3/2/0, KHÔNG).
 - Touch FT6336G (0x38) is still not found on I2C (only 0x18 besides the keypad) — touch is optional; not investigated.
 - Event log compaction added (>= 48 KB and fully answered -> deleted).
+- Employee name uses a fixed font size (24 px, 2 lines; 16 px in the multi-OP list): drawTextBox min=max at the
+  drawWorker/drawStartSuccess call sites. Flashed to both boards (dell bench + kiosk1) 2026-10-07.
 
 ## Field board on kiosk1 -> https://mesflow.net (2026-10-07)
 - Board ESP32-S3 MAC 44:1b:f6:ce:64:4c plugged into the KIMEX kiosk PC (`ssh kiosk`, 192.168.1.48) `/dev/ttyACM0`;
