@@ -165,3 +165,18 @@ Two read-only audits (blocking paths, logic) of `esp/mesflow_app.cpp`; confirmed
   after the hold; a key press during the hold has no meaning there.
 - Verified on the bench board: boot, scan -> name 0.2 s / lookup 0.35 s, `key *` cancel. kiosk1 flashed, bound,
   keypad kept. The pending-queue lookup path was not exercised live: it would need real START/FINISH on mesflow.net.
+
+## Weak Wi-Fi at kiosk1: PC hotspot + fallback network (2026-10-07)
+- Firmware: an optional second network (NVS `mesflow_cfg/wifi_ssid2`, `wifi_pass2`).
+  - Boot tries the primary for 20 s, then the fallback.
+  - At runtime, an outage of 45 s or more switches to the other network (`WIFI_SWITCH_AFTER_MS`).
+  - On the fallback, an async scan every 10 min (idle READY only) moves back to the primary when it is at -70 dBm or
+    better (`serviceWifiReturnToPrimary`).
+- New serial-only command:
+  `wifi-set {"ssid","password","fallback_ssid","fallback_password"}`, then `restart`. `status` shows `WiFi2`.
+- `[SERIAL RX]` no longer echoes `provision` / `wifi-set` lines, which carry a token or password.
+- kiosk1 PC (wired, Wi-Fi card unused): NetworkManager hotspot `KIOSK1-ESP`, 2.4 GHz channel 6, WPA2,
+  `ipv4.method shared` (10.42.0.0/24, NAT), autoconnect priority 10. The default route stays on Ethernet.
+  The password is in `~/esp-backups/kiosk1-esp/provision/hotspot.json` (0600, dell).
+- ESP kiosk1: primary KIOSK1-ESP, fallback KIMEXVN-OFFICE. Measured: RSSI -42 dBm (was -81), heartbeat OK with
+  keep-alive reuse, employee scan done in 1.0 s.

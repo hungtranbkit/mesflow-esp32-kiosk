@@ -64,6 +64,11 @@ using PsramJsonDocument = BasicJsonDocument<PsramJsonAllocator>;
 // phone setup or LAN provisioning from MESFlow Admin Center.
 char WIFI_SSID[33]       = "panda";
 char WIFI_PASSWORD[65]   = "12345678a";
+// Optional second network (NVS wifi_ssid2/wifi_pass2), e.g. the office Wi-Fi
+// behind a hotspot on the kiosk PC: used when the primary is gone for a while.
+char WIFI_SSID2[33]      = "";
+char WIFI_PASSWORD2[65]  = "";
+bool wifiOnFallback = false;
 char SERVER_BASE[192]    = "";  // Bat buoc cau hinh qua Setup Portal/NVS; khong co fallback hardcode
 // Deploy Agent is the OTA control plane. NVS/maintenance can override this
 // per environment, but a fresh kiosk is immediately OTA-capable by default.
@@ -381,6 +386,8 @@ volatile uint32_t eventLogGeneration = 1;
 TaskHandle_t uiLoopTask = nullptr;
 inline bool onUiLoopTask() { return !uiLoopTask || xTaskGetCurrentTaskHandle() == uiLoopTask; }
 constexpr uint32_t WORKER_IDLE_RELEASE_MS = 90000;
+constexpr uint32_t WIFI_SWITCH_AFTER_MS = 45000;
+constexpr uint32_t WIFI_PRIMARY_RECHECK_MS = 10UL * 60UL * 1000UL;
 constexpr uint32_t KEEPALIVE_IDLE_MS = 45000;      // heartbeat every 20 s keeps the link warm
 constexpr unsigned long TLS_HANDSHAKE_TIMEOUT_S = 8;
 class MesHttpSession {
@@ -1973,8 +1980,12 @@ bool loadDeviceConfig() {
   String deviceId = prefs.getString("device_id", DEVICE_ID);
   String deviceName = prefs.getString("device_name", DEVICE_NAME);
   String station = prefs.getString("station", STATION_CODE);
+  String ssid2 = prefs.getString("wifi_ssid2", "");
+  String pass2 = prefs.getString("wifi_pass2", "");
   prefs.end();
 
+  copyConfigValue(WIFI_SSID2, sizeof(WIFI_SSID2), ssid2);
+  copyConfigValue(WIFI_PASSWORD2, sizeof(WIFI_PASSWORD2), pass2);
   copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
   copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), pass);
   copyConfigValue(SERVER_BASE, sizeof(SERVER_BASE), server);
@@ -1990,6 +2001,8 @@ bool saveDeviceConfig() {
   bool ok = true;
   ok &= prefs.putString("wifi_ssid", WIFI_SSID) > 0;
   prefs.putString("wifi_pass", WIFI_PASSWORD); // empty password is valid for open Wi-Fi
+  prefs.putString("wifi_ssid2", WIFI_SSID2);
+  prefs.putString("wifi_pass2", WIFI_PASSWORD2);
   if (!SERVER_BASE[0]) { prefs.end(); return false; }
   ok &= prefs.putString("server", SERVER_BASE) > 0;
   ok &= prefs.putString("ota_agent", OTA_AGENT_BASE) > 0;
@@ -4504,12 +4517,23 @@ bool connectWifi() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
+  wifiOnFallback = false;
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t started = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
     delay(250);
     esp_task_wdt_reset();
+  }
+  if (WiFi.status() != WL_CONNECTED && WIFI_SSID2[0]) {
+    Serial.printf("[NETWORK] Khong vao duoc %s -> thu mang du phong %s\n", WIFI_SSID, WIFI_SSID2);
+    wifiOnFallback = true;
+    WiFi.begin(WIFI_SSID2, WIFI_PASSWORD2);
+    started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
+      delay(250);
+      esp_task_wdt_reset();
+    }
   }
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -5368,6 +5392,7 @@ static void consolePrintStatus() {
   Serial.printf("Server   : %s\n", SERVER_BASE);
   Serial.printf("WiFi     : %s\n", WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
   Serial.printf("SSID     : %s\n", WIFI_SSID[0] ? WIFI_SSID : "<NOT SET>");
+  Serial.printf("WiFi2    : %s%s\n", WIFI_SSID2[0] ? WIFI_SSID2 : "<none>", wifiOnFallback ? " (DANG DUNG)" : "");
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("IP       : %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("RSSI     : %d dBm\n", WiFi.RSSI());
@@ -5576,6 +5601,28 @@ static bool handleConsoleCommand(String line) {
   // touching Wi-Fi, identity, keypad mapping or scanner baud. Same rules as the
   // LAN provisioning API (applyConfigJson). Example:
   //   provision {"server_url":"https://mesflow.net","station_code":"111","kiosk_token":"..."}
+  // Serial-only: set the Wi-Fi networks (primary + optional fallback), then restart.
+  //   wifi-set {"ssid":"KIOSK1-ESP","password":"...","fallback_ssid":"OFFICE","fallback_password":"..."}
+  // "fallback_ssid":"" clears the fallback; omitting it keeps the current one.
+  if (cmd.startsWith("wifi-set ")) {
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, line.substring(9))) { Serial.println("[WIFI-SET] JSON khong hop le."); return true; }
+    String ssid = doc["ssid"] | ""; String pass = doc["password"] | "";
+    if (!ssid.length() || ssid.length() >= sizeof(WIFI_SSID) || pass.length() >= sizeof(WIFI_PASSWORD)) {
+      Serial.println("[WIFI-SET] Tu choi: ssid/password khong hop le."); return true;
+    }
+    if (doc.containsKey("fallback_ssid")) {
+      String ssid2 = doc["fallback_ssid"] | ""; String pass2 = doc["fallback_password"] | "";
+      if (ssid2.length() >= sizeof(WIFI_SSID2) || pass2.length() >= sizeof(WIFI_PASSWORD2)) { Serial.println("[WIFI-SET] Tu choi: fallback qua dai."); return true; }
+      copyConfigValue(WIFI_SSID2, sizeof(WIFI_SSID2), ssid2);
+      copyConfigValue(WIFI_PASSWORD2, sizeof(WIFI_PASSWORD2), pass2);
+    }
+    copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
+    copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), pass);
+    if (!saveDeviceConfig()) { Serial.println("[WIFI-SET] Khong ghi duoc NVS."); return true; }
+    Serial.printf("[WIFI-SET] OK primary=%s fallback=%s -> khoi dong lai de ap dung.\n", WIFI_SSID, WIFI_SSID2[0] ? WIFI_SSID2 : "<none>");
+    return true;
+  }
   if (cmd.startsWith("provision ")) {
     DynamicJsonDocument doc(1024);
     String error;
@@ -5613,7 +5660,7 @@ void handleSerialLine(String line) {
   inputEventCount++;
   // `provision {json}` carries a kiosk token: never keep it as the input preview
   // (that preview is reported in heartbeats/diagnostics).
-  safeCopy(lastInputPreview, sizeof(lastInputPreview), line.startsWith("provision ") ? "provision ***" : line.c_str());
+  safeCopy(lastInputPreview, sizeof(lastInputPreview), line.startsWith("provision ") ? "provision ***" : line.startsWith("wifi-set ") ? "wifi-set ***" : line.c_str());
 
   // Console administration always has priority over QR/session state.
   if (handleConsoleCommand(line)) return;
@@ -5858,7 +5905,9 @@ void readSerialCommands() {
     // Chap nhan ca New Line, Carriage Return va Both NL & CR.
     if (c == '\r' || c == '\n') {
       if (line.length() > 0) {
-        Serial.printf("[SERIAL RX] %s\n", line.c_str());
+        // provision / wifi-set carry a token or password: never echo them.
+        Serial.printf("[SERIAL RX] %s\n", line.startsWith("provision ") ? "provision ***"
+                      : line.startsWith("wifi-set ") ? "wifi-set ***" : line.c_str());
         lastInputWasVirtual = false;
         lastInputWasKeypad = false;
         handleSerialLine(line);
@@ -6775,6 +6824,34 @@ void serviceKeypad() {
   }
 }
 
+// On the fallback network, look for the primary every 10 min (async scan, only
+// on an idle READY screen) and move back when it is in good range.
+static void serviceWifiReturnToPrimary() {
+  static uint32_t lastScanAt = 0;
+  static bool scanning = false;
+  if (!wifiOnFallback || !WIFI_SSID2[0]) { scanning = false; return; }
+  if (!scanning) {
+    if (uiState != UiState::READY || millis() - stateEnteredAt < 20000 || hasPendingTransaction()) return;
+    if (lastScanAt && millis() - lastScanAt < WIFI_PRIMARY_RECHECK_MS) return;
+    lastScanAt = millis();
+    if (WiFi.scanNetworks(true) == WIFI_SCAN_FAILED) return;
+    scanning = true;
+    return;
+  }
+  const int16_t n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;
+  scanning = false;
+  int32_t best = -127;
+  for (int16_t i = 0; i < n; i++) if (WiFi.SSID(i) == WIFI_SSID && WiFi.RSSI(i) > best) best = WiFi.RSSI(i);
+  WiFi.scanDelete();
+  if (best < -70) return;
+  if (uiState != UiState::READY || hasPendingTransaction()) return;
+  Serial.printf("[NETWORK] Mang chinh %s da co lai (RSSI %ld) -> quay lai\n", WIFI_SSID, static_cast<long>(best));
+  mesKeepAlive.drop();
+  wifiOnFallback = false;
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
 void maintainConnection() {
   static uint32_t lastWifiAttempt = 0;
   static uint32_t disconnectObservedAt = 0;
@@ -6812,6 +6889,18 @@ void maintainConnection() {
     // a non-destructive reconnect request at a controlled interval.
     if (millis() - lastWifiAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
       lastWifiAttempt = millis();
+      // With a second network configured, a 45 s outage switches to the other
+      // one (e.g. the kiosk PC hotspot is off -> office Wi-Fi, and back).
+      static uint32_t lastSsidSwitchAt = 0;
+      if (WIFI_SSID2[0] && disconnectedFor >= WIFI_SWITCH_AFTER_MS &&
+          (!lastSsidSwitchAt || millis() - lastSsidSwitchAt >= WIFI_SWITCH_AFTER_MS)) {
+        lastSsidSwitchAt = millis();
+        wifiOnFallback = !wifiOnFallback;
+        Serial.printf("[NETWORK] WiFi mat %lu ms -> chuyen sang %s\n", static_cast<unsigned long>(disconnectedFor),
+                      wifiOnFallback ? WIFI_SSID2 : WIFI_SSID);
+        if (wifiOnFallback) WiFi.begin(WIFI_SSID2, WIFI_PASSWORD2); else WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        return;
+      }
       Serial.printf("[NETWORK] WiFi mat %lu ms, yeu cau reconnect. status=%d\n",
                     static_cast<unsigned long>(disconnectedFor),
                     static_cast<int>(WiFi.status()));
@@ -6819,6 +6908,7 @@ void maintainConnection() {
     }
     return;
   }
+  serviceWifiReturnToPrimary();
 
   // Close out a confirmed outage exactly once, before wifiLostAt is cleared.
   if (wifiLostAt) {

@@ -73,6 +73,10 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   pending offline queue (server sessions with an unanswered local FINISH are hidden via finishPendingFor); still open:
   WF|OP vs WF|OPID matching while OFFLINE (catalog has no op ids). The pending-queue path is untested live.
   Serial `*` is NOT a cancel (use `key *`); keypad `*` is.
+- kiosk1 Wi-Fi (2026-10-07): the ESP uses the kiosk PC hotspot `KIOSK1-ESP` (NM connection on wlp5s0, ch 6,
+  shared/NAT 10.42.0.0/24, ESP got 10.42.0.98, RSSI -42), fallback KIMEXVN-OFFICE (auto-switch after a 45 s outage,
+  back to the primary via a 10-min scan). PC sudo needs a password (kiosk1 user). Hotspot password:
+  ~/esp-backups/kiosk1-esp/provision/hotspot.json (0600).
 - Bench-test caution: never inject serial input while the user is testing on the device (a stray `*` on READY shows
   "DU LIEU KHONG HOP LE"; two readers on /dev/ttyACM0 steal each other's bytes).
 
