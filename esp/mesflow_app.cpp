@@ -73,10 +73,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.5.7"
+#define FW_VERSION "5.5.8"
 #define FW_BUILD "20260813.0015"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.5.7-KIMEX-OTA-DEFAULT";
+const char* APP_VERSION  = "ESP32-KIOSK-5.5.8-KIMEX-GM65-CONFIG";
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -140,7 +140,14 @@ constexpr uint32_t FINISH_SUCCESS_HOLD_MS = 0; // Finish xong ve QUET THE ngay
 // "WF|EMP|NV002", then reconfirmed clean over the real UART1 peripheral
 // (13/13 frames exact). 9600 (the datasheet's factory default) produced
 // zero bytes on real hardware.
-constexpr uint32_t SCANNER_BAUD = 115200;
+// Keep the proven legacy scanner baud unless the build explicitly selects GM65 9600.
+#ifndef MESFLOW_GM65_BAUD
+#define MESFLOW_GM65_BAUD 115200
+#endif
+#if MESFLOW_GM65_BAUD != 9600 && MESFLOW_GM65_BAUD != 115200
+#error "MESFLOW_GM65_BAUD must be 9600 or 115200"
+#endif
+constexpr uint32_t SCANNER_BAUD = MESFLOW_GM65_BAUD;
 constexpr uint32_t SCANNER_FRAME_TIMEOUT_MS = 50;
 constexpr size_t SCANNER_FRAME_MAX = 256;
 HardwareSerial ScannerSerial(1);
