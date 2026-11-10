@@ -74,10 +74,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.5.11"
+#define FW_VERSION "5.5.12"
 #define FW_BUILD "20260813.0015"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.5.11-KIMEX-BIND-PERSIST";
+const char* APP_VERSION  = "ESP32-KIOSK-5.5.12-KIMEX-GM65-DIAG";
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -156,6 +156,8 @@ static size_t scannerFrameLength = 0;
 static uint32_t scannerLastByteAt = 0;
 static uint32_t scannerByteCount = 0;
 static uint32_t scannerFrameCount = 0;
+static uint32_t scannerAcceptedFrames = 0;
+static uint32_t scannerDroppedFrames = 0;
 
 // Capacitive touch (FT6336G capacitive touch, I2C address 0x38)
 #define TOUCH_SDA 16
@@ -2171,7 +2173,15 @@ static void handleDeviceHealthApi() {
        (keypadMappingReady ? "PCF8574T READY" : "PCF8574T NEEDS CALIBRATION"));
   hardware["keypad_address"] = keypadAddress;
   hardware["keypad_calibrated"] = keypadMappingReady;
+  // Hardware diagnostics are aggregate counters only; never expose raw QR or credentials.
   hardware["scanner_uart_configured"] = true;
+  hardware["scanner_rx_gpio"] = SCANNER_RX_PIN;
+  hardware["scanner_baud"] = SCANNER_BAUD;
+  hardware["scanner_byte_count"] = scannerByteCount;
+  hardware["scanner_frame_count"] = scannerFrameCount;
+  hardware["scanner_accepted_frames"] = scannerAcceptedFrames;
+  hardware["scanner_dropped_frames"] = scannerDroppedFrames;
+  hardware["scanner_last_byte_age_ms"] = scannerByteCount ? now - scannerLastByteAt : 0;
   hardware["scanner_status"] = "UART1: RX GPIO44, TX disabled, " + String(SCANNER_BAUD) + " 8N1";
   hardware["usb_serial_status"] = "READY";
   hardware["last_input_source"] = lastInputAtMs == 0 ? "NONE" :
@@ -5502,10 +5512,12 @@ void dispatchScannerFrame(const char* reason) {
                 scannerText.c_str());
 
   if (scannerText.startsWith("WF|EMP|") || scannerText.startsWith("WF|OP|")) {
+    scannerAcceptedFrames++;
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
     handleSerialLine(scannerText);
   } else {
+    scannerDroppedFrames++;
     Serial.println("[SCANNER DROP] Frame khong co chuoi QR MESFlow hop le; khong gui vao MES.");
   }
 
