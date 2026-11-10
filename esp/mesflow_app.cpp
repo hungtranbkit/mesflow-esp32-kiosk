@@ -74,10 +74,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.5.9"
+#define FW_VERSION "5.5.10"
 #define FW_BUILD "20260813.0015"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.5.9-KIMEX-MESFLOW-HTTPS";
+const char* APP_VERSION  = "ESP32-KIOSK-5.5.10-KIMEX-LINK-REFRESH";
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -782,8 +782,11 @@ uint16_t offlineAckCapacity = MAX_OFFLINE_EVENTS;
 // time an operator sees anything. Remember it separately, tagged by source.
 int lastLinkFailureStatus = 0;
 char lastLinkFailureSource[16] = "";
+// Redraw READY title once when MESFlow online/offline state changes.
+static bool readyNetworkRedrawNeeded = false;
 
 void recordServerResult(bool success,bool wifiDown=false,int status=0,const char* source=nullptr){
+  const bool wasOnline = rt.online;
   if(success){serverFailureStreak=0;if(serverSuccessStreak<2)serverSuccessStreak++;if(serverSuccessStreak>=2)serverLinkState=ServerLinkState::AVAILABLE;}
   else{serverSuccessStreak=0;if(wifiDown){serverFailureStreak=2;serverLinkState=ServerLinkState::WIFI_DOWN;}
     else{if(serverFailureStreak<2)serverFailureStreak++;if(serverFailureStreak>=2)serverLinkState=ServerLinkState::UNREACHABLE;}
@@ -791,6 +794,7 @@ void recordServerResult(bool success,bool wifiDown=false,int status=0,const char
     if(source) safeCopy(lastLinkFailureSource,sizeof(lastLinkFailureSource),source);
   }
   rt.online=serverLinkState==ServerLinkState::AVAILABLE;
+  if (rt.online != wasOnline) readyNetworkRedrawNeeded = true;
   if (!rt.online) otaLinkReady = false;
 }
 
@@ -6401,6 +6405,13 @@ void loop() {
   handleTouch();
   serviceStateWatchdog();
   maintainConnection();
+  // The title previously stayed "MẤT KẾT NỐI" after the link recovered,
+  // because only the online flag changed and READY was not repainted.
+  // Repaint only while idle; never interrupt a live scan or transaction.
+  if (readyNetworkRedrawNeeded) {
+    readyNetworkRedrawNeeded = false;
+    if (uiState == UiState::READY && !hasPendingTransaction()) drawReady(0);
+  }
   // Background telemetry is lowest priority. Do not let its HTTP POST delay a
   // recent Web Console command or scanner interaction.
   if (millis() - lastWebCommandAcceptedAt > 8000) serviceActionEventQueue();
