@@ -31,7 +31,8 @@
 #endif
 #endif
 #ifndef MESFLOW_ROOT_CA_PEM
-#define MESFLOW_ROOT_CA_PEM ""
+#include "mesflow_gts_root_r4.h"
+#define MESFLOW_ROOT_CA_PEM MESFLOW_GTS_ROOT_R4_PEM
 #endif
 
 // ArduinoJson allocator backed by ESP32-S3 PSRAM.
@@ -73,10 +74,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.0"
+#define FW_VERSION "5.6.1"
 #define FW_BUILD "20260813.0015"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.0-KIMEX-MULTI-OP";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.1-KIMEX-M910-COMPAT";
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -2317,7 +2318,7 @@ static void handleDeviceHealthApi() {
   hardware["keypad_address"] = keypadAddress;
   hardware["keypad_calibrated"] = keypadMappingReady;
   hardware["scanner_uart_configured"] = true;
-  hardware["scanner_status"] = "UART1: RX GPIO44, TX GPIO43, 9600 8N1";
+  hardware["scanner_status"] = "UART1: RX GPIO44, TX disabled, " + String(scannerBaud) + " 8N1";
   hardware["usb_serial_status"] = "READY";
   hardware["last_input_source"] = lastInputAtMs == 0 ? "NONE" :
       (lastInputWasVirtual ? "WEB VIRTUAL" : (lastInputWasKeypad ? "I2C KEYPAD" : "SERIAL/SCANNER"));
@@ -4380,6 +4381,11 @@ bool bindKiosk() {
   prefs.putString("token", rt.kioskToken);
   prefs.putString("station", STATION_CODE);
   prefs.end();
+  // Keep the server-approved station consistent across both existing NVS namespaces.
+  // This is a persistence fix only; Multi-OP and scanner logic are unchanged.
+  if (!saveDeviceConfig()) {
+    Serial.println("[BIND] Warning: station config save failed");
+  }
 
   Serial.println("Kiosk bind OK; token da luu NVS.");
   remoteLogf("BIND OK station=%s", STATION_CODE);
@@ -6662,6 +6668,20 @@ void setup() {
   String storedToken = prefs.getString("token", "");
   String storedStation = prefs.getString("station", "");
   prefs.end();
+  // On boards previously bound by another release, the approved station may
+  // be saved in mesflow but not mesflow_cfg. Restore only with a stored token.
+  if (storedToken.length() && storedStation.length() &&
+      storedStation != STATION_CODE && storedStation.length() < sizeof(STATION_CODE)) {
+    bool opened = prefs.begin("mesflow_cfg", false);
+    bool written = opened && prefs.putString("station", storedStation) > 0;
+    if (opened) prefs.end();
+    if (written) {
+      safeCopy(STATION_CODE, sizeof(STATION_CODE), storedStation.c_str());
+      Serial.println("[CONFIG] Restored approved kiosk station from NVS");
+    } else {
+      Serial.println("[CONFIG] Could not restore approved station");
+    }
+  }
 
   demoGoodQty = 0;
   demoReworkQty = 0;
