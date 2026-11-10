@@ -74,10 +74,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.5.10"
+#define FW_VERSION "5.5.11"
 #define FW_BUILD "20260813.0015"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.5.10-KIMEX-LINK-REFRESH";
+const char* APP_VERSION  = "ESP32-KIOSK-5.5.11-KIMEX-BIND-PERSIST";
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -4223,6 +4223,12 @@ bool bindKiosk() {
   prefs.putString("token", rt.kioskToken);
   prefs.putString("station", STATION_CODE);
   prefs.end();
+  // Persist the server-assigned station in both NVS namespaces.
+  // Without this, the next boot restores a stale station from mesflow_cfg
+  // and silently rejects the otherwise valid stored kiosk token.
+  if (!saveDeviceConfig()) {
+    Serial.println("[BIND] Warning: mesflow_cfg station save failed");
+  }
 
   Serial.println("Kiosk bind OK; token da luu NVS.");
   remoteLogf("BIND OK station=%s", STATION_CODE);
@@ -6293,6 +6299,21 @@ void setup() {
   String storedToken = prefs.getString("token", "");
   String storedStation = prefs.getString("station", "");
   prefs.end();
+  // Repair bindings saved by older firmware: mesflow.station was updated
+  // on successful server bind, while mesflow_cfg.station stayed unchanged.
+  // Trust the station only when a kiosk token already exists on this device.
+  if (storedToken.length() && storedStation.length() &&
+      storedStation != STATION_CODE && storedStation.length() < sizeof(STATION_CODE)) {
+    const bool opened = prefs.begin("mesflow_cfg", false);
+    const bool written = opened && prefs.putString("station", storedStation) > 0;
+    if (opened) prefs.end();
+    if (written) {
+      safeCopy(STATION_CODE, sizeof(STATION_CODE), storedStation.c_str());
+      Serial.println("[CONFIG] Reconciled approved station from kiosk token NVS");
+    } else {
+      Serial.println("[CONFIG] Unable to reconcile persisted kiosk station");
+    }
+  }
 
   demoGoodQty = 0;
   demoReworkQty = 0;
