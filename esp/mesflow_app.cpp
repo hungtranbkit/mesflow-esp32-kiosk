@@ -31,7 +31,8 @@
 #endif
 #endif
 #ifndef MESFLOW_ROOT_CA_PEM
-#define MESFLOW_ROOT_CA_PEM ""
+#include "mesflow_gts_root_r4.h"
+#define MESFLOW_ROOT_CA_PEM MESFLOW_GTS_ROOT_R4_PEM
 #endif
 
 // ArduinoJson allocator backed by ESP32-S3 PSRAM.
@@ -73,10 +74,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.5.7"
+#define FW_VERSION "5.5.9"
 #define FW_BUILD "20260813.0015"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.5.7-KIMEX-OTA-DEFAULT";
+const char* APP_VERSION  = "ESP32-KIOSK-5.5.9-KIMEX-MESFLOW-HTTPS";
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -96,8 +97,7 @@ int demoDefectQty = 0;
 
 // true: nếu chưa có token hoặc token hết hiệu lực thì tự bind.
 constexpr bool AUTO_BIND = true;
-// Use plain HTTP for mesflow.net to reduce TLS heap/stack pressure on boards without PSRAM.
-constexpr bool PREFER_PLAIN_HTTP_FOR_MESFLOW = true;
+// MESFlow public API is HTTPS-only. Never downgrade mesflow.net to HTTP.
 
 // Tu dong mo phong: quet worker -> quet operation -> start -> nhap SL -> finish.
 constexpr bool AUTO_DEMO_ON_BOOT = false; // Da tat hoan toan
@@ -140,7 +140,14 @@ constexpr uint32_t FINISH_SUCCESS_HOLD_MS = 0; // Finish xong ve QUET THE ngay
 // "WF|EMP|NV002", then reconfirmed clean over the real UART1 peripheral
 // (13/13 frames exact). 9600 (the datasheet's factory default) produced
 // zero bytes on real hardware.
-constexpr uint32_t SCANNER_BAUD = 115200;
+// Keep the proven legacy scanner baud unless the build explicitly selects GM65 9600.
+#ifndef MESFLOW_GM65_BAUD
+#define MESFLOW_GM65_BAUD 115200
+#endif
+#if MESFLOW_GM65_BAUD != 9600 && MESFLOW_GM65_BAUD != 115200
+#error "MESFLOW_GM65_BAUD must be 9600 or 115200"
+#endif
+constexpr uint32_t SCANNER_BAUD = MESFLOW_GM65_BAUD;
 constexpr uint32_t SCANNER_FRAME_TIMEOUT_MS = 50;
 constexpr size_t SCANNER_FRAME_MAX = 256;
 HardwareSerial ScannerSerial(1);
@@ -2161,7 +2168,7 @@ static void handleDeviceHealthApi() {
   hardware["keypad_address"] = keypadAddress;
   hardware["keypad_calibrated"] = keypadMappingReady;
   hardware["scanner_uart_configured"] = true;
-  hardware["scanner_status"] = "UART1: RX GPIO44, TX GPIO43, 9600 8N1";
+  hardware["scanner_status"] = "UART1: RX GPIO44, TX disabled, " + String(SCANNER_BAUD) + " 8N1";
   hardware["usb_serial_status"] = "READY";
   hardware["last_input_source"] = lastInputAtMs == 0 ? "NONE" :
       (lastInputWasVirtual ? "WEB VIRTUAL" : (lastInputWasKeypad ? "I2C KEYPAD" : "SERIAL/SCANNER"));
@@ -2201,7 +2208,7 @@ static String webConsolePage() {
 <div class="tabs"><button class="active" data-tab="dashboard">Dashboard</button><button data-tab="network">Network</button><button data-tab="hardware">Hardware</button><button data-tab="mes">MES</button><button data-tab="scanner">Máy quét ảo</button><button data-tab="logs">Logs & Diagnostics</button></div>
 <section id="dashboard" class="panel active"><div class="cards"><div class="card metric" id="healthCard"><small>Device Health</small><b id="health">--</b></div><div class="card metric"><small>Firmware</small><b id="firmware">--</b></div><div class="card metric"><small>Uptime</small><b id="uptime">--</b></div><div class="card metric"><small>CPU</small><b id="cpu">--</b></div></div><div class="grid2"><div class="card"><b>Memory</b><div class="kv"><div><span>Heap free</span><strong id="heapFree">--</strong></div><div><span>Heap min</span><strong id="heapMin">--</strong></div><div><span>Largest block</span><strong id="heapLargest">--</strong></div><div><span>PSRAM free / total</span><strong id="psram">--</strong></div></div></div><div class="card"><b>Storage</b><div class="kv"><div><span>Flash</span><strong id="flash">--</strong></div><div><span>LittleFS</span><strong id="littlefs">--</strong></div><div><span>LittleFS used</span><strong id="fsUsed">--</strong></div><div><span>Model</span><strong id="model">--</strong></div></div></div></div></section>
 <section id="network" class="panel"><div class="grid2"><div class="card"><b>Wi-Fi</b><div class="kv"><div><span>Status</span><strong id="wifiStatus">--</strong></div><div><span>SSID</span><strong id="ssid">--</strong></div><div><span>RSSI</span><strong id="rssi">--</strong></div><div><span>IP</span><strong id="ip">--</strong></div><div><span>Gateway</span><strong id="gateway">--</strong></div><div><span>DNS</span><strong id="dns">--</strong></div><div><span>MAC</span><strong id="mac">--</strong></div></div></div><div class="card"><b>MES Server</b><div class="kv"><div><span>URL</span><strong id="serverUrl">--</strong></div><div><span>Status</span><strong id="serverStatus">--</strong></div><div><span>Last HTTP</span><strong id="httpStatus">--</strong></div></div><div class="actions" style="margin-top:12px"><button onclick="quick('heartbeat')">Test server</button><button class="secondary" onclick="quick('bind')">Bind lại</button></div></div></div></section>
-<section id="hardware" class="panel"><div class="grid2"><div class="card"><b>Thiết bị</b><div class="kv"><div><span>LCD</span><strong id="lcd">--</strong></div><div><span>Touch</span><strong id="touch">--</strong></div><div><span>I2C keypad</span><strong id="keypad">--</strong></div><div><span>UART scanner</span><strong id="uartScanner">--</strong></div><div><span>USB Serial</span><strong id="usbSerial">--</strong></div></div><div class="actions" style="margin-top:12px"><button class="danger" onclick="if(confirm('Hiệu chỉnh lại keypad ngay? Kiosk sẽ tạm khóa thao tác và không khởi động lại.'))quick('keypad-calibrate CONFIRM')">Hiệu chỉnh lại keypad</button></div></div><div class="card"><b>Input activity</b><div class="kv"><div><span>Nguồn gần nhất</span><strong id="inputSource">--</strong></div><div><span>Lần cuối</span><strong id="inputAge">--</strong></div><div><span>Tổng sự kiện</span><strong id="inputCount">--</strong></div><div><span>Dữ liệu gần nhất</span><strong id="inputPreview">--</strong></div></div><p class="muted">Keypad PCF8574T và cảm ứng dùng chung I2C GPIO16/GPIO15. Bảy dây keypad có thể cắm vào P0..P7 theo thứ tự bất kỳ sau khi hiệu chỉnh. Máy quét UART dùng RX GPIO44, 9600 8N1.</p></div></div></section>
+<section id="hardware" class="panel"><div class="grid2"><div class="card"><b>Thiết bị</b><div class="kv"><div><span>LCD</span><strong id="lcd">--</strong></div><div><span>Touch</span><strong id="touch">--</strong></div><div><span>I2C keypad</span><strong id="keypad">--</strong></div><div><span>UART scanner</span><strong id="uartScanner">--</strong></div><div><span>USB Serial</span><strong id="usbSerial">--</strong></div></div><div class="actions" style="margin-top:12px"><button class="danger" onclick="if(confirm('Hiệu chỉnh lại keypad ngay? Kiosk sẽ tạm khóa thao tác và không khởi động lại.'))quick('keypad-calibrate CONFIRM')">Hiệu chỉnh lại keypad</button></div></div><div class="card"><b>Input activity</b><div class="kv"><div><span>Nguồn gần nhất</span><strong id="inputSource">--</strong></div><div><span>Lần cuối</span><strong id="inputAge">--</strong></div><div><span>Tổng sự kiện</span><strong id="inputCount">--</strong></div><div><span>Dữ liệu gần nhất</span><strong id="inputPreview">--</strong></div></div><p class="muted">Keypad PCF8574T và cảm ứng dùng chung I2C GPIO16/GPIO15. Bảy dây keypad có thể cắm vào P0..P7 theo thứ tự bất kỳ sau khi hiệu chỉnh. Máy quét UART dùng RX GPIO44, TX không sử dụng; xem tốc độ thực tế ở mục Scanner.</p></div></div></section>
 <section id="mes" class="panel"><div class="cards"><div class="card metric"><small>Bind</small><b id="bound">--</b></div><div class="card metric"><small>Workers</small><b id="workers">--</b></div><div class="card metric"><small>Operations</small><b id="operations">--</b></div><div class="card metric"><small>Offline queue</small><b id="queue">--</b></div></div><div class="card"><div class="kv"><div><span>Device ID</span><strong id="deviceId">--</strong></div><div><span>Station</span><strong id="station">--</strong></div><div><span>UI state</span><strong id="uiState">--</strong></div><div><span>Pending transaction</span><strong id="pending">--</strong></div><div><span>Last error</span><strong id="lastError">--</strong></div></div><div class="actions" style="margin-top:12px"><button onclick="refreshMesCatalog()">Tải catalog từ MES</button><button class="secondary" onclick="window.open('/api/device/catalog-debug','_blank')">Xem catalog debug</button><button class="secondary" onclick="window.open('/api/device/catalog-raw','_blank')">Xem JSON gốc</button><button class="secondary" onclick="quick('retry')">Đồng bộ lại</button></div></div></section>
 <section id="scanner" class="panel"><div class="card"><b>Máy quét ảo</b><p class="muted">Dùng dữ liệu thật từ MES để test luồng kiosk.</p><div class="grid2"><div><select id="workerQr"><option value="">-- Chọn QR nhân viên --</option></select><input id="workerCustom" style="margin-top:7px" placeholder="Hoặc nhập WF|EMP|..."><button style="margin-top:7px" onclick="sendVirtual('worker')">Quét nhân viên</button></div><div><select id="opQr"><option value="">-- Chọn QR operation --</option></select><input id="opCustom" style="margin-top:7px" placeholder="Hoặc nhập WF|OP|..."><button style="margin-top:7px" onclick="sendVirtual('op')">Quét operation</button></div></div><div class="row" style="margin-top:10px"><input id="qty" inputmode="numeric" value="1"><button onclick="sendQty()">Gửi số</button><button class="secondary" onclick="quick('scan 1')">Xác nhận</button><button class="secondary" onclick="quick('scan 2')">Sửa lại</button><button class="secondary" onclick="quick('reset')">READY</button></div></div></section>
 <section id="logs" class="panel"><div class="card"><div class="row"><input id="cmd" value="status" onkeydown="if(event.key==='Enter')runCmd()"><button onclick="runCmd()">Gửi</button><button class="secondary" onclick="refreshLogs()">Làm mới log</button><button class="secondary" onclick="clearOut()">Xóa</button></div></div><div class="card"><div id="out" class="terminal">Đang kết nối tới ESP32...</div></div></section>
@@ -6267,11 +6274,6 @@ void setup() {
   }
 
   loadDeviceConfig();
-  if (PREFER_PLAIN_HTTP_FOR_MESFLOW && String(SERVER_BASE).equalsIgnoreCase("https://mesflow.net")) {
-    safeCopy(SERVER_BASE, sizeof(SERVER_BASE), "http://mesflow.net");
-    saveDeviceConfig();
-    Serial.println("[CONFIG] Switched mesflow.net transport HTTPS -> HTTP to reduce TLS memory usage.");
-  }
   Serial.printf("[CONFIG] SSID=%s server=%s device=%s station=%s identity=%s\n",
                 WIFI_SSID[0] ? WIFI_SSID : "<NOT SET>",
                 SERVER_BASE[0] ? SERVER_BASE : "<NOT SET>", DEVICE_ID, STATION_CODE, DEVICE_UUID);
