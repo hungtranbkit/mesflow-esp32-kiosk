@@ -1,0 +1,7 @@
+{
+  "profile_id": "es3c28p-n16r8-kiosklinux-gm65uart1",
+  "status": "UNVERIFIED",
+  "evidence": "Production Kiosk Linux ESP (MAC 28:84:85:85:75:10, v5.6.0 binary sha 23051241...). Its build FQBN (CDCOnBoot), partition table and pin wiring have NOT been read from the device/build record. Do not build or assign until verified; the Agent blocks these kiosks as PROFILE_REQUIRED/INCOMPATIBLE_FIRMWARE meanwhile.",
+  "hardware_model": "ES3C28P",
+  "chip": "esp32s3"
+}

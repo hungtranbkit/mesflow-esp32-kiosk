@@ -14,3 +14,4 @@ test-results/
 playwright-report/
 __pycache__/
 *.pyc
+esp/mesflow_build_profile.h
