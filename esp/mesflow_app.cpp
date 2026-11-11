@@ -74,10 +74,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.1"
+#define FW_VERSION "5.6.2"
 #define FW_BUILD "20260813.0015"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.1-KIMEX-M910-COMPAT";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.2-KIMEX-QR-HOLD";
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -110,16 +110,16 @@ constexpr bool AUTO_REPEAT_DEMO = false;
 // Sau khi finish thanh cong, hien thong bao ngan roi tra ve man hinh
 // cho quet the nhan vien moi, giong kiosk MESFlow hien co.
 // Thoi gian de cong nhan kip doc va kiem tra man hinh.
-// Luong kiosk toi gian: lookup nhanh, START giu 10 giay de cong nhan kip doc,
+// Luong kiosk toi gian: lookup nhanh, START/FINISH giu 20 giay de kiem tra,
 // cac loi thong thuong chi giu ngan roi tra ve QUET THE.
 constexpr uint32_t OP_REVIEW_HOLD_MS      = 120;
-constexpr uint32_t START_SUCCESS_HOLD_MS  = 10000;
+constexpr uint32_t START_SUCCESS_HOLD_MS  = 20000; // Give operators time to confirm employee + operation
 constexpr uint32_t BUSINESS_ERROR_HOLD_MS = 2000;
 constexpr uint32_t STATE_WATCHDOG_CHECK_MS = 500;
 constexpr uint32_t UI_CANCEL_HOLD_MS = 1800;
 constexpr uint32_t WIFI_SETUP_HOLD_MS = 10000;
 constexpr uint32_t WIFI_SETUP_BOOT_VERIFY_MS = 1500;
-constexpr uint32_t FINISH_SUCCESS_HOLD_MS = 0; // Finish xong ve QUET THE ngay
+constexpr uint32_t FINISH_SUCCESS_HOLD_MS = 20000; // Confirm worker, operation, and quantity
 
 // -------------------- LCD PINS -------------------------------
 #define TFT_MISO 13
@@ -3210,8 +3210,17 @@ void drawWorkerFinishSuccess() {
   tft.fillScreen(C_BG);
   drawIndustrialHeader(C_OK);
   drawPageTitle("ĐÃ GHI NHẬN", C_OK);
+  // The operator must be able to check whose work was finished before
+  // the kiosk returns to the home screen. Reuse existing in-memory details.
+  drawCenteredTextFit(rt.workerName, SCREEN_LEFT_MARGIN, 117, 216, 39,
+                      FONT_SECTION, FONT_SECTION - 1, 2, C_TEXT, true);
+  drawCenteredTextFit(rt.operationName, SCREEN_LEFT_MARGIN, 163, 216, 47,
+                      FONT_SECTION, FONT_SECTION - 1, 2, C_INFO, true);
   char qty[40]; snprintf(qty, sizeof(qty), "Đạt: %d", demoGoodQty);
-  drawCenteredTextFit(qty, SCREEN_LEFT_MARGIN, 156, 216, 36, FONT_SECTION, FONT_SECTION, 1, C_TEXT, true);
+  drawCenteredTextFit(qty, SCREEN_LEFT_MARGIN, 215, 216, 33,
+                      FONT_SECTION, FONT_SECTION, 1, C_TEXT, true);
+  drawCenteredTextFit("QUÉT THẺ MỚI ĐỂ TIẾP TỤC", SCREEN_LEFT_MARGIN, 256, 216, 22,
+                      FONT_HEADER, FONT_HEADER, 1, C_MUTED, true);
 }
 
 static String maintenancePage() {
@@ -3696,7 +3705,7 @@ uint32_t maxStateDurationMs(UiState state) {
     case UiState::FINISHING: return 10000;
     case UiState::FINISH_RETRY: return QUANTITY_CONFIRM_IDLE_TIMEOUT_MS;
     case UiState::START_SUCCESS: return START_SUCCESS_HOLD_MS + 3000;
-    case UiState::FINISH_SUCCESS: return 10000;
+    case UiState::FINISH_SUCCESS: return FINISH_SUCCESS_HOLD_MS + 3000;
     case UiState::ERROR_STATE: return BUSINESS_ERROR_HOLD_MS + 4000;
     case UiState::SYNC_PENDING: return 20000;
     case UiState::OFFLINE: return 30000;
@@ -4603,11 +4612,9 @@ bool syncPendingTransaction(bool foreground) {
   rt.activeSessionId = 0;
   rt.activeGroupId[0] = '\0';
   emitActionEvent("SYNC_SUCCESS", "API_RESULT", "SUCCESS", 200);
-  // Do not redraw READY from inside syncPendingTransaction(). At this point the
-  // function still owns two DynamicJsonDocument objects plus the completed
-  // HTTP/TLS call chain on the Arduino loop-task stack. On boards without
-  // PSRAM, drawing the full READY screen here can overflow/corrupt that stack
-  // and cause ESP_RST_PANIC immediately after a successful FINISH.
+  // Do not draw from inside syncPendingTransaction(): the HTTP/TLS stack is
+  // still in use. After it unwinds, show FINISH_SUCCESS for a readable
+  // confirmation period, then reset the local selection in loop().
   deferredFinishReset = true;
   Serial.printf("[FINISH] ACK OK; defer UI reset. heap=%u min_heap=%u stack_free_words=%u\n",
                 static_cast<unsigned>(ESP.getFreeHeap()),
@@ -5388,7 +5395,12 @@ void handleSerialLine(String line) {
     return;
   }
 
+  // A new employee QR may dismiss an acknowledged success screen early,
+  // so the next worker does not have to wait for the full confirmation hold.
+  // Release only local selection: durable START/FINISH events remain intact.
   if (line.startsWith("WF|EMP|")) {
+    if (uiState == UiState::FINISH_SUCCESS) resetForNextWorker();
+    else if (uiState == UiState::START_SUCCESS) releaseKioskAfterStart();
     beginSessionTrace();
     emitActionEvent("EMPLOYEE_SCANNED", "USER_ACTION", "RECEIVED");
     Serial.printf("[SCAN EMP] %s\n", line.c_str());
@@ -6759,18 +6771,15 @@ void loop() {
   lastLoopAliveAt = millis();
   esp_task_wdt_reset();
 
-  // Execute FINISH cleanup in a fresh loop iteration, after the HTTP request
-  // and local ArduinoJson documents from syncPendingTransaction() are gone.
+  // Display the server-confirmed FINISH only after the HTTP/JSON stack
+  // unwinds. Previous firmware immediately reset to READY here, giving the
+  // operator no time to verify the recorded worker, operation, and quantity.
   if (deferredFinishReset) {
     deferredFinishReset = false;
-    Serial.printf("[FINISH] deferred reset begin. heap=%u min_heap=%u stack_free_words=%u\n",
-                  static_cast<unsigned>(ESP.getFreeHeap()),
-                  static_cast<unsigned>(ESP.getMinFreeHeap()),
-                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-    resetForNextWorker();
-    Serial.printf("[FINISH] deferred reset complete. heap=%u stack_free_words=%u\n",
-                  static_cast<unsigned>(ESP.getFreeHeap()),
-                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    setUi(UiState::FINISH_SUCCESS);
+    Serial.printf("[FINISH] confirmation screen hold=%lu ms heap=%u\n",
+                  static_cast<unsigned long>(FINISH_SUCCESS_HOLD_MS),
+                  static_cast<unsigned>(ESP.getFreeHeap()));
   }
 
   // Serve LAN Web Console first so button presses are accepted with minimal latency.
@@ -6803,11 +6812,17 @@ void loop() {
   // Man hinh chi redraw khi state thay doi de giu phong cach sach, on dinh.
   static uint8_t waitAnimationFrame = 0;
 
-  // Luong toi gian: giu nguyen mot man hinh START_SUCCESS tinh trong 10 giay.
-  // Khong ve countdown moi giay de tranh redraw va giam tai cho LCD/heap.
+  // Show START/FINISH confirmations long enough to read, without blocking
+  // network polling or drawing a countdown every second.
   if (uiState == UiState::START_SUCCESS &&
       millis() - stateEnteredAt >= START_SUCCESS_HOLD_MS) {
     releaseKioskAfterStart();
+    waitAnimationFrame = 0;
+  }
+
+  if (uiState == UiState::FINISH_SUCCESS &&
+      millis() - stateEnteredAt >= FINISH_SUCCESS_HOLD_MS) {
+    resetForNextWorker();
     waitAnimationFrame = 0;
   }
 
