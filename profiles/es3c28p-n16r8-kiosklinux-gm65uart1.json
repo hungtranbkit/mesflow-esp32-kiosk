@@ -1,7 +1,14 @@
 {
   "profile_id": "es3c28p-n16r8-kiosklinux-gm65uart1",
   "status": "UNVERIFIED",
-  "evidence": "Production Kiosk Linux ESP (MAC 28:84:85:85:75:10, v5.6.0 binary sha 23051241...). Its build FQBN (CDCOnBoot), partition table and pin wiring have NOT been read from the device/build record. Do not build or assign until verified; the Agent blocks these kiosks as PROFILE_REQUIRED/INCOMPATIBLE_FIRMWARE meanwhile.",
+  "evidence": "Production Kiosk Linux ESP (MAC 28:84:85:85:75:10) runs v5.6.0 binary /home/kiosk1/esp-update/fw-5.6.0/esp.ino.bin, SHA256 23051241889ad86839b2b7a551f9dbbedd76c1b7de218e212c3ad5f423757362 (docs/M910_V560_COMPAT.md). That binary, its build.options.json and the device partition table are NOT on the Mac (searched all *.bin by SHA on 2026-11-11: no match) and no granted read-only route to the Kiosk Linux host exists. Arduino app images embed compile date/time, so rebuilding source cannot reproduce that SHA. Do not build or assign until verified; the Agent blocks these kiosks as PROFILE_REQUIRED/INCOMPATIBLE_FIRMWARE meanwhile.",
+  "candidate_unproven": {
+    "source": "v5.6.0 source bb256278 .mesflow-arduino.env ('Production ES3C28P / ESP32-S3 N16R8 profile, verified with ESP32 core 3.3.11') and PROJECT_CONTEXT.md",
+    "fqbn": "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_8MB,PSRAM=opi",
+    "difference_vs_m910": "CDCOnBoot default (off) vs M910 CDCOnBoot=cdc; the same source notes a bench TEST build with CDCOnBoot=cdc and 'decide before fleet builds whether CDC should be on'",
+    "not_proven": ["the deployed binary used this FQBN/core", "device partition table equals 1d9cca96... (default_8MB on core 3.3.11)", "GM65 UART pin wiring on the Kiosk Linux unit"]
+  },
+  "to_verify": "Read-only, owner-approved: copy of /home/kiosk1/esp-update/fw-5.6.0/ (esp.ino.bin + build.options.json/partitions.csv if kept) to compare app_desc/flash header and partition sha; or the device partition table from an existing backup. Then add fqbn/partition_sha256/app_slot_size and set VERIFIED.",
   "hardware_model": "ES3C28P",
   "chip": "esp32s3"
 }
