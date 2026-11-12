@@ -1,0 +1,64 @@
+name: ESP OTA firmware CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: esp-ota-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: OTA policy host tests (C++)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I esp tests/host/test_ota_policy.cpp -o /tmp/test_ota_policy
+          /tmp/test_ota_policy
+      - name: Python tools tests (OTA phase1, offline queue, release verifier)
+        run: python3 -m unittest -v tools/test_ota_phase1.py tools/test_offline_queue.py tools/test_verify_ota_release.py
+
+  build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: host-tests
+    env:
+      ARDUINO_CORE: esp32:esp32@3.3.11
+      ESP32_INDEX: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-esp32-3.3.11-libs-v1
+      - name: Install pinned toolchain (same versions as the verified local build)
+        run: |
+          arduino-cli config init --overwrite --additional-urls "$ESP32_INDEX"
+          arduino-cli core update-index
+          arduino-cli core install "$ARDUINO_CORE"
+          arduino-cli lib install "Adafruit GFX Library@1.13.0" "Adafruit ILI9341@1.7.0" "Adafruit BusIO@1.17.4" "ArduinoJson@6.21.5"
+          arduino-cli core list; arduino-cli lib list
+      - name: Build per-profile OTA release (VERIFIED profiles only)
+        run: ./scripts/build-ota-release.sh
+      - name: Verify release zip (manifest SHA256, app image, identity, profile set)
+        run: |
+          set -e
+          pkg=$(ls dist/release/*.ota.zip)
+          python3 tools/verify_ota_release.py "$pkg"
+          sha256sum "$pkg" dist/release/stage/*/app.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp-ota-release
+          path: |
+            dist/release/*.ota.zip
+            dist/release/stage/*/manifest.json
+          if-no-files-found: error
