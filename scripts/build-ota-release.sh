@@ -21,6 +21,13 @@ version="$(sed -n 's/^#define FW_VERSION "\([^"]*\)".*/\1/p' "$SKETCH/mesflow_ap
 fwbuild="$(sed -n 's/^#define FW_BUILD "\([^"]*\)".*/\1/p' "$SKETCH/mesflow_app.cpp" | head -1)"
 commit="$(git rev-parse HEAD)"
 build_id="${fwbuild}.g$(git rev-parse --short=10 HEAD)"
+# Optional tag for non-release builds (e.g. MESFLOW_BUILD_TAG=staging with a
+# staging CA bundle): the identity/build_id then can never be mistaken for the
+# release artifact built from the same commit.
+if [[ -n "${MESFLOW_BUILD_TAG:-}" ]]; then
+  [[ "$MESFLOW_BUILD_TAG" =~ ^[a-z0-9-]{1,24}$ ]] || die "BUILD_TAG_INVALID"
+  build_id="${build_id}.${MESFLOW_BUILD_TAG}"
+fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "FW_VERSION_INVALID $version"
 if [[ -f "$CA_FILE" ]]; then
   CA_GENERATED=1
