@@ -22,6 +22,7 @@
 #include <esp_task_wdt.h>
 #include "mesflow_ota_policy.h"
 #include "mesflow_keypad_policy.h"
+#include "mesflow_maintenance_policy.h"
 #include "mesflow_vietnamese_font.h"
 
 #ifndef MESFLOW_UI_SCREENSHOT
@@ -79,10 +80,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.4"
-#define FW_BUILD "20261112.0001"
+#define FW_VERSION "5.6.5"
+#define FW_BUILD "20261112.0002"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.4-KIMEX-OTA-SCOPED";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.5-KIMEX-OTA-SCOPED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -264,6 +265,7 @@ bool maintenanceMode = false;
 bool maintenanceEnteredDuringBoot = false;
 bool maintenanceWebActive = false;
 uint32_t lastMaintenanceRefreshAt = 0;
+uint32_t lastMaintenanceActivityAt = 0;  // idle timeout (mfmt::MAINTENANCE_IDLE_TIMEOUT_MS)
 char maintenanceLastIp[16] = "";
 char mdnsHostname[64] = "";
 bool mdnsReady = false;
@@ -381,6 +383,7 @@ static bool requestRuntimeKeypadCalibration(const char* source);
 static void serviceRuntimeKeypadCalibration();
 static void enterMaintenanceMode(bool duringBoot);
 static void openRecoveryMenu();
+extern bool recoveryMenuActive;
 void handleKeypadKey(char key);
 static void exitMaintenanceMode();
 static void drawMaintenanceScreen();
@@ -3323,6 +3326,7 @@ static String maintenancePage() {
 
 static void handleMaintenanceApiUrl() {
   if (!maintenanceMode) { maintenanceWeb.send(403, "application/json", "{\"ok\":false}"); return; }
+  lastMaintenanceActivityAt = millis();
   DynamicJsonDocument doc(512); String body;
   if (deserializeJson(doc, maintenanceWeb.arg("plain"))) {
     maintenanceWeb.send(400, "application/json", "{\"ok\":false,\"message\":\"JSON khong hop le\"}"); return;
@@ -3403,10 +3407,13 @@ static void redrawProductionUi() {
 static void enterMaintenanceMode(bool duringBoot) {
   if (maintenanceMode) return;
   maintenanceMode = true; maintenanceEnteredDuringBoot = duringBoot;
+  lastMaintenanceActivityAt = millis();
+  Serial.printf("[MAINT] ENTER boot=%d idle_timeout_s=%lu\n", duringBoot ? 1 : 0,
+                static_cast<unsigned long>(mfmt::MAINTENANCE_IDLE_TIMEOUT_MS / 1000UL));
   wifiSetupHoldTriggered = true;
   static bool routesRegistered = false;
   if (!routesRegistered) {
-    auto serveMaintenancePage = [](){ maintenanceWeb.send(200, "text/html; charset=utf-8", maintenancePage()); };
+    auto serveMaintenancePage = [](){ lastMaintenanceActivityAt = millis(); maintenanceWeb.send(200, "text/html; charset=utf-8", maintenancePage()); };
     maintenanceWeb.on("/", HTTP_GET, serveMaintenancePage);
     maintenanceWeb.on("/maintenance", HTTP_GET, serveMaintenancePage);
     maintenanceWeb.on("/maintenance/api-url", HTTP_POST, handleMaintenanceApiUrl);
@@ -3425,12 +3432,18 @@ static void exitMaintenanceMode() {
   maintenanceWeb.stop();
   maintenanceWebActive = false;
   maintenanceMode = false; maintenanceEnteredDuringBoot = false;
+  Serial.println("[MAINT] EXIT");
   wifiSetupHoldActive = false; wifiSetupHoldTriggered = false; wifiSetupHoldStartedAt = 0;
   redrawProductionUi();
 }
 
 static void serviceMaintenanceMode() {
   if (!maintenanceMode) return;
+  if (mfmt::maintenanceTimedOut(lastMaintenanceActivityAt, millis())) {
+    Serial.println("[MAINT] IDLE_TIMEOUT: tu thoat bao tri, ve san xuat.");
+    exitMaintenanceMode();
+    return;
+  }
   if (WiFi.status() == WL_CONNECTED && !maintenanceWebActive) {
     maintenanceWeb.begin(); maintenanceWebActive = true;
     if (mdnsReady) MDNS.addService("http", "tcp", 80);
@@ -5416,6 +5429,8 @@ static void consolePrintHelp() {
   Serial.println("clear-offline             : xoa queue + offline sessions (CAN THAN)");
   Serial.println("factory-reset             : xoa config/runtime + LittleFS; GIU identity");
   Serial.println("keypad-calibrate          : hieu chinh lai keypad ngay, khong reboot");
+  Serial.println("maintenance confirm       : vao bao tri (chi USB; READY, khong giao dich cho)");
+  Serial.println("maintenance exit          : thoat bao tri (tu thoat sau 10 phut khong thao tac)");
   Serial.println("restart | reboot          : khoi dong lai ESP32");
   Serial.println("bind                      : bind kiosk lai");
   Serial.println("heartbeat                 : gui heartbeat ngay");
@@ -5519,6 +5534,22 @@ static void consoleFactoryReset() {
   ESP.restart();
 }
 
+// USB CDC serial only (see mesflow_maintenance_policy.h). Does not change any
+// config, token, Wi-Fi, OTA state or the pending journal; it only opens the
+// existing maintenance screen/page, which keeps all its own validation.
+static void consoleEnterMaintenance() {
+  const bool idle = uiState == UiState::READY || uiState == UiState::OFFLINE;
+  const mfmt::EntryDecision d = mfmt::serialEntryDecision(
+      maintenanceMode, idle && !recoveryMenuActive, hasPendingTransaction(), otaInstallInProgress,
+      keypadCalibrationRequested || keypadCalibrationInProgress);
+  if (d != mfmt::EntryDecision::ALLOW) {
+    Serial.printf("[MAINT] Tu choi: %s (state=%s).\n", mfmt::entryDecisionName(d), stateName(uiState));
+    return;
+  }
+  Serial.println("[MAINT] USB maintenance confirm: vao bao tri. Thoat: 'maintenance exit' hoac tu dong sau 10 phut.");
+  enterMaintenanceMode(false);
+}
+
 static bool handleConsoleCommand(String line) {
   line.trim();
   String cmd = line;
@@ -5551,6 +5582,11 @@ static bool handleConsoleCommand(String line) {
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); Serial.println("Da mo test cam ung."); return true; }
   if (cmd == "recovery-menu") { openRecoveryMenu(); return true; }
+  if (mfmt::isMaintenanceConfirm(cmd.c_str())) { consoleEnterMaintenance(); return true; }
+  if (cmd == "maintenance") {
+    Serial.println("[MAINT] Go chinh xac 'maintenance confirm' (chi qua USB) de vao bao tri.");
+    return true;
+  }
   if (cmd.startsWith("key ") && cmd.length() == 5) { handleKeypadKey(line.charAt(4)); return true; }
   if (cmd.startsWith("scanner-baud")) { Serial.print(cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n"); return true; }
   if (cmd == "bind") { bindKiosk(); return true; }
@@ -5579,8 +5615,9 @@ void handleSerialLine(String line) {
   inputEventCount++;
   safeCopy(lastInputPreview, sizeof(lastInputPreview), line.c_str());
 
-  // Console administration always has priority over QR/session state.
-  if (handleConsoleCommand(line)) return;
+  // Console/admin commands are NOT handled here: this path also carries LAN
+  // console `scan` payloads, GM65 frames and keypad digits. Only the USB CDC
+  // reader (handleUsbConsoleLine) may run console commands.
 
   // Never trap the operator on an error page. Clear the transient error first;
   // an employee scan may immediately continue into the normal lookup flow.
@@ -5803,6 +5840,24 @@ void handleSerialLine(String line) {
   Serial.printf("[BO QUA] %s\n", line.c_str());
 }
 
+// USB CDC serial line: console administration first, then normal input.
+static void handleUsbConsoleLine(String line) {
+  line.trim();
+  if (!line.length()) return;
+  String cmd = line;
+  cmd.toLowerCase();
+  if (maintenanceMode) {
+    if (!mfmt::allowedDuringMaintenance(cmd.c_str())) {
+      Serial.println("[MAINT] Dang bao tri: chi nhan 'maintenance exit', 'status', 'help'.");
+      return;
+    }
+    if (cmd == "maintenance exit") { exitMaintenanceMode(); return; }
+    lastMaintenanceActivityAt = millis();
+  }
+  if (handleConsoleCommand(line)) { lastInputAtMs = millis(); return; }
+  handleSerialLine(line);
+}
+
 void readSerialCommands() {
   static String line;
   static uint32_t lastCharAt = 0;
@@ -5817,7 +5872,7 @@ void readSerialCommands() {
         Serial.printf("[SERIAL RX] %s\n", line.c_str());
         lastInputWasVirtual = false;
         lastInputWasKeypad = false;
-        handleSerialLine(line);
+        handleUsbConsoleLine(line);
         line = "";
       }
       continue;
@@ -5831,7 +5886,7 @@ void readSerialCommands() {
     Serial.printf("[SERIAL RX/TIMEOUT] %s\n", line.c_str());
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
-    handleSerialLine(line);
+    handleUsbConsoleLine(line);
     line = "";
   }
 }
@@ -6463,6 +6518,7 @@ void handleKeypadKey(char key) {
   if (recoveryMenuActive) { handleRecoveryMenuKey(key); return; }
 
   if (maintenanceMode) {
+    lastMaintenanceActivityAt = millis();
     if (key == '1') {
       maintenanceWeb.stop(); maintenanceWebActive = false;
       drawSimple("CÀI ĐẶT WI-FI", "ĐANG KHỞI ĐỘNG...", "", "", C_INFO);
@@ -7042,6 +7098,7 @@ void loop() {
   serviceDeviceManagement();
   if (setupPortalActive) return;
   if (maintenanceMode) {
+    readSerialCommands();   // USB only; restricted to 'maintenance exit'/status/help
     serviceKeypad();
     serviceMaintenanceMode();
     static uint32_t lastMaintenanceReconnectAt = 0;

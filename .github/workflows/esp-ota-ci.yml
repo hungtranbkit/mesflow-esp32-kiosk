@@ -23,10 +23,12 @@ jobs:
           /tmp/test_ota_policy
           g++ -std=c++17 -Wall -Wextra -Werror -I esp tests/host/test_keypad_policy.cpp -o /tmp/test_keypad_policy
           /tmp/test_keypad_policy
+          g++ -std=c++17 -Wall -Wextra -Werror -I esp tests/host/test_maintenance_policy.cpp -o /tmp/test_maintenance_policy
+          /tmp/test_maintenance_policy
       - name: Python tools tests (OTA phase1, offline queue, release verifier)
         run: |
           python3 -m pip install pytest==9.2.0
-          python3 -m pytest -v -p no:cacheprovider tools/test_ota_phase1.py tools/test_offline_queue.py tools/test_verify_ota_release.py tools/test_keypad_boot_regression.py
+          python3 -m pytest -v -p no:cacheprovider tools/test_ota_phase1.py tools/test_offline_queue.py tools/test_verify_ota_release.py tools/test_keypad_boot_regression.py tools/test_maintenance_usb_only.py
 
   build-release:
     runs-on: ubuntu-latest
