@@ -20,6 +20,10 @@
 #include <Update.h>
 #include <mbedtls/sha256.h>
 #include <esp_task_wdt.h>
+#include "mesflow_ota_policy.h"
+#include "mesflow_keypad_policy.h"
+#include "mesflow_maintenance_policy.h"
+#include "mesflow_server_credential_policy.h"
 #include "mesflow_vietnamese_font.h"
 
 #ifndef MESFLOW_UI_SCREENSHOT
@@ -66,18 +70,51 @@ using PsramJsonDocument = BasicJsonDocument<PsramJsonAllocator>;
 char WIFI_SSID[33]       = "panda";
 char WIFI_PASSWORD[65]   = "12345678a";
 char SERVER_BASE[192]    = "";  // Bat buoc cau hinh qua Setup Portal/NVS; khong co fallback hardcode
-// Deploy Agent is the OTA control plane. NVS/maintenance can override this
-// per environment, but a fresh kiosk is immediately OTA-capable by default.
-char OTA_AGENT_BASE[192] = "https://deploy.mesflow.net/agent";
+// Deploy Agent is the OTA control plane of THIS kiosk's MESFlow instance.
+// No compiled default: the URL is advertised by the kiosk's own MESFlow over
+// the authenticated heartbeat (or set in maintenance). Legacy NVS values are
+// kept and guarded by mfota::effectiveAgentBase().
+char OTA_AGENT_BASE[192] = "";
+static mfota::AgentSource otaAgentSource = mfota::AgentSource::NONE;
 char DEVICE_ID[48]       = "ESP32-KIOSK-001";
 char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.2"
-#define FW_BUILD "20260813.0015"
+#define FW_VERSION "5.6.6"
+#define FW_BUILD "20261112.0003"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.2-KIMEX-QR-HOLD";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.6-KIMEX-OTA-SCOPED";
+// Hardware profile + build id are injected per profile by
+// scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
+// build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
+// of guessing.
+#if defined(__has_include)
+#if __has_include("mesflow_build_profile.h")
+#include "mesflow_build_profile.h"
+#endif
+#endif
+#ifndef MESFLOW_HW_PROFILE
+#define MESFLOW_HW_PROFILE ""
+#endif
+#ifndef MESFLOW_BUILD_ID
+#define MESFLOW_BUILD_ID FW_BUILD
+#endif
+#define HW_PROFILE MESFLOW_HW_PROFILE
+#define FW_BUILD_ID MESFLOW_BUILD_ID
+// Embedded identity the Agent reads from the binary itself at upload.
+extern "C" __attribute__((used)) const char MESFLOW_FW_IDENTITY[] =
+    "MESFLOW_FW_IDENTITY:version=" FW_VERSION ";build=" MESFLOW_BUILD_ID ";profile=" MESFLOW_HW_PROFILE ";hw=" HW_MODEL ";end";
+#ifdef CONFIG_IDF_FIRMWARE_CHIP_ID
+static const uint16_t OTA_EXPECTED_CHIP_ID = CONFIG_IDF_FIRMWARE_CHIP_ID;
+#else
+static const uint16_t OTA_EXPECTED_CHIP_ID = 9;  // ESP32-S3
+#endif
+// Arduino marks every boot valid unless this returns true. Returning true
+// keeps a freshly OTA'd image in PENDING_VERIFY until otaLocalSelfCheck()
+// passes, so a crashing image is rolled back by the bootloader instead of
+// boot-looping (USB-flashed images are not PENDING_VERIFY and unaffected).
+extern "C" bool verifyRollbackLater() { return true; }
 
 constexpr uint16_t DISCOVERY_PORT = 17891;
 constexpr uint16_t PROVISION_HTTP_PORT = 17892;
@@ -229,6 +266,7 @@ bool maintenanceMode = false;
 bool maintenanceEnteredDuringBoot = false;
 bool maintenanceWebActive = false;
 uint32_t lastMaintenanceRefreshAt = 0;
+uint32_t lastMaintenanceActivityAt = 0;  // idle timeout (mfmt::MAINTENANCE_IDLE_TIMEOUT_MS)
 char maintenanceLastIp[16] = "";
 char mdnsHostname[64] = "";
 bool mdnsReady = false;
@@ -346,6 +384,7 @@ static bool requestRuntimeKeypadCalibration(const char* source);
 static void serviceRuntimeKeypadCalibration();
 static void enterMaintenanceMode(bool duringBoot);
 static void openRecoveryMenu();
+extern bool recoveryMenuActive;
 void handleKeypadKey(char key);
 static void exitMaintenanceMode();
 static void drawMaintenanceScreen();
@@ -460,7 +499,7 @@ constexpr uint32_t OTA_RETRY_INTERVAL_MS = 25UL * 1000UL;
 static uint8_t otaCheckFailures = 0;   // consecutive failed checks -> 25 s, 50 s, ... up to 30 min
 static uint32_t otaRetryIntervalMs() {
   uint32_t ms = OTA_RETRY_INTERVAL_MS;
-  for (uint8_t i = 0; i < otaCheckFailures && ms < 30UL * 60UL * 1000UL; i++) ms *= 2;
+  for (uint8_t i = 0; i < otaCheckFailures && ms < 5UL * 60UL * 1000UL; i++) ms *= 2;  // cap 5 min, never hours
   return ms < 30UL * 60UL * 1000UL ? ms : 30UL * 60UL * 1000UL;
 }
 uint32_t lastOtaCheckAt = 0;
@@ -471,6 +510,14 @@ bool otaLinkReady = false;
 char otaFirmwareId[40] = "", otaTargetVersion[40] = "", otaTargetBuild[40] = "";
 char otaDownloadUrl[384] = "", otaExpectedSha256[65] = "";
 size_t otaExpectedSize = 0;
+char otaClaimId[40] = "", otaTargetProfile[80] = "", otaRunningArtifact[40] = "";
+long otaTargetId = 0;
+bool otaForce = false, otaAllowDowngrade = false;
+uint32_t otaAvailableSince = 0;          // first time this claim waited for a safe point
+uint32_t otaLastWaitEventAt = 0;
+volatile bool otaInstallInProgress = false;  // new scans are refused while true
+bool otaBootReportPending = false;           // boot identity ACK not yet delivered
+uint32_t otaScanRefusedAt = 0;
 // Giai phong kiosk neu cong nhan quet the de ket thuc session roi bo di.
 // Chi reset giao dien cuc bo; KHONG tu dong finish session tren server.
 constexpr uint32_t QUANTITY_INPUT_IDLE_TIMEOUT_MS = 120000;
@@ -1794,19 +1841,39 @@ bool loadOrCreateDeviceIdentity() {
   return true;
 }
 
+// OTA config v2 migration: versioned (mf_ota/cfg_ver), idempotent, and it
+// never rewrites mesflow_cfg/ota_agent, so rolling back to <=5.6.2 still
+// reads its own key. Firmware <=5.6.2 effectively used the shared default for
+// empty/non-Agent values; that is reproduced as a LEGACY source (guarded).
+static void migrateOtaConfig(String& otaAgent) {
+  Preferences om; om.begin("mf_ota", false);
+  const uint32_t ver = om.getUInt("cfg_ver", 0);
+  uint8_t src = om.getUChar("agent_src", 0);
+  if (ver < 2) {
+    if (otaAgent.length() == 0 || otaAgent.indexOf("/agent") < 0) otaAgent = mfota::LEGACY_DEFAULT_AGENT;
+    src = static_cast<uint8_t>(mfota::AgentSource::LEGACY);
+    om.putUChar("agent_src", src); om.putUInt("cfg_ver", 2);
+    Serial.println("[OTA] config migrated to v2 (agent source LEGACY)");
+  } else if (src == static_cast<uint8_t>(mfota::AgentSource::LEGACY) && (otaAgent.length() == 0 || otaAgent.indexOf("/agent") < 0)) {
+    otaAgent = mfota::LEGACY_DEFAULT_AGENT;
+  }
+  String art = om.getString("run_art", "");
+  safeCopy(otaRunningArtifact, sizeof(otaRunningArtifact), art.c_str());
+  om.end();
+  otaAgentSource = static_cast<mfota::AgentSource>(src);
+}
+
+static void saveOtaAgentSource() {
+  Preferences om; om.begin("mf_ota", false);
+  om.putUChar("agent_src", static_cast<uint8_t>(otaAgentSource)); om.putUInt("cfg_ver", 2); om.end();
+}
+
 bool loadDeviceConfig() {
   prefs.begin("mesflow_cfg", true);
   String ssid = prefs.getString("wifi_ssid", WIFI_SSID);
   String pass = prefs.getString("wifi_pass", WIFI_PASSWORD);
   String server = prefs.getString("server", "");
   String otaAgent = prefs.getString("ota_agent", "");
-  // Migrate devices that previously stored the MESFlow URL in this slot.
-  // OTA control belongs to Deploy Agent; keep an explicit Deploy Agent URL
-  // if one was configured, otherwise repair the legacy value automatically.
-  if (otaAgent.length() == 0 || otaAgent.indexOf("/agent") < 0 ||
-      (otaAgent.indexOf("mesflow.net") >= 0 && otaAgent.indexOf("deploy.mesflow.net") < 0)) {
-    otaAgent = OTA_AGENT_BASE;
-  }
   String deviceId = prefs.getString("device_id", DEVICE_ID);
   String deviceName = prefs.getString("device_name", DEVICE_NAME);
   String station = prefs.getString("station", STATION_CODE);
@@ -1815,6 +1882,7 @@ bool loadDeviceConfig() {
   copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
   copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), pass);
   copyConfigValue(SERVER_BASE, sizeof(SERVER_BASE), server);
+  migrateOtaConfig(otaAgent);
   copyConfigValue(OTA_AGENT_BASE, sizeof(OTA_AGENT_BASE), otaAgent);
   copyConfigValue(DEVICE_ID, sizeof(DEVICE_ID), deviceId);
   copyConfigValue(DEVICE_NAME, sizeof(DEVICE_NAME), deviceName);
@@ -1829,7 +1897,8 @@ bool saveDeviceConfig() {
   prefs.putString("wifi_pass", WIFI_PASSWORD); // empty password is valid for open Wi-Fi
   if (!SERVER_BASE[0]) { prefs.end(); return false; }
   ok &= prefs.putString("server", SERVER_BASE) > 0;
-  ok &= prefs.putString("ota_agent", OTA_AGENT_BASE) > 0;
+  // An empty Agent URL is valid (OTA not configured yet); never fail the save on it.
+  if (OTA_AGENT_BASE[0]) prefs.putString("ota_agent", OTA_AGENT_BASE); else prefs.remove("ota_agent");
   ok &= prefs.putString("device_id", DEVICE_ID) > 0;
   ok &= prefs.putString("device_name", DEVICE_NAME) > 0;
   ok &= prefs.putString("station", STATION_CODE) > 0;
@@ -1843,8 +1912,90 @@ static bool validServerBase(const String& value) {
          value.length() >= 10 && value.length() < sizeof(SERVER_BASE);
 }
 
+// ---- Server-scoped kiosk credential (mesflow_server_credential_policy.h) ----
+// NVS "mesflow": token/station/token_srv = current credential and the server
+// that issued it; alt_srv/alt_token/alt_station = one spare credential kept
+// when the kiosk is moved to another server (e.g. production -> staging).
+bool enrollmentPending = false;
+char enrollmentCode[7] = "";
+
+static void computeEnrollmentCode(char out[7]) {
+  uint8_t digest[32];
+  mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha, 0);
+  mbedtls_sha256_update(&sha, reinterpret_cast<const unsigned char*>(DEVICE_SECRET), strlen(DEVICE_SECRET));
+  mbedtls_sha256_finish(&sha, digest); mbedtls_sha256_free(&sha);
+  mfcred::enrollmentCodeFromDigest(digest, out);
+}
+
+static void saveCurrentCredential() {
+  prefs.begin("mesflow", false);
+  if (rt.kioskToken[0]) { prefs.putString("token", rt.kioskToken); prefs.putString("token_srv", SERVER_BASE); }
+  else { prefs.remove("token"); prefs.remove("token_srv"); }
+  prefs.putString("station", STATION_CODE);
+  prefs.end();
+}
+
+// Called BEFORE SERVER_BASE is replaced by newServer. Never deletes a
+// credential: it is stashed, restored, or the change is refused.
+static bool applyServerChange(const String& newServer, String& error) {
+  prefs.begin("mesflow", true);
+  const String altSrv = prefs.getString("alt_srv", "");
+  const String altTok = prefs.getString("alt_token", "");
+  const String altSt = prefs.getString("alt_station", "");
+  prefs.end();
+  const bool busy = hasPendingTransaction() || countPendingOfflineEvents() > 0;
+  const mfcred::Switch d = mfcred::decideSwitch(SERVER_BASE, newServer.c_str(), rt.kioskToken[0] != '\0',
+                                                altSrv.c_str(), altTok.length() > 0, busy);
+  Serial.printf("[CRED] server %s -> %s: %s\n", SERVER_BASE, newServer.c_str(), mfcred::switchName(d));
+  if (d == mfcred::Switch::REFUSE_QUEUE_BUSY) {
+    error = "Còn giao dịch/sự kiện offline chưa gửi cho server hiện tại; đồng bộ xong rồi mới đổi server";
+    return false;
+  }
+  if (d == mfcred::Switch::REFUSE_SPARE_OCCUPIED) {
+    error = "Kiosk đang giữ quyền dự phòng của server " + altSrv + "; quay lại server đó trước khi chuyển sang server thứ ba";
+    return false;
+  }
+  if (d == mfcred::Switch::NO_CHANGE) return true;
+  enrollmentPending = false; enrollmentCode[0] = '\0';
+  prefs.begin("mesflow", false);
+  if (d == mfcred::Switch::STASH_AND_UNBIND) {
+    prefs.putString("alt_srv", SERVER_BASE); prefs.putString("alt_token", rt.kioskToken); prefs.putString("alt_station", STATION_CODE);
+    prefs.remove("token"); prefs.remove("token_srv");
+    rt.kioskToken[0] = '\0'; rt.bound = false;
+  } else if (d == mfcred::Switch::RESTORE_FROM_SPARE) {
+    const String curSrv(SERVER_BASE), curTok(rt.kioskToken), curSt(STATION_CODE);
+    safeCopy(rt.kioskToken, sizeof(rt.kioskToken), altTok.c_str());
+    if (altSt.length() && altSt.length() < sizeof(STATION_CODE)) safeCopy(STATION_CODE, sizeof(STATION_CODE), altSt.c_str());
+    prefs.putString("token", rt.kioskToken); prefs.putString("token_srv", newServer); prefs.putString("station", STATION_CODE);
+    if (curTok.length()) { prefs.putString("alt_srv", curSrv); prefs.putString("alt_token", curTok); prefs.putString("alt_station", curSt); }
+    else { prefs.remove("alt_srv"); prefs.remove("alt_token"); prefs.remove("alt_station"); }
+    rt.bound = true;
+  } else {  // CHANGE_UNBOUND: no current token to keep
+    prefs.remove("token_srv");
+    rt.bound = false;
+  }
+  prefs.end();
+  return true;
+}
+
 static const char* otaAgentBase() {
-  return validServerBase(String(OTA_AGENT_BASE)) ? OTA_AGENT_BASE : SERVER_BASE;
+  // Never falls back to SERVER_BASE: MESFlow is not assumed to host Agent routes.
+  return mfota::effectiveAgentBase(OTA_AGENT_BASE, otaAgentSource, SERVER_BASE);
+}
+
+// Instance-scoped Agent URL advertised by this kiosk's own MESFlow in the
+// authenticated heartbeat response. HTTPS only; empty = keep current value.
+static void adoptAdvertisedOtaAgent(const char* advertised) {
+  if (!advertised || !advertised[0] || otaCheckTaskRunning || otaInstallInProgress) return;
+  if (strncmp(advertised, "https://", 8) != 0 || strlen(advertised) >= sizeof(OTA_AGENT_BASE)) return;
+  if (strcmp(advertised, OTA_AGENT_BASE) == 0 && otaAgentSource == mfota::AgentSource::MESFLOW) return;
+  if (otaAgentSource == mfota::AgentSource::MANUAL && OTA_AGENT_BASE[0]) return;  // explicit maintenance choice wins
+  safeCopy(OTA_AGENT_BASE, sizeof(OTA_AGENT_BASE), advertised);
+  otaAgentSource = mfota::AgentSource::MESFLOW;
+  prefs.begin("mesflow_cfg", false); prefs.putString("ota_agent", OTA_AGENT_BASE); prefs.end();
+  saveOtaAgentSource();
+  lastOtaCheckAt = 0; otaCheckSucceeded = false;
+  Serial.printf("[OTA] Agent URL from MESFlow instance: %s\n", OTA_AGENT_BASE);
 }
 
 static bool hasServerConfig() {
@@ -1918,9 +2069,10 @@ static bool applyConfigJson(JsonDocument& doc, bool allowWifi, String& error) {
     copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
     copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), password);
   }
+  // Server change: stash/restore the credential per server (never delete it).
+  if (!applyServerChange(server, error)) return false;
   bool identityChanged = strcmp(STATION_CODE, station.c_str()) != 0 ||
-                         strcmp(DEVICE_ID, device.c_str()) != 0 ||
-                         strcmp(SERVER_BASE, server.c_str()) != 0;
+                         strcmp(DEVICE_ID, device.c_str()) != 0;
   copyConfigValue(SERVER_BASE, sizeof(SERVER_BASE), server);
   copyConfigValue(STATION_CODE, sizeof(STATION_CODE), station);
   copyConfigValue(DEVICE_ID, sizeof(DEVICE_ID), device);
@@ -1936,10 +2088,7 @@ static bool applyConfigJson(JsonDocument& doc, bool allowWifi, String& error) {
   }
 
   if (!saveDeviceConfig()) { error = "Không ghi được cấu hình vào NVS"; return false; }
-  prefs.begin("mesflow", false);
-  if (rt.kioskToken[0]) prefs.putString("token", rt.kioskToken); else prefs.remove("token");
-  prefs.putString("station", STATION_CODE);
-  prefs.end();
+  saveCurrentCredential();
   return true;
 }
 
@@ -2006,8 +2155,12 @@ void startSetupPortal(const char* reason) {
                 WiFi.softAPIP().toString().c_str());
 }
 
+// LAN provisioning changes Wi-Fi/server config, so it needs physical presence:
+// only while the kiosk is in maintenance (USB `maintenance confirm` / keypad).
+// Pre-5.6.6 published the token in /api/device/info and the UDP discovery
+// broadcast at all times, so anyone on the LAN could reconfigure a kiosk.
 static bool provisionAuthorized() {
-  return provisionWeb.hasHeader("X-Provision-Token") &&
+  return maintenanceMode && provisionWeb.hasHeader("X-Provision-Token") &&
          provisionWeb.header("X-Provision-Token").equalsIgnoreCase(provisionToken);
 }
 
@@ -2025,7 +2178,8 @@ static void sendDeviceInfo(WebServer& web) {
   doc["server_url"] = SERVER_BASE;
   doc["configured"] = rt.bound;
   doc["pending_offline_events"] = countPendingOfflineEvents();
-  doc["provision_token"] = provisionToken;
+  doc["maintenance"] = maintenanceMode;
+  if (maintenanceMode) doc["provision_token"] = provisionToken;  // only with physical presence
   String body; serializeJson(doc, body);
   web.send(200, "application/json", body);
 }
@@ -2062,7 +2216,6 @@ static void forceSetupOnNextBoot();
 static void consoleClearToken();
 static void consoleClearCache();
 static void consoleClearOffline();
-static void clearKeypadCalibration();
 bool bindKiosk();
 bool sendHeartbeat();
 bool syncPendingTransaction(bool userInitiated);
@@ -2122,6 +2275,7 @@ static String buildRemoteStatusText() {
     out += "RSSI     : " + String(WiFi.RSSI()) + " dBm\n";
   }
   out += "Bound    : " + String(rt.bound ? "YES" : "NO") + "\n";
+  if (enrollmentPending) out += "Enroll   : PENDING code=" + String(enrollmentCode) + "\n";
   out += "Online   : " + String(rt.online ? "YES" : "NO") + "\n";
   out += "Token    : " + maskedToken(rt.kioskToken) + "\n";
   out += "UI state : " + String(stateName(uiState)) + "\n";
@@ -2797,7 +2951,7 @@ static void broadcastDiscovery() {
   doc["http_port"] = PROVISION_HTTP_PORT;
   doc["configured"] = rt.bound;
   doc["rssi"] = WiFi.RSSI();
-  doc["provision_token"] = provisionToken;
+  if (maintenanceMode) doc["provision_token"] = provisionToken;  // only with physical presence
   char body[1024]; size_t len = serializeJson(doc, body, sizeof(body));
   IPAddress broadcast = WiFi.localIP();
   IPAddress mask = WiFi.subnetMask();
@@ -3084,6 +3238,17 @@ void drawStatusGlyph(int16_t cx, int16_t cy, uint16_t color, char glyph) {
 
 void drawReady(uint8_t frame = 0) {
   (void)frame;
+  if (!rt.bound && enrollmentPending && enrollmentCode[0]) {
+    // Fresh server: the admin approves THIS kiosk by matching this code on
+    // /kiosk-management. Not a secret (derived from a hash, shown on both sides).
+    tft.fillScreen(C_BG);
+    drawIndustrialHeader(C_WARN);
+    drawPageTitle("CHỜ DUYỆT KIOSK", C_WARN);
+    drawCenteredTextFit(enrollmentCode, SCREEN_LEFT_MARGIN, 110, 216, 48, FONT_VALUE, FONT_VALUE - 1, 1, C_TEXT, true);
+    drawCenteredTextFit("Duyệt mã này tại Quản lý kiosk", SCREEN_LEFT_MARGIN, 176, 216, 36, FONT_HEADER, FONT_HEADER, 2, C_MUTED);
+    drawFooter("", "");
+    return;
+  }
   tft.fillScreen(C_BG);
   drawIndustrialHeader(rt.online ? C_OK : C_ERR);
   drawPageTitle(rt.online ? "QUÉT THẺ NHÂN VIÊN" : "MẤT KẾT NỐI", rt.online ? C_TEXT : C_ERR);
@@ -3243,6 +3408,7 @@ static String maintenancePage() {
 
 static void handleMaintenanceApiUrl() {
   if (!maintenanceMode) { maintenanceWeb.send(403, "application/json", "{\"ok\":false}"); return; }
+  lastMaintenanceActivityAt = millis();
   DynamicJsonDocument doc(512); String body;
   if (deserializeJson(doc, maintenanceWeb.arg("plain"))) {
     maintenanceWeb.send(400, "application/json", "{\"ok\":false,\"message\":\"JSON khong hop le\"}"); return;
@@ -3252,8 +3418,19 @@ static void handleMaintenanceApiUrl() {
   if (!validServerBase(url)) {
     maintenanceWeb.send(400, "application/json", "{\"ok\":false,\"message\":\"API URL khong hop le\"}"); return;
   }
+  {
+    String credError;
+    if (!applyServerChange(url, credError)) {
+      DynamicJsonDocument out(512); out["ok"] = false; out["message"] = credError; String o; serializeJson(out, o);
+      maintenanceWeb.send(409, "application/json", o); return;
+    }
+  }
   safeCopy(SERVER_BASE, sizeof(SERVER_BASE), url.c_str());
-  if (otaUrl.length() == 0 || validServerBase(otaUrl)) safeCopy(OTA_AGENT_BASE, sizeof(OTA_AGENT_BASE), otaUrl.c_str());
+  if (otaUrl.length() == 0 || otaUrl.startsWith("https://")) {
+    safeCopy(OTA_AGENT_BASE, sizeof(OTA_AGENT_BASE), otaUrl.c_str());
+    otaAgentSource = otaUrl.length() ? mfota::AgentSource::MANUAL : mfota::AgentSource::NONE;
+    saveOtaAgentSource();
+  }
   const bool saved = saveDeviceConfig();
   body = saved ? "{\"ok\":true,\"message\":\"Da luu API URL\"}" : "{\"ok\":false,\"message\":\"Khong luu duoc\"}";
   maintenanceWeb.send(saved ? 200 : 500, "application/json", body);
@@ -3319,10 +3496,13 @@ static void redrawProductionUi() {
 static void enterMaintenanceMode(bool duringBoot) {
   if (maintenanceMode) return;
   maintenanceMode = true; maintenanceEnteredDuringBoot = duringBoot;
+  lastMaintenanceActivityAt = millis();
+  Serial.printf("[MAINT] ENTER boot=%d idle_timeout_s=%lu\n", duringBoot ? 1 : 0,
+                static_cast<unsigned long>(mfmt::MAINTENANCE_IDLE_TIMEOUT_MS / 1000UL));
   wifiSetupHoldTriggered = true;
   static bool routesRegistered = false;
   if (!routesRegistered) {
-    auto serveMaintenancePage = [](){ maintenanceWeb.send(200, "text/html; charset=utf-8", maintenancePage()); };
+    auto serveMaintenancePage = [](){ lastMaintenanceActivityAt = millis(); maintenanceWeb.send(200, "text/html; charset=utf-8", maintenancePage()); };
     maintenanceWeb.on("/", HTTP_GET, serveMaintenancePage);
     maintenanceWeb.on("/maintenance", HTTP_GET, serveMaintenancePage);
     maintenanceWeb.on("/maintenance/api-url", HTTP_POST, handleMaintenanceApiUrl);
@@ -3341,12 +3521,18 @@ static void exitMaintenanceMode() {
   maintenanceWeb.stop();
   maintenanceWebActive = false;
   maintenanceMode = false; maintenanceEnteredDuringBoot = false;
+  Serial.println("[MAINT] EXIT");
   wifiSetupHoldActive = false; wifiSetupHoldTriggered = false; wifiSetupHoldStartedAt = 0;
   redrawProductionUi();
 }
 
 static void serviceMaintenanceMode() {
   if (!maintenanceMode) return;
+  if (mfmt::maintenanceTimedOut(lastMaintenanceActivityAt, millis())) {
+    Serial.println("[MAINT] IDLE_TIMEOUT: tu thoat bao tri, ve san xuat.");
+    exitMaintenanceMode();
+    return;
+  }
   if (WiFi.status() == WL_CONNECTED && !maintenanceWebActive) {
     maintenanceWeb.begin(); maintenanceWebActive = true;
     if (mdnsReady) MDNS.addService("http", "tcp", 80);
@@ -4346,8 +4532,10 @@ bool bindKiosk() {
   request["hostname"] = DEVICE_ID;
   request["os"] = "ESP32-S3";
   request["firmware_version"] = FW_VERSION;
-  request["firmware_build"] = FW_BUILD;
+  request["firmware_build"] = FW_BUILD_ID;
   request["hardware_model"] = HW_MODEL;
+  request["hardware_profile"] = HW_PROFILE;
+  request["firmware_artifact_id"] = otaRunningArtifact;
   request["ota_capable"] = true;
   request["boot_id"] = String(bootId, HEX);
   request["boot_reason"] = String((int)esp_reset_reason());
@@ -4365,6 +4553,16 @@ bool bindKiosk() {
   const bool bindPosted = httpPostJson("/api/kiosk/connect", request, response, false);
   suppressNetworkUiErrors = previousSuppress;
   if (!bindPosted) {
+    const char* errCode = response["error"] | "";
+    if (rt.lastHttpStatus == 403 && strcmp(errCode, "KIOSK_ENROLLMENT_PENDING") == 0) {
+      char local[7]; computeEnrollmentCode(local);
+      const char* serverCode = response["enrollment_code"] | "";
+      const bool changed = !enrollmentPending || strcmp(enrollmentCode, local) != 0;
+      enrollmentPending = true; safeCopy(enrollmentCode, sizeof(enrollmentCode), local);
+      Serial.printf("[BIND] ENROLLMENT_PENDING code=%s server_code=%s%s\n", local, serverCode,
+                    strcmp(local, serverCode) == 0 ? "" : " (KHAC MA: khong duyet!)");
+      if (changed && (uiState == UiState::READY || uiState == UiState::OFFLINE)) redrawProductionUi();
+    }
     Serial.println("[BIND] That bai; kiosk van vao READY va se thu lai nen.");
     remoteLogf("BIND failed HTTP=%d error=%s", rt.lastHttpStatus, rt.lastError);
     if (showBindingScreen) setUi(UiState::READY);
@@ -4385,11 +4583,8 @@ bool bindKiosk() {
   if (assignedStation[0]) safeCopy(STATION_CODE, sizeof(STATION_CODE), assignedStation);
   if (assignedName[0]) safeCopy(DEVICE_NAME, sizeof(DEVICE_NAME), assignedName);
   rt.bound = true;
-
-  prefs.begin("mesflow", false);
-  prefs.putString("token", rt.kioskToken);
-  prefs.putString("station", STATION_CODE);
-  prefs.end();
+  enrollmentPending = false; enrollmentCode[0] = '\0';
+  saveCurrentCredential();  // token + the server that issued it
   // Keep the server-approved station consistent across both existing NVS namespaces.
   // This is a persistence fix only; Multi-OP and scanner logic are unchanged.
   if (!saveDeviceConfig()) {
@@ -4668,7 +4863,7 @@ bool sendHeartbeat() {
   if (!canSendHeartbeat()) return false;
 
   DynamicJsonDocument request(1536);
-  DynamicJsonDocument response(768);
+  DynamicJsonDocument response(1024);
 
   request["station_code"] = STATION_CODE;
   request["device_id"] = DEVICE_ID;
@@ -4678,8 +4873,10 @@ bool sendHeartbeat() {
   request["browser"] = "Embedded";
   request["app_version"] = APP_VERSION;
   request["firmware_version"] = FW_VERSION;
-  request["firmware_build"] = FW_BUILD;
+  request["firmware_build"] = FW_BUILD_ID;
   request["hardware_model"] = HW_MODEL;
+  request["hardware_profile"] = HW_PROFILE;
+  request["firmware_artifact_id"] = otaRunningArtifact;
   request["ota_capable"] = true;
   request["boot_id"] = String(bootId, HEX);
   request["boot_reason"] = String((int)esp_reset_reason());
@@ -4794,6 +4991,7 @@ bool sendHeartbeat() {
     if (response["config_version"].is<int>()) {
       Serial.printf("[heartbeat] config_version=%d\n", response["config_version"].as<int>());
     }
+    adoptAdvertisedOtaAgent(response["ota_agent_url"] | "");
 
     Serial.printf("[heartbeat] OK RSSI=%d heap=%u\n",
                   WiFi.RSSI(), static_cast<unsigned>(ESP.getFreeHeap()));
@@ -4817,81 +5015,203 @@ bool sendHeartbeat() {
   return false;
 }
 
-static void otaEvent(const char* status, const char* errorCode = "", const char* message = "") {
-  if (!rt.bound || WiFi.status() != WL_CONNECTED) return;
-  DynamicJsonDocument req(1024), resp(512);
+static bool otaEvent(const char* status, const char* errorCode = "", const char* message = "") {
+  const char* base = otaAgentBase();
+  if (!base[0] || !rt.bound || WiFi.status() != WL_CONNECTED) return false;
+  DynamicJsonDocument req(1536), resp(512);
   req["kiosk_id"] = DEVICE_UUID[0] ? DEVICE_UUID : DEVICE_ID;
   req["from_version"] = FW_VERSION; req["to_version"] = otaTargetVersion;
-  if (otaFirmwareId[0]) req["firmware_id"] = otaFirmwareId;
+  if (otaFirmwareId[0]) { req["firmware_id"] = otaFirmwareId; req["artifact_id"] = otaFirmwareId; }
+  if (otaTargetId > 0) req["target_id"] = otaTargetId;
+  if (otaClaimId[0]) req["claim_id"] = otaClaimId;
+  // Identity of the RUNNING image: the Agent accepts a boot ACK only when it
+  // matches the pinned artifact's build/profile.
+  req["build_id"] = FW_BUILD_ID;
+  req["hardware_profile"] = HW_PROFILE[0] ? HW_PROFILE : otaTargetProfile;
+  char cid[20]; snprintf(cid, sizeof(cid), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+  req["client_event_id"] = cid;
   req["status"] = status; req["error_code"] = errorCode; req["message"] = message;
   req["timestamp"] = currentEpoch();
   const bool previousSuppress = suppressNetworkUiErrors;
-  suppressNetworkUiErrors = true;
-  httpPostJson("/api/esp-ota/event", req, resp, true, false, otaAgentBase());
+  suppressNetworkUiErrors = true;  // background OTA never hijacks the LCD (no ERROR_STATE)
+  const bool ok = httpPostJson("/api/esp-ota/event", req, resp, true, false, base);
   suppressNetworkUiErrors = previousSuppress;
+  return ok;
 }
 
-static bool otaIdleSafe() {
-  return WiFi.status() == WL_CONNECTED && rt.bound && rt.online && uiState == UiState::READY &&
-         !rt.hasWorker && !rt.hasOperation && rt.activeSessionId <= 0 &&
-         !hasPendingTransaction() && countPendingOfflineEvents() == 0 && actionQueueCount() == 0 &&
-         !offlineMode && !maintenanceMode && !keypadCalibrationRequested && !keypadCalibrationInProgress;
+static mfota::SafePoint otaSafePoint() {
+  mfota::SafePointInputs in{};
+  in.linkReady = WiFi.status() == WL_CONNECTED && rt.bound && rt.online;
+  in.uiReady = uiState == UiState::READY;
+  in.pendingTransaction = hasPendingTransaction();
+  in.offlineEvents = countPendingOfflineEvents();
+  in.actionQueue = actionQueueCount();
+  in.maintenanceOrCalibration = maintenanceMode || keypadCalibrationRequested || keypadCalibrationInProgress;
+  in.offlineMode = offlineMode;
+  in.longTermSession = rt.hasWorker || rt.hasOperation || rt.activeSessionId > 0;
+  in.force = otaForce;
+  in.waitingMs = otaAvailableSince ? millis() - otaAvailableSince : 0;
+  return mfota::evaluateSafePoint(in);
 }
 
-static void rememberOtaBoot() {
+static void otaReportWait(mfota::SafePoint sp) {
+  if (otaLastWaitEventAt && millis() - otaLastWaitEventAt < 60000UL) return;
+  otaLastWaitEventAt = millis();
+  Serial.printf("[OTA] WAITING_SAFE_POINT reason=%s\n", mfota::safePointReason(sp));
+  otaEvent(sp == mfota::SafePoint::BLOCKED_TRANSACTION ? "OTA_BLOCKED_TRANSACTION" : "OTA_WAITING_IDLE",
+           mfota::safePointReason(sp), "OTA_AVAILABLE_WAITING_SAFE_POINT");
+}
+
+static void rememberOtaBoot(const esp_partition_t* target) {
   Preferences ota; ota.begin("mf_ota", false);
   ota.putString("from", FW_VERSION); ota.putString("to", otaTargetVersion);
-  ota.putString("firmware", otaFirmwareId); ota.putBool("pending", true); ota.end();
+  ota.putString("firmware", otaFirmwareId); ota.putString("build", otaTargetBuild);
+  ota.putString("profile", otaTargetProfile); ota.putString("claim", otaClaimId);
+  ota.putLong("target", otaTargetId); ota.putUInt("part", target ? target->address : 0);
+  ota.putBool("pending", true); ota.end();
+}
+
+static bool otaFailNow(const char* status, const char* code, const char* message) {
+  otaInstallInProgress = false;
+  Serial.printf("[OTA] %s %s %s\n", status, code, message ? message : "");
+  otaEvent(status, code, message);
+  return false;
 }
 
 static bool performOtaUpdate() {
-  if (!otaIdleSafe()) { otaEvent("OTA_WAITING_IDLE", "", "OTA_AVAILABLE_WAITING_IDLE"); return false; }
-  if (!String(otaDownloadUrl).startsWith("https://")) {
-    otaEvent("OTA_FAILED", "OTA_HTTP_ERROR", "HTTPS firmware URL required"); return false;
-  }
+  mfota::SafePoint sp = otaSafePoint();
+  if (sp != mfota::SafePoint::SAFE) { otaReportWait(sp); return false; }
+  otaInstallInProgress = true;   // from here new scans are refused (nothing recorded)
+  delay(400);                    // a scan already being dispatched finishes first
+  sp = otaSafePoint();
+  if (sp != mfota::SafePoint::SAFE) { otaInstallInProgress = false; otaReportWait(sp); return false; }
+  if (!mfota::sameHttpsOrigin(otaAgentBase(), otaDownloadUrl))
+    return otaFailNow("OTA_FAILED", "OTA_ORIGIN_MISMATCH", "Download URL is not on the Agent origin");
+  if (mfota::compareVersions(otaTargetVersion, FW_VERSION) < 0 && !otaAllowDowngrade)
+    return otaFailNow("OTA_FAILED", "OTA_DOWNGRADE_REFUSED", otaTargetVersion);
   const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
-  if (!next || otaExpectedSize == 0 || otaExpectedSize > next->size) {
-    otaEvent("OTA_FAILED", "OTA_NO_SPACE", "Firmware exceeds inactive OTA partition"); return false;
-  }
+  if (!next || otaExpectedSize == 0 || otaExpectedSize > next->size)
+    return otaFailNow("OTA_FAILED", "OTA_NO_SPACE", "Firmware exceeds inactive OTA partition");
   otaEvent("OTA_DOWNLOAD_START");
   MesHttpSession net;
-  if (!net.begin(String(otaDownloadUrl), 8000, 30000, 35, false, true)) {
-    otaEvent("OTA_FAILED", "OTA_NETWORK_ERROR", "http.begin failed"); return false;
-  }
+  if (!net.begin(String(otaDownloadUrl), 8000, 30000, 35, false, true))
+    return otaFailNow("OTA_FAILED", "OTA_NETWORK_ERROR", "http.begin failed");
   HTTPClient& http = net.http(); addAuthHeaders(http);
   int code = http.GET();
-  if (code != HTTP_CODE_OK) { net.end(); otaEvent("OTA_FAILED", "OTA_HTTP_ERROR", String(code).c_str()); return false; }
+  if (code != HTTP_CODE_OK) { net.end(); return otaFailNow("OTA_FAILED", "OTA_HTTP_ERROR", String(code).c_str()); }
   int declared = http.getSize();
-  if (declared <= 0 || static_cast<size_t>(declared) != otaExpectedSize) {
-    net.end(); otaEvent("OTA_FAILED", "OTA_SIZE_MISMATCH", "Content-Length mismatch"); return false;
-  }
-  if (!Update.begin(otaExpectedSize, U_FLASH)) {
-    net.end(); otaEvent("OTA_FAILED", "OTA_FLASH_ERROR", Update.errorString()); return false;
-  }
+  if (declared <= 0 || static_cast<size_t>(declared) != otaExpectedSize) { net.end(); return otaFailNow("OTA_FAILED", "OTA_SIZE_MISMATCH", "Content-Length mismatch"); }
+  if (!Update.begin(otaExpectedSize, U_FLASH)) { net.end(); return otaFailNow("OTA_FAILED", "OTA_FLASH_ERROR", Update.errorString()); }
   mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha, 0);
   WiFiClient* stream = http.getStreamPtr(); uint8_t buffer[4096]; size_t written = 0;
-  uint32_t lastData = millis(); bool streamFailed = false;
+  uint32_t lastData = millis(); bool streamFailed = false; const char* headError = nullptr;
   while (written < otaExpectedSize) {
     size_t available = stream->available();
     if (available) {
       size_t want = min(available, min(sizeof(buffer), otaExpectedSize - written));
       int got = stream->readBytes(buffer, want);
-      if (got <= 0 || Update.write(buffer, got) != static_cast<size_t>(got)) { streamFailed = true; break; }
-      mbedtls_sha256_update(&sha, buffer, got); written += got; lastData = millis();
+      if (got <= 0) { streamFailed = true; break; }
+      size_t have = static_cast<size_t>(got);
+      if (written == 0) {
+        // Validate the image header + app descriptor BEFORE the first byte is
+        // written: a bootloader/merged/foreign-chip image never reaches flash.
+        while (have < 36 && have < otaExpectedSize && millis() - lastData < 30000) {
+          size_t more = stream->available();
+          if (more) { int g = stream->readBytes(buffer + have, min(more, sizeof(buffer) - have)); if (g > 0) { have += g; lastData = millis(); } }
+          else if (!http.connected()) break;
+          delay(1);
+        }
+        headError = mfota::validateAppImageHead(buffer, have, OTA_EXPECTED_CHIP_ID);
+        if (headError) break;
+      }
+      if (Update.write(buffer, have) != have) { streamFailed = true; break; }
+      mbedtls_sha256_update(&sha, buffer, have); written += have; lastData = millis();
     } else if (!http.connected() || millis() - lastData > 30000) { streamFailed = true; break; }
     delay(1);
   }
   uint8_t digest[32]; mbedtls_sha256_finish(&sha, digest); mbedtls_sha256_free(&sha); net.end();
-  if (streamFailed || written != otaExpectedSize) { Update.abort(); otaEvent("OTA_FAILED", "OTA_SIZE_MISMATCH", "Truncated stream"); return false; }
+  if (headError) { Update.abort(); return otaFailNow("OTA_FAILED", headError, "image header rejected"); }
+  if (streamFailed || written != otaExpectedSize) { Update.abort(); return otaFailNow("OTA_FAILED", "OTA_SIZE_MISMATCH", "Truncated stream"); }
   char actual[65]; for (uint8_t i=0;i<32;i++) sprintf(actual+i*2, "%02x", digest[i]); actual[64]='\0';
-  if (strcasecmp(actual, otaExpectedSha256) != 0) { Update.abort(); otaEvent("OTA_VERIFY_FAILED", "OTA_HASH_MISMATCH", actual); return false; }
+  if (strcasecmp(actual, otaExpectedSha256) != 0) { Update.abort(); return otaFailNow("OTA_VERIFY_FAILED", "OTA_HASH_MISMATCH", actual); }
   otaEvent("OTA_DOWNLOAD_COMPLETE"); otaEvent("OTA_VERIFY_OK");
-  if (!Update.end(true) || !Update.isFinished()) { otaEvent("OTA_FAILED", "OTA_FLASH_ERROR", Update.errorString()); return false; }
-  rememberOtaBoot(); otaEvent("OTA_REBOOTING"); delay(300); ESP.restart(); return true;
+  // Only now (size + SHA256 verified) does the inactive slot become the boot target.
+  if (!Update.end(true) || !Update.isFinished()) return otaFailNow("OTA_FAILED", "OTA_FLASH_ERROR", Update.errorString());
+  rememberOtaBoot(next); otaEvent("OTA_REBOOTING"); delay(300); ESP.restart(); return true;
+}
+
+static uint32_t otaPendingVerifyPrintedAt = 0;
+static bool otaImagePendingVerify = false;
+static uint32_t otaWifiSeenAt = 0;
+
+static void otaBootPrepare() {
+  Preferences ota; ota.begin("mf_ota", true);
+  otaBootReportPending = ota.getBool("pending", false);
+  ota.end();
+  esp_ota_img_states_t st; const esp_partition_t* running = esp_ota_get_running_partition();
+  otaImagePendingVerify = running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+// Local, network-independent self-check for a freshly OTA'd image. A server
+// or Agent outage never causes a rollback (no boot loop); only an image that
+// cannot keep running 60 s with storage + Wi-Fi association is rolled back.
+static void otaLocalSelfCheck() {
+  if (!otaImagePendingVerify) return;
+  if (WiFi.status() == WL_CONNECTED && !otaWifiSeenAt) otaWifiSeenAt = millis();
+  const uint32_t up = millis() - bootAtMs;
+  if (!otaPendingVerifyPrintedAt || millis() - otaPendingVerifyPrintedAt > 15000UL) {
+    otaPendingVerifyPrintedAt = millis();
+    Serial.printf("[OTA] PENDING_VERIFY %s up=%lus fs=%d wifi=%d\n", MESFLOW_FW_IDENTITY, (unsigned long)(up / 1000UL), fsReady, otaWifiSeenAt != 0);
+  }
+  if (fsReady && otaWifiSeenAt && up >= 60000UL) {
+    if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+      otaImagePendingVerify = false;
+      Serial.println("[OTA] SELF_CHECK_OK image marked valid (rollback cancelled)");
+    }
+    return;
+  }
+  if (up >= 15UL * 60UL * 1000UL && uiState == UiState::READY && !hasPendingTransaction()) {
+    Serial.println("[OTA] SELF_CHECK_FAILED: rollback to previous image");
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+  }
+}
+
+static void confirmPendingOtaBoot() {
+  static uint32_t lastAttempt = 0;
+  if (!otaBootReportPending || otaImagePendingVerify) return;  // not before the image is marked valid
+  if (lastAttempt && millis() - lastAttempt < 30000UL) return;
+  lastAttempt = millis();
+  Preferences ota; ota.begin("mf_ota", true);
+  String target = ota.getString("to", ""), firmware = ota.getString("firmware", ""), build = ota.getString("build", "");
+  String profile = ota.getString("profile", ""), claim = ota.getString("claim", "");
+  long tid = ota.getLong("target", 0); uint32_t part = ota.getUInt("part", 0);
+  ota.end();
+  safeCopy(otaTargetVersion, sizeof(otaTargetVersion), target.c_str()); safeCopy(otaFirmwareId, sizeof(otaFirmwareId), firmware.c_str());
+  safeCopy(otaTargetBuild, sizeof(otaTargetBuild), build.c_str()); safeCopy(otaTargetProfile, sizeof(otaTargetProfile), profile.c_str());
+  safeCopy(otaClaimId, sizeof(otaClaimId), claim.c_str()); otaTargetId = tid;
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  // Partition address, not version text: a same-version forced reinstall and
+  // a rollback carry the same FW_VERSION.
+  const bool bootedTarget = part ? (running && running->address == part) : (target == FW_VERSION);
+  bool sent;
+  if (!bootedTarget) {
+    sent = otaEvent("OTA_ROLLBACK", "OTA_BOOT_FAILED", "Bootloader returned to previous image");
+  } else {
+    otaEvent("OTA_BOOT_NEW_VERSION", "", MESFLOW_FW_IDENTITY);
+    sent = otaEvent("OTA_HEALTHCHECK_OK", "", MESFLOW_FW_IDENTITY);
+  }
+  if (!sent) return;  // keep pending; retried on the next OTA cycle
+  Preferences w; w.begin("mf_ota", false);
+  if (bootedTarget) { w.putString("run_art", firmware); safeCopy(otaRunningArtifact, sizeof(otaRunningArtifact), firmware.c_str()); }
+  w.putBool("pending", false); w.end();
+  otaBootReportPending = false;
+  otaTargetId = 0; otaClaimId[0] = otaFirmwareId[0] = otaTargetVersion[0] = otaTargetBuild[0] = otaTargetProfile[0] = '\0';
+  Serial.printf("[OTA] BOOT_REPORTED %s\n", bootedTarget ? "TARGET" : "ROLLBACK");
 }
 
 static void checkForOta() {
-  if (!rt.bound || WiFi.status() != WL_CONNECTED || !rt.online) return;
+  const char* base = otaAgentBase();
+  if (!base[0] || !rt.bound || WiFi.status() != WL_CONNECTED || !rt.online) return;
   // HTTPS certificate validation needs a valid clock. Do not consume the
   // long polling interval while NTP is still bootstrapping.
   if (currentEpoch() < MIN_VALID_EPOCH) {
@@ -4900,42 +5220,57 @@ static void checkForOta() {
   }
   const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? otaRetryIntervalMs() : OTA_CHECK_INTERVAL_MS;
   if (lastOtaCheckAt && millis() - lastOtaCheckAt < interval) return;
-  lastOtaCheckAt = millis(); otaEvent("OTA_CHECK");
-  Serial.printf("[OTA] CHECK agent=%s version=%s model=%s\n", otaAgentBase(), FW_VERSION, HW_MODEL);
-  char path[320]; snprintf(path, sizeof(path), "/api/esp-ota/check?kiosk_id=%s&current_version=%s&hardware_model=%s",
-                           DEVICE_UUID[0] ? DEVICE_UUID : DEVICE_ID, FW_VERSION, HW_MODEL);
-  DynamicJsonDocument response(1536);
+  lastOtaCheckAt = millis();
+  if (otaBootReportPending) confirmPendingOtaBoot();
+  Serial.printf("[OTA] CHECK agent=%s version=%s profile=%s\n", base, FW_VERSION, HW_PROFILE[0] ? HW_PROFILE : "<none>");
+  char path[512]; snprintf(path, sizeof(path),
+    "/api/esp-ota/check?kiosk_id=%s&current_version=%s&hardware_model=%s&hardware_profile=%s&artifact_id=%s&build_id=%s&api=2",
+    DEVICE_UUID[0] ? DEVICE_UUID : DEVICE_ID, FW_VERSION, HW_MODEL, HW_PROFILE, otaRunningArtifact, FW_BUILD_ID);
+  DynamicJsonDocument response(2048);
   const bool previousSuppress = suppressNetworkUiErrors;
   suppressNetworkUiErrors = true;
   // trackLinkState=false: the OTA agent is a separate service from the core
-  // MES API and must never affect serverLinkState/rt.online (see the long
-  // comment on httpGetJson()) -- otherwise a device with no OTA CA cert
-  // provisioned yet can never stay "online" long enough to scan.
-  const bool checked = httpGetJson(path, response, true, nullptr, otaAgentBase(), false);
+  // MES API and must never affect serverLinkState/rt.online.
+  const bool checked = httpGetJson(path, response, true, nullptr, base, false);
   suppressNetworkUiErrors = previousSuppress;
   if (!checked) {
     otaCheckSucceeded = false;
     if (otaCheckFailures < 16) otaCheckFailures++;
-    // Consume the retry cooldown.  Setting the timestamp in the past creates
-    // a tight request loop when the Agent/network is unavailable.
     lastOtaCheckAt = millis();
     Serial.printf("[OTA] CHECK_FAILED status=%d; retry in %lus\n", rt.lastHttpStatus,
                   static_cast<unsigned long>(otaRetryIntervalMs() / 1000UL));
     return;
   }
   otaCheckFailures = 0;
-  if (!(response["update_available"] | false)) { otaAvailableWaitingIdle = false; otaCheckSucceeded = true; Serial.println("[OTA] NO_UPDATE"); return; }
+  if (!(response["update_available"] | false)) {
+    otaAvailableWaitingIdle = false; otaCheckSucceeded = true; otaAvailableSince = 0;
+    if (!otaBootReportPending) { otaClaimId[0] = '\0'; otaTargetId = 0; }
+    Serial.printf("[OTA] NO_UPDATE %s\n", (const char*)(response["reason"] | ""));
+    return;
+  }
   otaCheckSucceeded = true;
   const char* model = response["hardware_model"] | "";
   if (strcmp(model, HW_MODEL) != 0) { otaEvent("OTA_FAILED", "OTA_WRONG_HARDWARE", model); return; }
+  const char* type = response["artifact_type"] | "app";
+  if (strcmp(type, "app") != 0) { otaEvent("OTA_FAILED", "OTA_ARTIFACT_TYPE_INVALID", type); return; }
+  const char* profile = response["hardware_profile"] | "";
+  if (HW_PROFILE[0] && profile[0] && strcmp(profile, HW_PROFILE) != 0) { otaEvent("OTA_FAILED", "OTA_PROFILE_MISMATCH", profile); return; }
+  const long targetId = response["target_id"] | 0L;
+  if (targetId != otaTargetId || !otaAvailableSince) otaAvailableSince = millis();
+  otaTargetId = targetId;
+  safeCopy(otaClaimId, sizeof(otaClaimId), response["claim_id"] | "");
+  safeCopy(otaTargetProfile, sizeof(otaTargetProfile), profile);
   safeCopy(otaFirmwareId,sizeof(otaFirmwareId),response["firmware_id"] | "");
   safeCopy(otaTargetVersion,sizeof(otaTargetVersion),response["version"] | "");
   safeCopy(otaTargetBuild,sizeof(otaTargetBuild),response["build"] | "");
   safeCopy(otaDownloadUrl,sizeof(otaDownloadUrl),response["url"] | "");
   safeCopy(otaExpectedSha256,sizeof(otaExpectedSha256),response["sha256"] | "");
-  otaExpectedSize = response["size"] | 0; otaAvailableWaitingIdle = true; otaEvent("OTA_AVAILABLE");
-  if (!otaIdleSafe()) otaEvent("OTA_WAITING_IDLE", "", "OTA_AVAILABLE_WAITING_IDLE");
-  else performOtaUpdate();
+  otaExpectedSize = response["size"] | 0;
+  otaForce = response["force"] | false;
+  otaAllowDowngrade = response["allow_downgrade"] | false;
+  otaAvailableWaitingIdle = true;
+  Serial.printf("[OTA] AVAILABLE target=%ld version=%s force=%d\n", otaTargetId, otaTargetVersion, otaForce);
+  performOtaUpdate();
 }
 
 static void otaCheckTask(void*) {
@@ -4945,13 +5280,15 @@ static void otaCheckTask(void*) {
 }
 
 static void scheduleOtaCheck() {
-  // An HTTPS agent without a CA in the build can only fail (fail-closed), and
-  // every attempt also POSTed an OTA_CHECK event from the other core and
-  // logged "http.begin that bai" every 12-25 s. Build with MESFLOW_OTA_CA_FILE
-  // to enable OTA; without it the kiosk does not poll at all.
-  static bool otaDisabledLogged = false;
-  if (strncmp(otaAgentBase(), "https://", 8) == 0 && strlen(MESFLOW_ROOT_CA_PEM) == 0) {
-    if (!otaDisabledLogged) { Serial.println("[OTA] TAT: agent HTTPS nhung ban build khong co CA -> khong kiem tra OTA."); otaDisabledLogged = true; }
+  // An HTTPS agent without a CA in the build can only fail (fail-closed).
+  static bool otaDisabledLogged = false, otaUnconfiguredLogged = false;
+  const char* base = otaAgentBase();
+  if (!base[0]) {
+    if (!otaUnconfiguredLogged) { Serial.println("[OTA] Chua co Deploy Agent URL cua instance -> cho MESFlow cau hinh."); otaUnconfiguredLogged = true; }
+    return;
+  }
+  if (strlen(MESFLOW_ROOT_CA_PEM) == 0) {
+    if (!otaDisabledLogged) { Serial.println("[OTA] TAT: ban build khong co CA -> khong kiem tra OTA."); otaDisabledLogged = true; }
     return;
   }
   if (otaCheckTaskRunning || !rt.bound || WiFi.status() != WL_CONNECTED || !rt.online) return;
@@ -4959,29 +5296,22 @@ static void scheduleOtaCheck() {
   if (lastOtaCheckAt && millis() - lastOtaCheckAt < interval) return;
   otaCheckTaskRunning = true;
   // HTTPS + ArduinoJson parsing uses more stack than the normal UI task.
-  // Keep this isolated from the production loop and give it enough headroom
-  // to prevent a stack-canary reboot while checking the Agent.
   if (xTaskCreatePinnedToCore(otaCheckTask, "mesflow-ota-check", 24576, nullptr, 1, nullptr, 0) != pdPASS) {
     otaCheckTaskRunning = false;
-    otaEvent("OTA_FAILED", "OTA_NO_SPACE", "Cannot allocate OTA check task");
+    Serial.println("[OTA] Cannot allocate OTA check task");
   }
 }
 
-static void confirmPendingOtaBoot() {
-  Preferences ota; ota.begin("mf_ota", false); bool pending=ota.getBool("pending",false);
-  String target=ota.getString("to",""); String firmware=ota.getString("firmware","");
-  if (!pending) { ota.end(); return; }
-  if (target != FW_VERSION) {
-    safeCopy(otaTargetVersion,sizeof(otaTargetVersion),target.c_str()); safeCopy(otaFirmwareId,sizeof(otaFirmwareId),firmware.c_str());
-    ota.putBool("pending",false); ota.end(); otaEvent("OTA_ROLLBACK","OTA_BOOT_FAILED","Bootloader returned to previous image"); return;
+// Main-task UI notice while installing (the OTA task never draws: SPI is
+// owned by the UI loop).
+static void otaUiTick() {
+  static bool shown = false; static uint32_t lastDraw = 0;
+  if (otaInstallInProgress && uiState == UiState::READY) {
+    if (!shown || millis() - lastDraw > 5000UL) { drawFooter("ĐANG CẬP NHẬT PHẦN MỀM", ""); shown = true; lastDraw = millis(); }
+  } else if (shown) {
+    shown = false;
+    if (uiState == UiState::READY) drawReady(0);
   }
-  safeCopy(otaTargetVersion,sizeof(otaTargetVersion),target.c_str()); safeCopy(otaFirmwareId,sizeof(otaFirmwareId),firmware.c_str());
-  otaEvent("OTA_BOOT_NEW_VERSION");
-  esp_ota_img_states_t state; const esp_partition_t* running=esp_ota_get_running_partition();
-  if (running && esp_ota_get_state_partition(running,&state)==ESP_OK && state==ESP_OTA_IMG_PENDING_VERIFY) {
-    if (esp_ota_mark_app_valid_cancel_rollback()!=ESP_OK) { otaEvent("OTA_FAILED","OTA_BOOT_FAILED","mark valid failed"); ota.end(); return; }
-  }
-  ota.putBool("pending",false); ota.end(); otaEvent("OTA_HEALTHCHECK_OK");
 }
 
 // ============================================================
@@ -5162,6 +5492,7 @@ static void consolePrintStatus() {
     Serial.printf("RSSI     : %d dBm\n", WiFi.RSSI());
   }
   Serial.printf("Bound    : %s\n", rt.bound ? "YES" : "NO");
+  if (enrollmentPending) Serial.printf("Enroll   : PENDING code=%s\n", enrollmentCode);
   Serial.printf("Token    : %s\n", rt.kioskToken[0] ? "STORED" : "EMPTY");
   Serial.printf("Pending  : %s\n", hasPendingTransaction() ? "YES" : "NO");
   Serial.printf("OfflineQ : %u\n", countPendingOfflineEvents());
@@ -5195,6 +5526,8 @@ static void consolePrintHelp() {
   Serial.println("clear-offline             : xoa queue + offline sessions (CAN THAN)");
   Serial.println("factory-reset             : xoa config/runtime + LittleFS; GIU identity");
   Serial.println("keypad-calibrate          : hieu chinh lai keypad ngay, khong reboot");
+  Serial.println("maintenance confirm       : vao bao tri (chi USB; READY, khong giao dich cho)");
+  Serial.println("maintenance exit          : thoat bao tri (tu thoat sau 10 phut khong thao tac)");
   Serial.println("restart | reboot          : khoi dong lai ESP32");
   Serial.println("bind                      : bind kiosk lai");
   Serial.println("heartbeat                 : gui heartbeat ngay");
@@ -5210,11 +5543,6 @@ static void clearNamespace(const char* name) {
   temp.end();
 }
 
-static void clearKeypadCalibration() {
-  clearNamespace(KEYPAD_NVS_NAMESPACE);
-  keypadMappingReady = false;
-  Serial.println("[KEYPAD] Da xoa mapping khoi NVS.");
-}
 
 static void forceSetupOnNextBoot() {
   // An empty key must be stored. Merely removing it would make loadDeviceConfig()
@@ -5244,6 +5572,7 @@ static void consoleClearToken() {
   Preferences temp;
   temp.begin("mesflow", false);
   temp.remove("token");
+  temp.remove("token_srv");
   temp.end();
   rt.kioskToken[0] = '\0';
   rt.bound = false;
@@ -5303,6 +5632,22 @@ static void consoleFactoryReset() {
   ESP.restart();
 }
 
+// USB CDC serial only (see mesflow_maintenance_policy.h). Does not change any
+// config, token, Wi-Fi, OTA state or the pending journal; it only opens the
+// existing maintenance screen/page, which keeps all its own validation.
+static void consoleEnterMaintenance() {
+  const bool idle = uiState == UiState::READY || uiState == UiState::OFFLINE;
+  const mfmt::EntryDecision d = mfmt::serialEntryDecision(
+      maintenanceMode, idle && !recoveryMenuActive, hasPendingTransaction(), otaInstallInProgress,
+      keypadCalibrationRequested || keypadCalibrationInProgress);
+  if (d != mfmt::EntryDecision::ALLOW) {
+    Serial.printf("[MAINT] Tu choi: %s (state=%s).\n", mfmt::entryDecisionName(d), stateName(uiState));
+    return;
+  }
+  Serial.println("[MAINT] USB maintenance confirm: vao bao tri. Thoat: 'maintenance exit' hoac tu dong sau 10 phut.");
+  enterMaintenanceMode(false);
+}
+
 static bool handleConsoleCommand(String line) {
   line.trim();
   String cmd = line;
@@ -5335,6 +5680,11 @@ static bool handleConsoleCommand(String line) {
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); Serial.println("Da mo test cam ung."); return true; }
   if (cmd == "recovery-menu") { openRecoveryMenu(); return true; }
+  if (mfmt::isMaintenanceConfirm(cmd.c_str())) { consoleEnterMaintenance(); return true; }
+  if (cmd == "maintenance") {
+    Serial.println("[MAINT] Go chinh xac 'maintenance confirm' (chi qua USB) de vao bao tri.");
+    return true;
+  }
   if (cmd.startsWith("key ") && cmd.length() == 5) { handleKeypadKey(line.charAt(4)); return true; }
   if (cmd.startsWith("scanner-baud")) { Serial.print(cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n"); return true; }
   if (cmd == "bind") { bindKiosk(); return true; }
@@ -5363,8 +5713,9 @@ void handleSerialLine(String line) {
   inputEventCount++;
   safeCopy(lastInputPreview, sizeof(lastInputPreview), line.c_str());
 
-  // Console administration always has priority over QR/session state.
-  if (handleConsoleCommand(line)) return;
+  // Console/admin commands are NOT handled here: this path also carries LAN
+  // console `scan` payloads, GM65 frames and keypad digits. Only the USB CDC
+  // reader (handleUsbConsoleLine) may run console commands.
 
   // Never trap the operator on an error page. Clear the transient error first;
   // an employee scan may immediately continue into the normal lookup flow.
@@ -5587,6 +5938,24 @@ void handleSerialLine(String line) {
   Serial.printf("[BO QUA] %s\n", line.c_str());
 }
 
+// USB CDC serial line: console administration first, then normal input.
+static void handleUsbConsoleLine(String line) {
+  line.trim();
+  if (!line.length()) return;
+  String cmd = line;
+  cmd.toLowerCase();
+  if (maintenanceMode) {
+    if (!mfmt::allowedDuringMaintenance(cmd.c_str())) {
+      Serial.println("[MAINT] Dang bao tri: chi nhan 'maintenance exit', 'status', 'help'.");
+      return;
+    }
+    if (cmd == "maintenance exit") { exitMaintenanceMode(); return; }
+    lastMaintenanceActivityAt = millis();
+  }
+  if (handleConsoleCommand(line)) { lastInputAtMs = millis(); return; }
+  handleSerialLine(line);
+}
+
 void readSerialCommands() {
   static String line;
   static uint32_t lastCharAt = 0;
@@ -5601,7 +5970,7 @@ void readSerialCommands() {
         Serial.printf("[SERIAL RX] %s\n", line.c_str());
         lastInputWasVirtual = false;
         lastInputWasKeypad = false;
-        handleSerialLine(line);
+        handleUsbConsoleLine(line);
         line = "";
       }
       continue;
@@ -5615,7 +5984,7 @@ void readSerialCommands() {
     Serial.printf("[SERIAL RX/TIMEOUT] %s\n", line.c_str());
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
-    handleSerialLine(line);
+    handleUsbConsoleLine(line);
     line = "";
   }
 }
@@ -5668,7 +6037,13 @@ void dispatchScannerFrame(const char* reason) {
                 static_cast<unsigned>(scannerText.length()),
                 scannerText.c_str());
 
-  if (scannerText.startsWith("WF|EMP|") || isOperationQr(scannerText.c_str())) {
+  if (otaInstallInProgress && (scannerText.startsWith("WF|EMP|") || isOperationQr(scannerText.c_str()))) {
+    // Never accept a new transaction while the update is being installed;
+    // nothing is recorded, the worker simply scans again after the reboot.
+    noteScannerFrameValid();
+    Serial.println("[OTA] Dang cap nhat phan mem: tu choi luot quet moi (khong ghi giao dich).");
+    otaScanRefusedAt = millis();
+  } else if (scannerText.startsWith("WF|EMP|") || isOperationQr(scannerText.c_str())) {
     noteScannerFrameValid();
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
@@ -5824,25 +6199,33 @@ static void drawKeypadCalibration(uint8_t index, const char* note, uint16_t acce
   printCenteredFit("BẤM VÀ THẢ TỪNG PHÍM", 270, 1, C_MUTED, false);
 }
 
-static void waitKeypadRelease() {
+// Bounded: false when a key stays pressed past the idle timeout.
+static bool waitKeypadRelease() {
   uint32_t stableSince = 0;
+  const uint32_t started = millis();
   while (true) {
+    esp_task_wdt_reset();
     const int pair = scanKeypadPair();
     if (pair == -1) {
       if (stableSince == 0) stableSince = millis();
-      if (millis() - stableSince >= 100) return;
+      if (millis() - stableSince >= 100) return true;
     } else {
       stableSince = 0;
     }
+    if (mfkp::calibrationTimedOut(started, millis())) return false;
     delay(10);
   }
 }
 
+// Bounded: returns -4 when no stable key arrives within the idle timeout.
 static int waitStableKeypadPair() {
   int candidate = -1;
   uint32_t stableSince = 0;
   uint32_t lastWarningAt = 0;
+  const uint32_t started = millis();
   while (true) {
+    esp_task_wdt_reset();
+    if (mfkp::calibrationTimedOut(started, millis())) return -4;
     const int pair = scanKeypadPair();
     if (pair >= 0) {
       if (pair != candidate) {
@@ -5864,15 +6247,23 @@ static int waitStableKeypadPair() {
   }
 }
 
+// Explicit (maintenance/serial) calibration only. Bounded: aborts after
+// CALIBRATION_IDLE_TIMEOUT_MS without key activity or CALIBRATION_MAX_ROUNDS
+// invalid matrices. Works on a scratch copy; on any failure the mapping that
+// is stored in NVS (if any) is reloaded unchanged -- never a partial/fake map.
 static bool calibrateKeypadInteractive() {
   Serial.println("[KEYPAD CAL] Bat dau hieu chinh 12 phim; bam va tha theo man hinh.");
-  while (true) {
+  keypadMappingReady = false;  // no key is interpreted while calibrating
+  bool valid = false;
+  bool timedOut = false;
+  for (uint8_t round = 0; round < mfkp::CALIBRATION_MAX_ROUNDS && !valid && !timedOut; ++round) {
     memset(keypadPairs, 0xFF, sizeof(keypadPairs));
-    waitKeypadRelease();
-    for (uint8_t index = 0; index < KEYPAD_KEY_COUNT; ++index) {
+    if (!waitKeypadRelease()) { timedOut = true; break; }
+    for (uint8_t index = 0; index < KEYPAD_KEY_COUNT && !timedOut; ++index) {
       while (true) {
         drawKeypadCalibration(index, "DANG CHO PHIM");
         const int pair = waitStableKeypadPair();
+        if (pair == -4) { timedOut = true; break; }
         bool duplicate = false;
         for (uint8_t previous = 0; previous < index; ++previous) {
           if (keypadPairs[previous] == static_cast<uint8_t>(pair)) duplicate = true;
@@ -5882,7 +6273,7 @@ static bool calibrateKeypadInteractive() {
           printKeypadPair(static_cast<uint8_t>(pair));
           Serial.println("; bam lai dung phim.");
           drawKeypadCalibration(index, "TRUNG PHIM - BAM LAI", C_ERR);
-          waitKeypadRelease();
+          if (!waitKeypadRelease()) { timedOut = true; break; }
           delay(500);
           continue;
         }
@@ -5890,18 +6281,25 @@ static bool calibrateKeypadInteractive() {
         Serial.printf("[KEYPAD CAL] %c = ", keypadCalibrationKeys[index]);
         printKeypadPair(keypadPairs[index]);
         Serial.println();
-        waitKeypadRelease();
+        if (!waitKeypadRelease()) timedOut = true;
         break;
       }
     }
-    if (validateKeypadMapping()) break;
-    Serial.println("[KEYPAD CAL] Cau truc khong phai ma tran 3x4; thu lai tu dau.");
-    drawSimple("HIỆU CHỈNH LỖI", "SAI MA TRẬN 3X4", "KIỂM TRA DÂY", "THỬ LẠI", C_ERR);
-    delay(1800);
+    if (timedOut) break;
+    valid = validateKeypadMapping();
+    if (!valid) {
+      Serial.println("[KEYPAD CAL] Cau truc khong phai ma tran 3x4; thu lai tu dau.");
+      drawSimple("HIỆU CHỈNH LỖI", "SAI MA TRẬN 3X4", "KIỂM TRA DÂY", "THỬ LẠI", C_ERR);
+      delay(1800);
+    }
   }
-  if (!saveKeypadMapping()) {
-    Serial.println("[KEYPAD CAL] Khong luu duoc mapping vao NVS.");
-    drawSimple("HIỆU CHỈNH LỖI", "KHÔNG LƯU ĐƯỢC", "KIỂM TRA NVS", "", C_ERR);
+  if (!valid || !saveKeypadMapping()) {
+    const bool restored = loadKeypadMapping();  // previous NVS mapping, untouched
+    Serial.printf("[KEYPAD CAL] %s; giu mapping cu=%s.\n",
+                  timedOut ? "Het thoi gian cho phim" : (valid ? "Khong luu duoc mapping vao NVS" : "Sai ma tran 3x4 qua nhieu lan"),
+                  restored ? "CO" : "KHONG (keypad tat)");
+    drawSimple("HIỆU CHỈNH DỪNG", timedOut ? "HẾT GIỜ CHỜ PHÍM" : "KHÔNG HOÀN TẤT",
+               restored ? "GIỮ MAPPING CŨ" : "KEYPAD TẠM TẮT", "", C_ERR);
     delay(1800);
     return false;
   }
@@ -5960,7 +6358,8 @@ static void serviceRuntimeKeypadCalibration() {
   demoDefectQty = 0;
   keypadNumberLength = 0;
   keypadNumberBuffer[0] = '\0';
-  clearKeypadCalibration();
+  // The stored mapping is NOT wiped here: calibration works on a scratch copy
+  // and reloads it if the operator does not finish.
   keypadReleaseAll();
 
   drawSimple("HIỆU CHỈNH KEYPAD", "TẠM KHÓA THAO TÁC", "LÀM THEO MÀN HÌNH", "KHÔNG TẮT NGUỒN", C_INFO);
@@ -5983,7 +6382,8 @@ static void serviceRuntimeKeypadCalibration() {
   if (calibrated) {
     Serial.println("[KEYPAD CAL] Hieu chinh runtime thanh cong; kiosk da tro ve READY.");
   } else {
-    Serial.println("[KEYPAD CAL] Hieu chinh runtime that bai; keypad bi vo hieu hoa.");
+    Serial.printf("[KEYPAD CAL] Hieu chinh runtime khong hoan tat; keypad=%s.\n",
+                  keypadMappingReady ? "MAPPING CU" : "TAT (can hieu chinh qua maintenance)");
   }
 }
 
@@ -6011,9 +6411,12 @@ bool initKeypad() {
   }
   keypadAvailable = true;
   keypadReleaseAll();
-  if (!loadKeypadMapping()) {
-    Serial.println("[KEYPAD] Chua co mapping hop le; mo hieu chinh tren LCD.");
-    calibrateKeypadInteractive();
+  loadKeypadMapping();
+  if (!mfkp::keypadInputEnabled(mfkp::bootKeypadState(keypadAvailable, keypadMappingReady))) {
+    // Never block boot on calibration: Wi-Fi, MESFlow, OTA and the GM65 scanner
+    // must come up. Calibrate later via maintenance ("keypad-calibrate").
+    Serial.println("[KEYPAD] Chua co mapping hop le -> keypad TAT; Wi-Fi/OTA/scanner van chay. "
+                   "Hieu chinh qua maintenance: keypad-calibrate.");
   }
   keypadCandidatePair = -1;
   keypadEmittedPair = -1;
@@ -6213,6 +6616,7 @@ void handleKeypadKey(char key) {
   if (recoveryMenuActive) { handleRecoveryMenuKey(key); return; }
 
   if (maintenanceMode) {
+    lastMaintenanceActivityAt = millis();
     if (key == '1') {
       maintenanceWeb.stop(); maintenanceWebActive = false;
       drawSimple("CÀI ĐẶT WI-FI", "ĐANG KHỞI ĐỘNG...", "", "", C_INFO);
@@ -6315,18 +6719,21 @@ static void serviceKeypadPresence() {
         keypadReleaseAll();
         keypadCandidatePair = -1;
         keypadEmittedPair = -1;
-        Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong) -> hieu chinh lai vi tri phim.\n", address);
-        markKeypadNeedsCalibration("KEYPAD_ATTACHED");
+        // Reuse the stored mapping; without one the keypad stays disabled
+        // until an explicit maintenance calibration (never automatic).
+        const bool mapped = loadKeypadMapping();
+        Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong); mapping=%s.\n", address,
+                      mapped ? "CU" : "CHUA CO (keypad tat)");
+        if (!mapped) markKeypadNeedsCalibration("KEYPAD_ATTACHED");
         break;
       }
     }
     return;
   }
   if (!keypadMappingReady && !keypadWantsCalibration) markKeypadNeedsCalibration("NO_MAPPING");
-  if (keypadWantsCalibration && uiState == UiState::READY && !keypadCalibrationRequested &&
-      !keypadCalibrationInProgress && !hasPendingTransaction()) {
-    if (requestRuntimeKeypadCalibration(keypadCalibrationReason)) keypadWantsCalibration = false;
-  }
+  // Status only (console/heartbeat show NEEDS CALIBRATION). Calibration is
+  // started exclusively by an explicit maintenance/serial request.
+  if (keypadMappingReady && keypadWantsCalibration && strcmp(keypadCalibrationReason, "UNKNOWN_KEY_PAIR") != 0) keypadWantsCalibration = false;
 }
 
 void serviceKeypad() {
@@ -6562,6 +6969,7 @@ void setup() {
   // cycled it" (POWERON) -- see the FORENSICS block near wifiDropCount.
   bootResetReason = esp_reset_reason();
   bootAtMs = millis();
+  otaBootPrepare();
 
   // SAFETY NET (found 2026-08-22, round 5): DNS resolution inside
   // NetworkClient::connect() -> Network.hostByName() -> lwip_getaddrinfo()
@@ -6716,10 +7124,17 @@ void setup() {
   else { loadOfflineStorage(); recoverOfflineSessionIntents(); compactEventLogIfDrained(); }
   loadPendingTransaction();
 
-  if (storedToken.length() && storedStation == STATION_CODE) {
+  prefs.begin("mesflow", true);
+  const String storedTokenServer = prefs.getString("token_srv", "");
+  prefs.end();
+  if (storedToken.length() && storedStation == STATION_CODE &&
+      mfcred::tokenUsableFor(true, storedTokenServer.c_str(), SERVER_BASE)) {
     safeCopy(rt.kioskToken, sizeof(rt.kioskToken), storedToken.c_str());
     rt.bound = true;
+    if (!storedTokenServer.length()) saveCurrentCredential();  // pre-5.6.6 NVS: record issuing server once
     Serial.println("Da nap kiosk token tu NVS.");
+  } else if (storedToken.length()) {
+    Serial.println("[CRED] Token trong NVS thuoc server khac; chua bind voi server hien tai (token van duoc giu).");
   }
 
   if (!WIFI_SSID[0]) {
@@ -6761,13 +7176,15 @@ void setup() {
     setUi(UiState::READY);
     lastHeartbeatAt = millis() - HEARTBEAT_MS;
     sendHeartbeat();
-    if (rt.online) confirmPendingOtaBoot();
+    // Boot identity ACK is sent from the OTA task once the image is marked valid.
     lastHeartbeatAt = millis();
     Serial.println("[READY] Quet the nhan vien.");
   }
 }
 
 void loop() {
+  otaLocalSelfCheck();
+  otaUiTick();
   lastLoopAliveAt = millis();
   esp_task_wdt_reset();
 
@@ -6786,6 +7203,7 @@ void loop() {
   serviceDeviceManagement();
   if (setupPortalActive) return;
   if (maintenanceMode) {
+    readSerialCommands();   // USB only; restricted to 'maintenance exit'/status/help
     serviceKeypad();
     serviceMaintenanceMode();
     static uint32_t lastMaintenanceReconnectAt = 0;

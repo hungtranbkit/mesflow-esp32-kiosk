@@ -1,0 +1,15 @@
+{
+  "profile_id": "es3c28p-n16r8-m910-gm65uart1",
+  "status": "VERIFIED",
+  "evidence": "docs/M910_V560_COMPAT.md (ESP32-S3 N16R8, 16MiB flash + 8MiB OPI PSRAM, ILI9341 240x320, GM65 TX->GPIO44 UART1, USB JTAG-Serial CDC on boot); partitions sha from esp-kiosk-tools/build-manifest.json",
+  "hardware_model": "ES3C28P",
+  "chip": "esp32s3",
+  "min_chip_revision": 0,
+  "flash_size": "16MB",
+  "psram": "8MB-OPI",
+  "board": "ES3C28P-M910-USB-CDC",
+  "scanner_interface": "GM65-UART1-RX44-TXNC",
+  "fqbn": "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_8MB,PSRAM=opi,CDCOnBoot=cdc",
+  "partition_table_sha256": "1d9cca96de0fe07ad7fc0648b9878ddecd9ce565e38b589ad20fea698ed4c80c",
+  "ota_slot_size": 3342336
+}

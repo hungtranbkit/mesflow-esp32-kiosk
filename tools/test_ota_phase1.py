@@ -1,11 +1,12 @@
 from pathlib import Path
 
 SOURCE=(Path(__file__).parents[1]/"esp/mesflow_app.cpp").read_text()
+POLICY=(Path(__file__).parents[1]/"esp/mesflow_ota_policy.h").read_text()
 
 
 def test_identity_and_partition_safe_contract():
-    assert '#define FW_VERSION "5.5.7"' in SOURCE
-    assert '#define FW_BUILD "20260813.0015"' in SOURCE
+    assert '#define FW_VERSION "5.6.6"' in SOURCE
+    assert 'MESFLOW_FW_IDENTITY:version=" FW_VERSION' in SOURCE
     assert '#define HW_MODEL "ES3C28P"' in SOURCE
     assert 'esp_ota_get_next_update_partition' in SOURCE
     assert 'otaExpectedSize > next->size' in SOURCE
@@ -17,12 +18,16 @@ def test_no_update_and_rate_limit_contract():
 
 
 def test_active_session_quantity_scan_and_offline_queue_wait():
-    block=SOURCE[SOURCE.index('static bool otaIdleSafe()'):SOURCE.index('static void rememberOtaBoot()')]
+    # v5.6.3: in-flight ESP data always blocks; a server-durable work session
+    # only blocks non-forced updates (behaviour unit-tested in tests/host).
+    block=SOURCE[SOURCE.index('static mfota::SafePoint otaSafePoint()'):SOURCE.index('static void otaReportWait(')]
     assert 'uiState == UiState::READY' in block
-    assert 'rt.activeSessionId <= 0' in block
-    assert 'countPendingOfflineEvents() == 0' in block
-    assert 'actionQueueCount() == 0' in block
-    assert '!hasPendingTransaction()' in block
+    assert 'rt.activeSessionId > 0' in block
+    assert 'countPendingOfflineEvents()' in block
+    assert 'actionQueueCount()' in block
+    assert 'hasPendingTransaction()' in block
+    assert 'in.longTermSession && !in.force' in POLICY
+    assert 'in.pendingTransaction || in.offlineEvents || in.actionQueue || in.offlineMode' in POLICY
 
 
 def test_download_failures_and_success_path_are_distinct():
