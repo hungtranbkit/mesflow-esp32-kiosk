@@ -102,3 +102,6 @@ with zipfile.ZipFile(pkg, "w", zipfile.ZIP_DEFLATED) as z:
 print("RELEASE", pkg)
 PY
 sha256sum "$pkg"
+# Same app bytes, packaged for the LEGACY Deploy Agent upload (production
+# 2.24.x: POST /api/esp-ota/upload accepts exactly 1 .bin + 1 *.manifest.json).
+python3 "$ROOT/tools/make_legacy_ota_zip.py" "$pkg" "$OUT/legacy"
