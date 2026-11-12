@@ -23,6 +23,7 @@
 #include "mesflow_ota_policy.h"
 #include "mesflow_keypad_policy.h"
 #include "mesflow_maintenance_policy.h"
+#include "mesflow_server_credential_policy.h"
 #include "mesflow_vietnamese_font.h"
 
 #ifndef MESFLOW_UI_SCREENSHOT
@@ -80,10 +81,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.5"
-#define FW_BUILD "20261112.0002"
+#define FW_VERSION "5.6.6"
+#define FW_BUILD "20261112.0003"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.5-KIMEX-OTA-SCOPED";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.6-KIMEX-OTA-SCOPED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -1911,6 +1912,72 @@ static bool validServerBase(const String& value) {
          value.length() >= 10 && value.length() < sizeof(SERVER_BASE);
 }
 
+// ---- Server-scoped kiosk credential (mesflow_server_credential_policy.h) ----
+// NVS "mesflow": token/station/token_srv = current credential and the server
+// that issued it; alt_srv/alt_token/alt_station = one spare credential kept
+// when the kiosk is moved to another server (e.g. production -> staging).
+bool enrollmentPending = false;
+char enrollmentCode[7] = "";
+
+static void computeEnrollmentCode(char out[7]) {
+  uint8_t digest[32];
+  mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha, 0);
+  mbedtls_sha256_update(&sha, reinterpret_cast<const unsigned char*>(DEVICE_SECRET), strlen(DEVICE_SECRET));
+  mbedtls_sha256_finish(&sha, digest); mbedtls_sha256_free(&sha);
+  mfcred::enrollmentCodeFromDigest(digest, out);
+}
+
+static void saveCurrentCredential() {
+  prefs.begin("mesflow", false);
+  if (rt.kioskToken[0]) { prefs.putString("token", rt.kioskToken); prefs.putString("token_srv", SERVER_BASE); }
+  else { prefs.remove("token"); prefs.remove("token_srv"); }
+  prefs.putString("station", STATION_CODE);
+  prefs.end();
+}
+
+// Called BEFORE SERVER_BASE is replaced by newServer. Never deletes a
+// credential: it is stashed, restored, or the change is refused.
+static bool applyServerChange(const String& newServer, String& error) {
+  prefs.begin("mesflow", true);
+  const String altSrv = prefs.getString("alt_srv", "");
+  const String altTok = prefs.getString("alt_token", "");
+  const String altSt = prefs.getString("alt_station", "");
+  prefs.end();
+  const bool busy = hasPendingTransaction() || countPendingOfflineEvents() > 0;
+  const mfcred::Switch d = mfcred::decideSwitch(SERVER_BASE, newServer.c_str(), rt.kioskToken[0] != '\0',
+                                                altSrv.c_str(), altTok.length() > 0, busy);
+  Serial.printf("[CRED] server %s -> %s: %s\n", SERVER_BASE, newServer.c_str(), mfcred::switchName(d));
+  if (d == mfcred::Switch::REFUSE_QUEUE_BUSY) {
+    error = "Còn giao dịch/sự kiện offline chưa gửi cho server hiện tại; đồng bộ xong rồi mới đổi server";
+    return false;
+  }
+  if (d == mfcred::Switch::REFUSE_SPARE_OCCUPIED) {
+    error = "Kiosk đang giữ quyền dự phòng của server " + altSrv + "; quay lại server đó trước khi chuyển sang server thứ ba";
+    return false;
+  }
+  if (d == mfcred::Switch::NO_CHANGE) return true;
+  enrollmentPending = false; enrollmentCode[0] = '\0';
+  prefs.begin("mesflow", false);
+  if (d == mfcred::Switch::STASH_AND_UNBIND) {
+    prefs.putString("alt_srv", SERVER_BASE); prefs.putString("alt_token", rt.kioskToken); prefs.putString("alt_station", STATION_CODE);
+    prefs.remove("token"); prefs.remove("token_srv");
+    rt.kioskToken[0] = '\0'; rt.bound = false;
+  } else if (d == mfcred::Switch::RESTORE_FROM_SPARE) {
+    const String curSrv(SERVER_BASE), curTok(rt.kioskToken), curSt(STATION_CODE);
+    safeCopy(rt.kioskToken, sizeof(rt.kioskToken), altTok.c_str());
+    if (altSt.length() && altSt.length() < sizeof(STATION_CODE)) safeCopy(STATION_CODE, sizeof(STATION_CODE), altSt.c_str());
+    prefs.putString("token", rt.kioskToken); prefs.putString("token_srv", newServer); prefs.putString("station", STATION_CODE);
+    if (curTok.length()) { prefs.putString("alt_srv", curSrv); prefs.putString("alt_token", curTok); prefs.putString("alt_station", curSt); }
+    else { prefs.remove("alt_srv"); prefs.remove("alt_token"); prefs.remove("alt_station"); }
+    rt.bound = true;
+  } else {  // CHANGE_UNBOUND: no current token to keep
+    prefs.remove("token_srv");
+    rt.bound = false;
+  }
+  prefs.end();
+  return true;
+}
+
 static const char* otaAgentBase() {
   // Never falls back to SERVER_BASE: MESFlow is not assumed to host Agent routes.
   return mfota::effectiveAgentBase(OTA_AGENT_BASE, otaAgentSource, SERVER_BASE);
@@ -2002,9 +2069,10 @@ static bool applyConfigJson(JsonDocument& doc, bool allowWifi, String& error) {
     copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
     copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), password);
   }
+  // Server change: stash/restore the credential per server (never delete it).
+  if (!applyServerChange(server, error)) return false;
   bool identityChanged = strcmp(STATION_CODE, station.c_str()) != 0 ||
-                         strcmp(DEVICE_ID, device.c_str()) != 0 ||
-                         strcmp(SERVER_BASE, server.c_str()) != 0;
+                         strcmp(DEVICE_ID, device.c_str()) != 0;
   copyConfigValue(SERVER_BASE, sizeof(SERVER_BASE), server);
   copyConfigValue(STATION_CODE, sizeof(STATION_CODE), station);
   copyConfigValue(DEVICE_ID, sizeof(DEVICE_ID), device);
@@ -2020,10 +2088,7 @@ static bool applyConfigJson(JsonDocument& doc, bool allowWifi, String& error) {
   }
 
   if (!saveDeviceConfig()) { error = "Không ghi được cấu hình vào NVS"; return false; }
-  prefs.begin("mesflow", false);
-  if (rt.kioskToken[0]) prefs.putString("token", rt.kioskToken); else prefs.remove("token");
-  prefs.putString("station", STATION_CODE);
-  prefs.end();
+  saveCurrentCredential();
   return true;
 }
 
@@ -2090,8 +2155,12 @@ void startSetupPortal(const char* reason) {
                 WiFi.softAPIP().toString().c_str());
 }
 
+// LAN provisioning changes Wi-Fi/server config, so it needs physical presence:
+// only while the kiosk is in maintenance (USB `maintenance confirm` / keypad).
+// Pre-5.6.6 published the token in /api/device/info and the UDP discovery
+// broadcast at all times, so anyone on the LAN could reconfigure a kiosk.
 static bool provisionAuthorized() {
-  return provisionWeb.hasHeader("X-Provision-Token") &&
+  return maintenanceMode && provisionWeb.hasHeader("X-Provision-Token") &&
          provisionWeb.header("X-Provision-Token").equalsIgnoreCase(provisionToken);
 }
 
@@ -2109,7 +2178,8 @@ static void sendDeviceInfo(WebServer& web) {
   doc["server_url"] = SERVER_BASE;
   doc["configured"] = rt.bound;
   doc["pending_offline_events"] = countPendingOfflineEvents();
-  doc["provision_token"] = provisionToken;
+  doc["maintenance"] = maintenanceMode;
+  if (maintenanceMode) doc["provision_token"] = provisionToken;  // only with physical presence
   String body; serializeJson(doc, body);
   web.send(200, "application/json", body);
 }
@@ -2205,6 +2275,7 @@ static String buildRemoteStatusText() {
     out += "RSSI     : " + String(WiFi.RSSI()) + " dBm\n";
   }
   out += "Bound    : " + String(rt.bound ? "YES" : "NO") + "\n";
+  if (enrollmentPending) out += "Enroll   : PENDING code=" + String(enrollmentCode) + "\n";
   out += "Online   : " + String(rt.online ? "YES" : "NO") + "\n";
   out += "Token    : " + maskedToken(rt.kioskToken) + "\n";
   out += "UI state : " + String(stateName(uiState)) + "\n";
@@ -2880,7 +2951,7 @@ static void broadcastDiscovery() {
   doc["http_port"] = PROVISION_HTTP_PORT;
   doc["configured"] = rt.bound;
   doc["rssi"] = WiFi.RSSI();
-  doc["provision_token"] = provisionToken;
+  if (maintenanceMode) doc["provision_token"] = provisionToken;  // only with physical presence
   char body[1024]; size_t len = serializeJson(doc, body, sizeof(body));
   IPAddress broadcast = WiFi.localIP();
   IPAddress mask = WiFi.subnetMask();
@@ -3167,6 +3238,17 @@ void drawStatusGlyph(int16_t cx, int16_t cy, uint16_t color, char glyph) {
 
 void drawReady(uint8_t frame = 0) {
   (void)frame;
+  if (!rt.bound && enrollmentPending && enrollmentCode[0]) {
+    // Fresh server: the admin approves THIS kiosk by matching this code on
+    // /kiosk-management. Not a secret (derived from a hash, shown on both sides).
+    tft.fillScreen(C_BG);
+    drawIndustrialHeader(C_WARN);
+    drawPageTitle("CHỜ DUYỆT KIOSK", C_WARN);
+    drawCenteredTextFit(enrollmentCode, SCREEN_LEFT_MARGIN, 110, 216, 48, FONT_VALUE, FONT_VALUE - 1, 1, C_TEXT, true);
+    drawCenteredTextFit("Duyệt mã này tại Quản lý kiosk", SCREEN_LEFT_MARGIN, 176, 216, 36, FONT_HEADER, FONT_HEADER, 2, C_MUTED);
+    drawFooter("", "");
+    return;
+  }
   tft.fillScreen(C_BG);
   drawIndustrialHeader(rt.online ? C_OK : C_ERR);
   drawPageTitle(rt.online ? "QUÉT THẺ NHÂN VIÊN" : "MẤT KẾT NỐI", rt.online ? C_TEXT : C_ERR);
@@ -3335,6 +3417,13 @@ static void handleMaintenanceApiUrl() {
   String otaUrl = doc["ota_agent_url"] | ""; otaUrl.trim();
   if (!validServerBase(url)) {
     maintenanceWeb.send(400, "application/json", "{\"ok\":false,\"message\":\"API URL khong hop le\"}"); return;
+  }
+  {
+    String credError;
+    if (!applyServerChange(url, credError)) {
+      DynamicJsonDocument out(512); out["ok"] = false; out["message"] = credError; String o; serializeJson(out, o);
+      maintenanceWeb.send(409, "application/json", o); return;
+    }
   }
   safeCopy(SERVER_BASE, sizeof(SERVER_BASE), url.c_str());
   if (otaUrl.length() == 0 || otaUrl.startsWith("https://")) {
@@ -4464,6 +4553,16 @@ bool bindKiosk() {
   const bool bindPosted = httpPostJson("/api/kiosk/connect", request, response, false);
   suppressNetworkUiErrors = previousSuppress;
   if (!bindPosted) {
+    const char* errCode = response["error"] | "";
+    if (rt.lastHttpStatus == 403 && strcmp(errCode, "KIOSK_ENROLLMENT_PENDING") == 0) {
+      char local[7]; computeEnrollmentCode(local);
+      const char* serverCode = response["enrollment_code"] | "";
+      const bool changed = !enrollmentPending || strcmp(enrollmentCode, local) != 0;
+      enrollmentPending = true; safeCopy(enrollmentCode, sizeof(enrollmentCode), local);
+      Serial.printf("[BIND] ENROLLMENT_PENDING code=%s server_code=%s%s\n", local, serverCode,
+                    strcmp(local, serverCode) == 0 ? "" : " (KHAC MA: khong duyet!)");
+      if (changed && (uiState == UiState::READY || uiState == UiState::OFFLINE)) redrawProductionUi();
+    }
     Serial.println("[BIND] That bai; kiosk van vao READY va se thu lai nen.");
     remoteLogf("BIND failed HTTP=%d error=%s", rt.lastHttpStatus, rt.lastError);
     if (showBindingScreen) setUi(UiState::READY);
@@ -4484,11 +4583,8 @@ bool bindKiosk() {
   if (assignedStation[0]) safeCopy(STATION_CODE, sizeof(STATION_CODE), assignedStation);
   if (assignedName[0]) safeCopy(DEVICE_NAME, sizeof(DEVICE_NAME), assignedName);
   rt.bound = true;
-
-  prefs.begin("mesflow", false);
-  prefs.putString("token", rt.kioskToken);
-  prefs.putString("station", STATION_CODE);
-  prefs.end();
+  enrollmentPending = false; enrollmentCode[0] = '\0';
+  saveCurrentCredential();  // token + the server that issued it
   // Keep the server-approved station consistent across both existing NVS namespaces.
   // This is a persistence fix only; Multi-OP and scanner logic are unchanged.
   if (!saveDeviceConfig()) {
@@ -5396,6 +5492,7 @@ static void consolePrintStatus() {
     Serial.printf("RSSI     : %d dBm\n", WiFi.RSSI());
   }
   Serial.printf("Bound    : %s\n", rt.bound ? "YES" : "NO");
+  if (enrollmentPending) Serial.printf("Enroll   : PENDING code=%s\n", enrollmentCode);
   Serial.printf("Token    : %s\n", rt.kioskToken[0] ? "STORED" : "EMPTY");
   Serial.printf("Pending  : %s\n", hasPendingTransaction() ? "YES" : "NO");
   Serial.printf("OfflineQ : %u\n", countPendingOfflineEvents());
@@ -5475,6 +5572,7 @@ static void consoleClearToken() {
   Preferences temp;
   temp.begin("mesflow", false);
   temp.remove("token");
+  temp.remove("token_srv");
   temp.end();
   rt.kioskToken[0] = '\0';
   rt.bound = false;
@@ -7026,10 +7124,17 @@ void setup() {
   else { loadOfflineStorage(); recoverOfflineSessionIntents(); compactEventLogIfDrained(); }
   loadPendingTransaction();
 
-  if (storedToken.length() && storedStation == STATION_CODE) {
+  prefs.begin("mesflow", true);
+  const String storedTokenServer = prefs.getString("token_srv", "");
+  prefs.end();
+  if (storedToken.length() && storedStation == STATION_CODE &&
+      mfcred::tokenUsableFor(true, storedTokenServer.c_str(), SERVER_BASE)) {
     safeCopy(rt.kioskToken, sizeof(rt.kioskToken), storedToken.c_str());
     rt.bound = true;
+    if (!storedTokenServer.length()) saveCurrentCredential();  // pre-5.6.6 NVS: record issuing server once
     Serial.println("Da nap kiosk token tu NVS.");
+  } else if (storedToken.length()) {
+    Serial.println("[CRED] Token trong NVS thuoc server khac; chua bind voi server hien tai (token van duoc giu).");
   }
 
   if (!WIFI_SSID[0]) {

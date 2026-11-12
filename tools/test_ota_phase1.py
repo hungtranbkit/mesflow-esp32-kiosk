@@ -5,7 +5,7 @@ POLICY=(Path(__file__).parents[1]/"esp/mesflow_ota_policy.h").read_text()
 
 
 def test_identity_and_partition_safe_contract():
-    assert '#define FW_VERSION "5.6.5"' in SOURCE
+    assert '#define FW_VERSION "5.6.6"' in SOURCE
     assert 'MESFLOW_FW_IDENTITY:version=" FW_VERSION' in SOURCE
     assert '#define HW_MODEL "ES3C28P"' in SOURCE
     assert 'esp_ota_get_next_update_partition' in SOURCE
