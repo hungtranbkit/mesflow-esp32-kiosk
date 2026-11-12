@@ -21,6 +21,7 @@
 #include <mbedtls/sha256.h>
 #include <esp_task_wdt.h>
 #include "mesflow_ota_policy.h"
+#include "mesflow_keypad_policy.h"
 #include "mesflow_vietnamese_font.h"
 
 #ifndef MESFLOW_UI_SCREENSHOT
@@ -78,10 +79,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.3"
-#define FW_BUILD "20261111.0001"
+#define FW_VERSION "5.6.4"
+#define FW_BUILD "20261112.0001"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.3-KIMEX-OTA-SCOPED";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.4-KIMEX-OTA-SCOPED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -2142,7 +2143,6 @@ static void forceSetupOnNextBoot();
 static void consoleClearToken();
 static void consoleClearCache();
 static void consoleClearOffline();
-static void clearKeypadCalibration();
 bool bindKiosk();
 bool sendHeartbeat();
 bool syncPendingTransaction(bool userInitiated);
@@ -5431,11 +5431,6 @@ static void clearNamespace(const char* name) {
   temp.end();
 }
 
-static void clearKeypadCalibration() {
-  clearNamespace(KEYPAD_NVS_NAMESPACE);
-  keypadMappingReady = false;
-  Serial.println("[KEYPAD] Da xoa mapping khoi NVS.");
-}
 
 static void forceSetupOnNextBoot() {
   // An empty key must be stored. Merely removing it would make loadDeviceConfig()
@@ -6051,25 +6046,33 @@ static void drawKeypadCalibration(uint8_t index, const char* note, uint16_t acce
   printCenteredFit("BẤM VÀ THẢ TỪNG PHÍM", 270, 1, C_MUTED, false);
 }
 
-static void waitKeypadRelease() {
+// Bounded: false when a key stays pressed past the idle timeout.
+static bool waitKeypadRelease() {
   uint32_t stableSince = 0;
+  const uint32_t started = millis();
   while (true) {
+    esp_task_wdt_reset();
     const int pair = scanKeypadPair();
     if (pair == -1) {
       if (stableSince == 0) stableSince = millis();
-      if (millis() - stableSince >= 100) return;
+      if (millis() - stableSince >= 100) return true;
     } else {
       stableSince = 0;
     }
+    if (mfkp::calibrationTimedOut(started, millis())) return false;
     delay(10);
   }
 }
 
+// Bounded: returns -4 when no stable key arrives within the idle timeout.
 static int waitStableKeypadPair() {
   int candidate = -1;
   uint32_t stableSince = 0;
   uint32_t lastWarningAt = 0;
+  const uint32_t started = millis();
   while (true) {
+    esp_task_wdt_reset();
+    if (mfkp::calibrationTimedOut(started, millis())) return -4;
     const int pair = scanKeypadPair();
     if (pair >= 0) {
       if (pair != candidate) {
@@ -6091,15 +6094,23 @@ static int waitStableKeypadPair() {
   }
 }
 
+// Explicit (maintenance/serial) calibration only. Bounded: aborts after
+// CALIBRATION_IDLE_TIMEOUT_MS without key activity or CALIBRATION_MAX_ROUNDS
+// invalid matrices. Works on a scratch copy; on any failure the mapping that
+// is stored in NVS (if any) is reloaded unchanged -- never a partial/fake map.
 static bool calibrateKeypadInteractive() {
   Serial.println("[KEYPAD CAL] Bat dau hieu chinh 12 phim; bam va tha theo man hinh.");
-  while (true) {
+  keypadMappingReady = false;  // no key is interpreted while calibrating
+  bool valid = false;
+  bool timedOut = false;
+  for (uint8_t round = 0; round < mfkp::CALIBRATION_MAX_ROUNDS && !valid && !timedOut; ++round) {
     memset(keypadPairs, 0xFF, sizeof(keypadPairs));
-    waitKeypadRelease();
-    for (uint8_t index = 0; index < KEYPAD_KEY_COUNT; ++index) {
+    if (!waitKeypadRelease()) { timedOut = true; break; }
+    for (uint8_t index = 0; index < KEYPAD_KEY_COUNT && !timedOut; ++index) {
       while (true) {
         drawKeypadCalibration(index, "DANG CHO PHIM");
         const int pair = waitStableKeypadPair();
+        if (pair == -4) { timedOut = true; break; }
         bool duplicate = false;
         for (uint8_t previous = 0; previous < index; ++previous) {
           if (keypadPairs[previous] == static_cast<uint8_t>(pair)) duplicate = true;
@@ -6109,7 +6120,7 @@ static bool calibrateKeypadInteractive() {
           printKeypadPair(static_cast<uint8_t>(pair));
           Serial.println("; bam lai dung phim.");
           drawKeypadCalibration(index, "TRUNG PHIM - BAM LAI", C_ERR);
-          waitKeypadRelease();
+          if (!waitKeypadRelease()) { timedOut = true; break; }
           delay(500);
           continue;
         }
@@ -6117,18 +6128,25 @@ static bool calibrateKeypadInteractive() {
         Serial.printf("[KEYPAD CAL] %c = ", keypadCalibrationKeys[index]);
         printKeypadPair(keypadPairs[index]);
         Serial.println();
-        waitKeypadRelease();
+        if (!waitKeypadRelease()) timedOut = true;
         break;
       }
     }
-    if (validateKeypadMapping()) break;
-    Serial.println("[KEYPAD CAL] Cau truc khong phai ma tran 3x4; thu lai tu dau.");
-    drawSimple("HIỆU CHỈNH LỖI", "SAI MA TRẬN 3X4", "KIỂM TRA DÂY", "THỬ LẠI", C_ERR);
-    delay(1800);
+    if (timedOut) break;
+    valid = validateKeypadMapping();
+    if (!valid) {
+      Serial.println("[KEYPAD CAL] Cau truc khong phai ma tran 3x4; thu lai tu dau.");
+      drawSimple("HIỆU CHỈNH LỖI", "SAI MA TRẬN 3X4", "KIỂM TRA DÂY", "THỬ LẠI", C_ERR);
+      delay(1800);
+    }
   }
-  if (!saveKeypadMapping()) {
-    Serial.println("[KEYPAD CAL] Khong luu duoc mapping vao NVS.");
-    drawSimple("HIỆU CHỈNH LỖI", "KHÔNG LƯU ĐƯỢC", "KIỂM TRA NVS", "", C_ERR);
+  if (!valid || !saveKeypadMapping()) {
+    const bool restored = loadKeypadMapping();  // previous NVS mapping, untouched
+    Serial.printf("[KEYPAD CAL] %s; giu mapping cu=%s.\n",
+                  timedOut ? "Het thoi gian cho phim" : (valid ? "Khong luu duoc mapping vao NVS" : "Sai ma tran 3x4 qua nhieu lan"),
+                  restored ? "CO" : "KHONG (keypad tat)");
+    drawSimple("HIỆU CHỈNH DỪNG", timedOut ? "HẾT GIỜ CHỜ PHÍM" : "KHÔNG HOÀN TẤT",
+               restored ? "GIỮ MAPPING CŨ" : "KEYPAD TẠM TẮT", "", C_ERR);
     delay(1800);
     return false;
   }
@@ -6187,7 +6205,8 @@ static void serviceRuntimeKeypadCalibration() {
   demoDefectQty = 0;
   keypadNumberLength = 0;
   keypadNumberBuffer[0] = '\0';
-  clearKeypadCalibration();
+  // The stored mapping is NOT wiped here: calibration works on a scratch copy
+  // and reloads it if the operator does not finish.
   keypadReleaseAll();
 
   drawSimple("HIỆU CHỈNH KEYPAD", "TẠM KHÓA THAO TÁC", "LÀM THEO MÀN HÌNH", "KHÔNG TẮT NGUỒN", C_INFO);
@@ -6210,7 +6229,8 @@ static void serviceRuntimeKeypadCalibration() {
   if (calibrated) {
     Serial.println("[KEYPAD CAL] Hieu chinh runtime thanh cong; kiosk da tro ve READY.");
   } else {
-    Serial.println("[KEYPAD CAL] Hieu chinh runtime that bai; keypad bi vo hieu hoa.");
+    Serial.printf("[KEYPAD CAL] Hieu chinh runtime khong hoan tat; keypad=%s.\n",
+                  keypadMappingReady ? "MAPPING CU" : "TAT (can hieu chinh qua maintenance)");
   }
 }
 
@@ -6238,9 +6258,12 @@ bool initKeypad() {
   }
   keypadAvailable = true;
   keypadReleaseAll();
-  if (!loadKeypadMapping()) {
-    Serial.println("[KEYPAD] Chua co mapping hop le; mo hieu chinh tren LCD.");
-    calibrateKeypadInteractive();
+  loadKeypadMapping();
+  if (!mfkp::keypadInputEnabled(mfkp::bootKeypadState(keypadAvailable, keypadMappingReady))) {
+    // Never block boot on calibration: Wi-Fi, MESFlow, OTA and the GM65 scanner
+    // must come up. Calibrate later via maintenance ("keypad-calibrate").
+    Serial.println("[KEYPAD] Chua co mapping hop le -> keypad TAT; Wi-Fi/OTA/scanner van chay. "
+                   "Hieu chinh qua maintenance: keypad-calibrate.");
   }
   keypadCandidatePair = -1;
   keypadEmittedPair = -1;
@@ -6542,18 +6565,21 @@ static void serviceKeypadPresence() {
         keypadReleaseAll();
         keypadCandidatePair = -1;
         keypadEmittedPair = -1;
-        Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong) -> hieu chinh lai vi tri phim.\n", address);
-        markKeypadNeedsCalibration("KEYPAD_ATTACHED");
+        // Reuse the stored mapping; without one the keypad stays disabled
+        // until an explicit maintenance calibration (never automatic).
+        const bool mapped = loadKeypadMapping();
+        Serial.printf("[KEYPAD] Phat hien PCF8574T=0x%02X (cam nong); mapping=%s.\n", address,
+                      mapped ? "CU" : "CHUA CO (keypad tat)");
+        if (!mapped) markKeypadNeedsCalibration("KEYPAD_ATTACHED");
         break;
       }
     }
     return;
   }
   if (!keypadMappingReady && !keypadWantsCalibration) markKeypadNeedsCalibration("NO_MAPPING");
-  if (keypadWantsCalibration && uiState == UiState::READY && !keypadCalibrationRequested &&
-      !keypadCalibrationInProgress && !hasPendingTransaction()) {
-    if (requestRuntimeKeypadCalibration(keypadCalibrationReason)) keypadWantsCalibration = false;
-  }
+  // Status only (console/heartbeat show NEEDS CALIBRATION). Calibration is
+  // started exclusively by an explicit maintenance/serial request.
+  if (keypadMappingReady && keypadWantsCalibration && strcmp(keypadCalibrationReason, "UNKNOWN_KEY_PAIR") != 0) keypadWantsCalibration = false;
 }
 
 void serviceKeypad() {
