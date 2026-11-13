@@ -4396,7 +4396,7 @@ bool httpPostJson(const char* path,
   }
 
   Serial.printf("\n[POST] %s\n", url);
-  Serial.println(body);
+  // Enrollment requests contain device_secret; never print request bodies.
 
   int lastStatus = 0;
   String lastMessage = "Ket noi API that bai";
@@ -5028,7 +5028,20 @@ static bool otaEvent(const char* status, const char* errorCode = "", const char*
   // matches the pinned artifact's build/profile.
   req["build_id"] = FW_BUILD_ID;
   req["hardware_profile"] = HW_PROFILE[0] ? HW_PROFILE : otaTargetProfile;
-  char cid[20]; snprintf(cid, sizeof(cid), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+  char cid[65];
+  if (otaBootReportPending) {
+    // Stable across retries/reboots: a lost HTTP response must not lose the
+    // server's applied decision (also for rollback and legacy bootstrap).
+    const String key = String(otaTargetId) + ":" + otaFirmwareId + ":" + otaClaimId + ":" + status;
+    uint8_t digest[32];
+    mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha, 0);
+    mbedtls_sha256_update(&sha, reinterpret_cast<const unsigned char*>(key.c_str()), key.length());
+    mbedtls_sha256_finish(&sha, digest); mbedtls_sha256_free(&sha);
+    for (uint8_t i = 0; i < 32; ++i) sprintf(cid + i * 2, "%02x", digest[i]);
+    cid[64] = '\0';
+  } else {
+    snprintf(cid, sizeof(cid), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+  }
   req["client_event_id"] = cid;
   req["status"] = status; req["error_code"] = errorCode; req["message"] = message;
   req["timestamp"] = currentEpoch();
@@ -5036,7 +5049,8 @@ static bool otaEvent(const char* status, const char* errorCode = "", const char*
   suppressNetworkUiErrors = true;  // background OTA never hijacks the LCD (no ERROR_STATE)
   const bool ok = httpPostJson("/api/esp-ota/event", req, resp, true, false, base);
   suppressNetworkUiErrors = previousSuppress;
-  return ok;
+  return mfota::eventAcknowledged(ok, resp["ok"] | false,
+                                  resp.containsKey("applied"), resp["applied"] | false);
 }
 
 static mfota::SafePoint otaSafePoint() {

@@ -80,6 +80,12 @@ static void safePoint() {
 
 int main() {
   versions(); origins(); agentBase(); image(); safePoint();
+  CHECK(!eventAcknowledged(false, true, true, true));
+  CHECK(!eventAcknowledged(true, false, true, true));
+  CHECK(!eventAcknowledged(true, true, true, false));
+  CHECK(eventAcknowledged(true, true, true, true));
+  CHECK(eventAcknowledged(true, true, false, false)); // legacy Agent: no applied field
+
   std::printf("%d/%d checks passed\n", total - fails, total);
   return fails ? 1 : 0;
 }

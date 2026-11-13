@@ -8,6 +8,13 @@
 
 namespace mfota {
 
+// v2 separates receiving an event from applying it. Legacy Agents omit
+// applied; keep their ok response compatible during migration.
+inline bool eventAcknowledged(bool transported, bool ok, bool hasApplied, bool applied) {
+  return transported && ok && (!hasApplied || applied);
+}
+
+
 // The compiled default of firmware <= 5.6.2. Kept ONLY to recognise legacy
 // NVS values; it is never a default for a new install any more.
 static const char LEGACY_DEFAULT_AGENT[] = "https://deploy.mesflow.net/agent";
