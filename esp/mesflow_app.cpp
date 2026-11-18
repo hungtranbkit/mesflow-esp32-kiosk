@@ -6512,7 +6512,8 @@ static bool startKeypadTestMode() {
       keypadCalibrationInProgress || maintenanceMode || setupPortalActive ||
       uiState != UiState::READY || hasPendingTransaction()) return false;
   keypadTestActive = true;
-  keypadTestPage = 0; keypadTestDemoPage = 0;
+  keypadTestPage = keypadMappingReady ? 1 : 0;  // Ready keypad starts on number entry, not raw I2C.
+  keypadTestDemoPage = 0;
   keypadTestDigits[0] = '\0'; keypadTestDigitCount = 0;
   keypadTestRawPair = -1; keypadTestRawLatch = -1;
   keypadTestLastKey = '-'; keypadTestPressCount = 0;

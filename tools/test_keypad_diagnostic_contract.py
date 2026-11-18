@@ -38,3 +38,8 @@ def test_test_state_no_mesflow_event_calls():
     for forbidden in ("emitActionEvent(", "sendHeartbeat(", "handleSerialLine(",
                       "syncPendingTransaction(", "startSession(", "finishSession("):
         assert forbidden not in body
+
+
+def test_mapped_keypad_starts_on_number_input_page():
+    body = section("static bool startKeypadTestMode() {", "static void stopKeypadTestMode() {")
+    assert "keypadTestPage = keypadMappingReady ? 1 : 0;" in body
