@@ -256,6 +256,8 @@ static uint32_t keypadTestLastActivity = 0;
 static uint32_t keypadTestPressCount = 0;
 static int keypadTestRawPair = -1;
 static int keypadTestRawLatch = -1;
+static uint32_t keypadTestRawLastPoll = 0;
+static uint32_t keypadTestLastI2cWarning = 0;
 static char keypadTestLastKey = '-';
 bool keypadMappingReady = false;
 uint8_t keypadAddress = 0;
@@ -6870,6 +6872,10 @@ void serviceKeypad() {
   keypadLastPollAt = millis();
   if (!keypadMappingReady) {
     if (!keypadTestActive) return;
+    // Raw scanning is for human diagnostics only; 8 I2C round-trips at 12ms
+    // starve the single-threaded HTTP server on some ESP32-S3 boards.
+    if (millis() - keypadTestRawLastPoll < 85) return;
+    keypadTestRawLastPoll = millis();
     const int raw = scanKeypadPair();
     if (raw == -1) keypadTestRawLatch = -1;
     else if (raw >= 0 && raw != keypadTestRawLatch) {
@@ -6877,7 +6883,11 @@ void serviceKeypad() {
       ++keypadTestPressCount; keypadTestLastActivity = millis();
       Serial.printf("[KEYPAD TEST] RAW P%d-P%d\n", raw >> 4, raw & 15);
       drawKeypadTestMode();
-    } else if (raw == -3) Serial.println("[KEYPAD TEST] I2C READ ERROR");
+    } else if (raw == -3 && millis() - keypadTestLastI2cWarning > 5000) {
+      keypadTestLastI2cWarning = millis();
+      Serial.println("[KEYPAD TEST] I2C READ ERROR");
+    }
+    yield();
     return;
   }
 

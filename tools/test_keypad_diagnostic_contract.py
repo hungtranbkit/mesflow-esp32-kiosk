@@ -21,6 +21,8 @@ def test_unmapped_raw_scan_and_timeout():
     assert "if (!keypadTestActive) return;" in runner
     assert "scanKeypadPair()" in runner
     assert "10UL * 60UL * 1000UL" in runner
+    assert "keypadTestRawLastPoll < 85" in runner
+    assert "keypadTestLastI2cWarning > 5000" in runner
 
 def test_maintenance_and_lan_controls():
     assert 'cmd == "keypad-test confirm"' in SOURCE
