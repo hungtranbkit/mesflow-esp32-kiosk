@@ -6507,6 +6507,22 @@ static void drawKeypadTestMode() {
     drawSimple("TEST HOAN TAT", a, b, "# THOAT | * QUAY LAI", C_OK);
   }
 }
+// Update only the LCD value area; a full-screen redraw per key can hide
+// fast presses while SPI operations hold the single-threaded loop.
+static void drawKeypadTestNumberValue() {
+  if (!keypadTestActive || keypadTestPage != 1) return;
+  char number[84], last[84];
+  snprintf(number, sizeof(number), "NHAP: %s",
+           keypadTestDigitCount ? keypadTestDigits : "_");
+  snprintf(last, sizeof(last), "PHIM CUOI: %c | LAN %lu",
+           keypadTestLastKey, (unsigned long)keypadTestPressCount);
+  tft.fillRect(SCREEN_LEFT_MARGIN, 125, 216, 101, C_BG);
+  drawCenteredTextFit(number, SCREEN_LEFT_MARGIN, 128, 216, 42,
+                      FONT_SECTION, FONT_SECTION - 1, 2, C_TEXT, true);
+  drawCenteredTextFit(last, SCREEN_LEFT_MARGIN, 180, 216, 38,
+                      FONT_SECTION, FONT_SECTION - 1, 2, C_MUTED);
+}
+
 static bool startKeypadTestMode() {
   if (!keypadAvailable || keypadAddress == 0 || keypadCalibrationRequested ||
       keypadCalibrationInProgress || maintenanceMode || setupPortalActive ||
@@ -6531,6 +6547,7 @@ static void stopKeypadTestMode() {
 }
 static void handleKeypadTestKey(char key) {
   if (!keypadTestActive) return;
+  const uint8_t formerPage = keypadTestPage;
   keypadTestLastActivity = millis();
   keypadTestLastKey = key;
   ++keypadTestPressCount;
@@ -6553,7 +6570,10 @@ static void handleKeypadTestKey(char key) {
     if (key == '#') { stopKeypadTestMode(); return; }
     if (key == '*') keypadTestPage = 2;
   }
-  drawKeypadTestMode();
+  if (formerPage == 1 && keypadTestPage == 1)
+    drawKeypadTestNumberValue();
+  else
+    drawKeypadTestMode();
 }
 
 static bool detectBootWifiSetupShortcut() {
@@ -7367,6 +7387,14 @@ void loop() {
   servicePendingWebCommand();
   readSerialCommands();
   serviceRuntimeKeypadCalibration();
+  if (keypadTestActive) {
+    // An active hardware test must keep the keypad responsive and the test
+    // screen visible, even if MESFlow is unconfigured or unreachable.
+    // Never perform remote bind/heartbeat/sync or production UI redraw here.
+    serviceKeypad();
+    delay(2);
+    return;
+  }
   readScannerCommands();
   serviceKeypad();
   handleTouch();

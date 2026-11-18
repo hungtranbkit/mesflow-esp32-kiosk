@@ -43,3 +43,18 @@ def test_test_state_no_mesflow_event_calls():
 def test_mapped_keypad_starts_on_number_input_page():
     body = section("static bool startKeypadTestMode() {", "static void stopKeypadTestMode() {")
     assert "keypadTestPage = keypadMappingReady ? 1 : 0;" in body
+
+
+def test_test_loop_isolation_from_mes_and_ready_redraw():
+    body = section("void loop() {", "serviceStateWatchdog();")
+    assert "if (keypadTestActive) {" in body
+    assert "serviceKeypad();" in body.split("if (keypadTestActive) {",1)[1]
+    assert "return;" in body.split("if (keypadTestActive) {",1)[1]
+    assert "maintainConnection();" not in body.split("if (keypadTestActive) {",1)[1].split("return;",1)[0]
+
+def test_number_entry_uses_fast_partial_lcd_redraw():
+    body = section("static void handleKeypadTestKey(char key) {", "static bool detectBootWifiSetupShortcut() {")
+    assert "drawKeypadTestNumberValue()" in body
+    draw = section("static void drawKeypadTestNumberValue() {", "static bool startKeypadTestMode() {")
+    assert "tft.fillRect" in draw
+    assert "tft.fillScreen" not in draw
