@@ -18,6 +18,7 @@
 //  * maintenance ends by itself after MAINTENANCE_IDLE_TIMEOUT_MS without
 //    activity, so a board is never left with the config page open.
 #include <stdint.h>
+#include <string.h>
 
 namespace mfmt {
 
@@ -70,7 +71,19 @@ inline bool allowedDuringMaintenance(const char* lowerTrimmed) {
     while (*a && *a == *b) { ++a; ++b; }
     if (!*a && !*b) return true;
   }
-  return false;
+  const char prefix[] = "usb-provision-proof ";
+  const char* a=prefix; const char* b=lowerTrimmed;
+  while (*a && *a==*b) { ++a; ++b; }
+  if (!*a && *b && strlen(b)==64) {
+    for (;*b;++b) if (!( (*b>='0'&&*b<='9') || (*b>='a'&&*b<='f') )) return false;
+    return true;
+  }
+  const char commitPrefix[] = "usb-provision-commit ";
+  a=commitPrefix; b=lowerTrimmed;
+  while (*a && *a==*b) { ++a; ++b; }
+  if (*a || strlen(b)!=16 || strncmp(b,"esp32-kiosk-",12)!=0) return false;
+  for (size_t i=12;i<16;i++) if (!( (b[i]>='0'&&b[i]<='9') || (b[i]>='a'&&b[i]<='f') )) return false;
+  return true;
 }
 
 static const uint32_t MAINTENANCE_IDLE_TIMEOUT_MS = 10UL * 60UL * 1000UL;

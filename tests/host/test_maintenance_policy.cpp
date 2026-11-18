@@ -28,6 +28,11 @@ int main() {
   CHECK(allowedDuringMaintenance("maintenance exit"));
   CHECK(allowedDuringMaintenance("status"));
   CHECK(allowedDuringMaintenance("help"));
+  CHECK(allowedDuringMaintenance("usb-provision-proof 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+  CHECK(!allowedDuringMaintenance("usb-provision-proof short"));
+  CHECK(!allowedDuringMaintenance("usb-provision-proof 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"));
+  CHECK(allowedDuringMaintenance("usb-provision-commit esp32-kiosk-396c"));
+  CHECK(!allowedDuringMaintenance("usb-provision-commit esp32-kiosk-39xz"));
   CHECK(!allowedDuringMaintenance("factory-reset"));
   CHECK(!allowedDuringMaintenance("clear-offline"));
   CHECK(!allowedDuringMaintenance("WF|EMP|E001"));

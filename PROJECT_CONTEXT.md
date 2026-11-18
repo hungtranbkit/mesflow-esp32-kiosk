@@ -1,5 +1,14 @@
 # PROJECT_CONTEXT — esp-kiosk (legacy ESP32-S3 kiosk, "v1")
 
+## Issue #51 handoff — USB-scoped provisioning (2026-11-18)
+
+- Modified the existing PR #2 branch `feat/esp-ota-force-scoped-20261111` in isolated worktree `/home/dell/workspace/mesflow-esp32-kiosk-issue51`.
+- Added pure policy `esp/mesflow_usb_provision_policy.h` and host regression `tests/host/test_usb_provision_policy.cpp`; maintenance console accepts only a well-formed proof challenge and derived ID commit. Proof HMAC binds UUID/MAC/device ID/station/FW and is emitted over USB. NVS device ID commits only after server acceptance, with read-back and rollback. Serial RX redacts both provisioning commands. Wi-Fi/station/server/UUID/token/journal/OTA config remain unchanged.
+- Host C++ checks: USB policy 18/18; maintenance 32/32; OTA 35/35; keypad 19/19; credential 18/18. No PlatformIO/full firmware build available; no board flashed or rebooted.
+- Backend companion is MESFlow Issue #51, stacked on PR #50. Do not use this firmware command without server migration/routes. Production unchanged; no real USB, TLS proxy or live heartbeat verified. Fleet OTA remains OFF; no board/canary touched.
+
+
+
 Living handoff for the next agent. Code/tests/git/runtime evidence win over these notes.
 
 ## Current state (2026-10-07)

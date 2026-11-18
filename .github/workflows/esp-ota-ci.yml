@@ -25,6 +25,8 @@ jobs:
           /tmp/test_keypad_policy
           g++ -std=c++17 -Wall -Wextra -Werror -I esp tests/host/test_maintenance_policy.cpp -o /tmp/test_maintenance_policy
           /tmp/test_maintenance_policy
+          g++ -std=c++17 -Wall -Wextra -Werror -I esp tests/host/test_usb_provision_policy.cpp -o /tmp/test_usb_provision_policy
+          /tmp/test_usb_provision_policy
           g++ -std=c++17 -Wall -Wextra -Werror -I esp tests/host/test_server_credential_policy.cpp -o /tmp/test_server_credential_policy
           /tmp/test_server_credential_policy
       - name: Python tools tests (OTA phase1, offline queue, release verifier)

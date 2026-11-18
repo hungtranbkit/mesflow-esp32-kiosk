@@ -19,11 +19,13 @@
 #include <esp_ota_ops.h>
 #include <Update.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
 #include <esp_task_wdt.h>
 #include "mesflow_ota_policy.h"
 #include "mesflow_keypad_policy.h"
 #include "mesflow_maintenance_policy.h"
 #include "mesflow_server_credential_policy.h"
+#include "mesflow_usb_provision_policy.h"
 #include "mesflow_vietnamese_font.h"
 
 #ifndef MESFLOW_UI_SCREENSHOT
@@ -1925,6 +1927,70 @@ static void computeEnrollmentCode(char out[7]) {
   mbedtls_sha256_update(&sha, reinterpret_cast<const unsigned char*>(DEVICE_SECRET), strlen(DEVICE_SECRET));
   mbedtls_sha256_finish(&sha, digest); mbedtls_sha256_free(&sha);
   mfcred::enrollmentCodeFromDigest(digest, out);
+}
+
+// USB physical-presence attestation. The device secret is reduced to the
+// same SHA-256 key stored by MESFlow; only a challenge-bound HMAC leaves USB.
+static bool handleUsbProvisionProof(const String& challenge) {
+  if (!mfusb::isHex64(challenge.c_str()) ||
+      !mfusb::mayProvision(maintenanceMode, enrollmentPending, rt.bound,
+        uiState==UiState::READY || uiState==UiState::OFFLINE,
+        hasPendingTransaction(), countPendingOfflineEvents()>0) ||
+      otaInstallInProgress || !DEVICE_UUID[0] || !DEVICE_SECRET[0]) {
+    Serial.println("[USB-PROVISION] Tu choi: kiosk khong o trang thai enrollment an toan.");
+    return false;
+  }
+  char mac[18], desiredId[32];
+  String rawMac=WiFi.macAddress();
+  if (!mfusb::canonicalMac(rawMac.c_str(),mac) || !mfusb::deriveDeviceId(mac,desiredId) ||
+      !mfusb::factoryOrSameId(DEVICE_ID,desiredId)) {
+    Serial.println("[USB-PROVISION] Tu choi: Device ID hien tai khong the doi an toan.");
+    return false;
+  }
+  uint8_t key[32],macDigest[32];
+  mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha,0);
+  mbedtls_sha256_update(&sha,reinterpret_cast<const unsigned char*>(DEVICE_SECRET),strlen(DEVICE_SECRET));
+  mbedtls_sha256_finish(&sha,key); mbedtls_sha256_free(&sha);
+  String message=String("MESFLOW-KIOSK-USB-ENROLLMENT-V1\n")+DEVICE_UUID+"\n"+challenge+"\n"+
+    mac+"\n"+desiredId+"\n"+STATION_CODE+"\n"+FW_VERSION;
+  const mbedtls_md_info_t* md=mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!md || mbedtls_md_hmac(md,key,sizeof(key),
+      reinterpret_cast<const unsigned char*>(message.c_str()),message.length(),macDigest)!=0) {
+    memset(key,0,sizeof(key));
+    Serial.println("[USB-PROVISION] Khong tao duoc proof."); return false;
+  }
+  memset(key,0,sizeof(key));
+  char proof[65]; for(size_t i=0;i<32;i++) snprintf(proof+i*2,3,"%02x",macDigest[i]);
+  DynamicJsonDocument doc(512); doc["type"]="mesflow_usb_proof"; doc["device_uuid"]=DEVICE_UUID;
+  doc["device_id"]=desiredId; doc["mac_address"]=mac; doc["station_code"]=STATION_CODE;
+  doc["firmware_version"]=FW_VERSION; doc["proof"]=proof;
+  Serial.print("MESFLOW_USB_PROOF:"); serializeJson(doc,Serial); Serial.println();
+  memset(proof,0,sizeof(proof)); memset(macDigest,0,sizeof(macDigest));
+  return true;
+}
+
+static bool handleUsbProvisionCommit(const String& requestedId) {
+  if (!mfusb::mayProvision(maintenanceMode,enrollmentPending,rt.bound,
+      uiState==UiState::READY || uiState==UiState::OFFLINE,
+      hasPendingTransaction(),countPendingOfflineEvents()>0) || otaInstallInProgress || !DEVICE_UUID[0]) {
+    Serial.println("[USB-PROVISION] Tu choi commit: kiosk khong o trang thai enrollment an toan."); return false;
+  }
+  char mac[18],desiredId[32]; String rawMac=WiFi.macAddress();
+  if (!mfusb::canonicalMac(rawMac.c_str(),mac) || !mfusb::deriveDeviceId(mac,desiredId) ||
+      requestedId!=desiredId || !mfusb::factoryOrSameId(DEVICE_ID,desiredId)) {
+    Serial.println("[USB-PROVISION] Tu choi commit: Device ID khong khop voi MAC."); return false;
+  }
+  char oldId[sizeof(DEVICE_ID)]; safeCopy(oldId,sizeof(oldId),DEVICE_ID);
+  if (strcmp(oldId,desiredId)!=0) {
+    Preferences cfg; cfg.begin("mesflow_cfg",false);
+    size_t n=cfg.putString("device_id",desiredId); String verify=cfg.getString("device_id",""); cfg.end();
+    if (!n || verify!=desiredId) {
+      Preferences restore; restore.begin("mesflow_cfg",false); restore.putString("device_id",oldId); restore.end();
+      Serial.println("[USB-PROVISION] Loi luu Device ID; da khoi phuc gia tri truoc."); return false;
+    }
+    safeCopy(DEVICE_ID,sizeof(DEVICE_ID),desiredId);
+  }
+  Serial.printf("[USB-PROVISION] DEVICE_ID_SAVED %s\n",desiredId); return true;
 }
 
 static void saveCurrentCredential() {
@@ -5946,10 +6012,18 @@ static void handleUsbConsoleLine(String line) {
   cmd.toLowerCase();
   if (maintenanceMode) {
     if (!mfmt::allowedDuringMaintenance(cmd.c_str())) {
-      Serial.println("[MAINT] Dang bao tri: chi nhan 'maintenance exit', 'status', 'help'.");
+      Serial.println("[MAINT] Lenh USB khong duoc phep trong che do bao tri.");
       return;
     }
     if (cmd == "maintenance exit") { exitMaintenanceMode(); return; }
+    if (cmd.startsWith("usb-provision-proof ")) {
+      String challenge=cmd.substring(strlen("usb-provision-proof ")); challenge.trim();
+      handleUsbProvisionProof(challenge); lastMaintenanceActivityAt=millis(); return;
+    }
+    if (cmd.startsWith("usb-provision-commit ")) {
+      String requestedId=line.substring(strlen("usb-provision-commit ")); requestedId.trim();
+      handleUsbProvisionCommit(requestedId); lastMaintenanceActivityAt=millis(); return;
+    }
     lastMaintenanceActivityAt = millis();
   }
   if (handleConsoleCommand(line)) { lastInputAtMs = millis(); return; }
@@ -5967,7 +6041,10 @@ void readSerialCommands() {
     // Chap nhan ca New Line, Carriage Return va Both NL & CR.
     if (c == '\r' || c == '\n') {
       if (line.length() > 0) {
-        Serial.printf("[SERIAL RX] %s\n", line.c_str());
+        String lowerLine=line; lowerLine.toLowerCase();
+        if (lowerLine.startsWith("usb-provision-proof ")) Serial.println("[SERIAL RX] usb-provision-proof [redacted]");
+        else if (lowerLine.startsWith("usb-provision-commit ")) Serial.println("[SERIAL RX] usb-provision-commit [redacted]");
+        else Serial.printf("[SERIAL RX] %s\n", line.c_str());
         lastInputWasVirtual = false;
         lastInputWasKeypad = false;
         handleUsbConsoleLine(line);
@@ -5981,7 +6058,10 @@ void readSerialCommands() {
 
   // Ke ca Serial Monitor dang de "No line ending", van xu ly sau 350 ms.
   if (line.length() > 0 && millis() - lastCharAt >= 350) {
-    Serial.printf("[SERIAL RX/TIMEOUT] %s\n", line.c_str());
+    String lowerLine=line; lowerLine.toLowerCase();
+    if (lowerLine.startsWith("usb-provision-proof ")) Serial.println("[SERIAL RX/TIMEOUT] usb-provision-proof [redacted]");
+    else if (lowerLine.startsWith("usb-provision-commit ")) Serial.println("[SERIAL RX/TIMEOUT] usb-provision-commit [redacted]");
+    else Serial.printf("[SERIAL RX/TIMEOUT] %s\n", line.c_str());
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
     handleUsbConsoleLine(line);
