@@ -87,6 +87,7 @@ char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
 #define FW_VERSION "5.6.6"
 #define FW_BUILD "20261112.0003"
 #define HW_MODEL "ES3C28P"
+static const char* USB_PROVISION_PROTOCOL = "MESFLOW-KIOSK-USB-ENROLLMENT-V1";
 const char* APP_VERSION  = "ESP32-KIOSK-5.6.6-KIMEX-OTA-SCOPED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
@@ -2006,6 +2007,8 @@ static void handleUsbProvisionHello() {
   cred.end();
   doc["device_uuid"]=DEVICE_UUID; doc["mac_address"]=mac;
   doc["device_id"]=DEVICE_ID; doc["station_code"]=STATION_CODE;
+  doc["firmware_version"]=FW_VERSION; doc["firmware_build"]=FW_BUILD_ID;
+  doc["usb_provision_protocol"]=USB_PROVISION_PROTOCOL; doc["hardware_model"]=HW_MODEL;
   doc["server_url"]=SERVER_BASE; doc["wifi_ssid"]=WIFI_SSID;
   doc["bound"]=rt.bound; doc["credential_present"]=credentialPresent;
   doc["idle"]=(uiState==UiState::READY || uiState==UiState::OFFLINE);
@@ -2573,6 +2576,10 @@ static void handleDeviceHealthApi() {
   doc["updated_ms"] = now;
   JsonObject device = doc.createNestedObject("device");
   device["firmware"] = APP_VERSION;
+  device["firmware_version"] = FW_VERSION;
+  device["firmware_build"] = FW_BUILD_ID;
+  device["usb_provision_protocol"] = USB_PROVISION_PROTOCOL;
+  device["hardware_model"] = HW_MODEL;
   device["model"] = "ESP32-S3 N16R8";
   device["device_id"] = DEVICE_ID;
   device["device_name"] = DEVICE_NAME;

@@ -81,3 +81,12 @@ def test_config_write_still_requires_maintenance_and_validation():
     assert api.index("if (!maintenanceMode)") < api.index("saveDeviceConfig()")
     assert "validServerBase(url)" in api and 'otaUrl.startsWith("https://")' in api
     assert ".setInsecure(" not in SOURCE
+
+
+def test_health_and_usb_hello_advertise_non_secret_provisioning_identity():
+    health = body("static void handleDeviceHealthApi() {")
+    hello = body("static void handleUsbProvisionHello() {")
+    for field in ('firmware_version', 'firmware_build', 'usb_provision_protocol', 'hardware_model'):
+        assert f'device["{field}"]' in health
+        assert f'doc["{field}"]' in hello
+    assert 'MESFLOW-KIOSK-USB-ENROLLMENT-V1' in SOURCE
