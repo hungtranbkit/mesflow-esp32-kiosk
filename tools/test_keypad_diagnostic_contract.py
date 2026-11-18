@@ -58,3 +58,37 @@ def test_number_entry_uses_fast_partial_lcd_redraw():
     draw = section("static void drawKeypadTestNumberValue() {", "static bool startKeypadTestMode() {")
     assert "tft.fillRect" in draw
     assert "tft.fillScreen" not in draw
+
+
+def test_fast_mapped_scan_preserves_original_calibration_path():
+    reader = section("static int scanMappedKeypadFast() {",
+                     "static void printKeypadPair(uint8_t pair) {")
+    assert "degree[pin] == 3" in reader
+    assert "degree[pin] == 4" in reader
+    assert "rowMask" in reader and "colMask" in reader
+    assert "keypadReleaseAll()" in reader
+    assert "return count == 1 ? found : -2;" in reader
+    loop = section("void serviceKeypad() {", "if (pair == -3)")
+    assert "keypadTestActive ? scanMappedKeypadFast() : scanKeypadPair()" in loop
+
+def test_live_latency_metrics_exposed():
+    for key in ("keypad_test_scan_us", "keypad_test_scan_max_us",
+                "keypad_test_draw_us", "keypad_test_draw_max_us",
+                "keypad_test_loop_gap_max_ms"):
+        assert f'hardware["{key}"]' in SOURCE
+
+def test_fast_number_entry_prioritizes_physical_keypad_before_web():
+    body = section("void loop() {", "// Display the server-confirmed FINISH")
+    assert "serviceKeypad();" in body
+    fast = body[body.index("if (keypadTestActive) {"):]
+    assert fast.index("serviceKeypad();") < fast.index("serviceDeviceManagement();")
+    assert fast.index("serviceDeviceManagement();") < fast.index("return;")
+    assert "keypadTestWebLastMs >= 120" in fast
+    assert "keypadTestLoopMaxGapMs" in fast
+
+def test_fast_lcd_avoids_full_redraw_and_tracks_duration():
+    body = section("static void drawKeypadTestNumberValue() {",
+                   "static bool startKeypadTestMode() {")
+    assert "tft.drawString(digits" in body
+    assert "tft.fillScreen(" not in body
+    assert "keypadTestDrawLastUs = micros()" in body

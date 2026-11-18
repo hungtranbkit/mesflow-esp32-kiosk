@@ -258,6 +258,13 @@ static int keypadTestRawPair = -1;
 static int keypadTestRawLatch = -1;
 static uint32_t keypadTestRawLastPoll = 0;
 static uint32_t keypadTestLastI2cWarning = 0;
+static uint32_t keypadTestScanLastUs = 0;
+static uint32_t keypadTestScanMaxUs = 0;
+static uint32_t keypadTestDrawLastUs = 0;
+static uint32_t keypadTestDrawMaxUs = 0;
+static uint32_t keypadTestLoopMaxGapMs = 0;
+static uint32_t keypadTestLoopPreviousMs = 0;
+static uint32_t keypadTestWebLastMs = 0;
 static char keypadTestLastKey = '-';
 bool keypadMappingReady = false;
 uint8_t keypadAddress = 0;
@@ -2512,6 +2519,11 @@ static void handleDeviceHealthApi() {
   hardware["keypad_test_raw_pair"] = keypadTestRawPair;
   hardware["keypad_test_digits"] = keypadTestDigits;
   hardware["keypad_test_last_key"] = String(keypadTestLastKey);
+  hardware["keypad_test_scan_us"] = keypadTestScanLastUs;
+  hardware["keypad_test_scan_max_us"] = keypadTestScanMaxUs;
+  hardware["keypad_test_draw_us"] = keypadTestDrawLastUs;
+  hardware["keypad_test_draw_max_us"] = keypadTestDrawMaxUs;
+  hardware["keypad_test_loop_gap_max_ms"] = keypadTestLoopMaxGapMs;
   hardware["scanner_uart_configured"] = true;
   hardware["scanner_status"] = "UART1: RX GPIO44, TX disabled, " + String(scannerBaud) + " 8N1";
   hardware["usb_serial_status"] = "READY";
@@ -6183,6 +6195,48 @@ static int scanKeypadPair() {
   return -2;
 }
 
+// Test-only 3x4 matrix fast path: one I2C idle probe, four mapped rows
+// only on a press. Production/calibration keep the exhaustive scanner.
+static int scanMappedKeypadFast() {
+  uint8_t degree[8] = {};
+  for (uint8_t i = 0; i < KEYPAD_KEY_COUNT; ++i) {
+    const uint8_t a = keypadPairs[i] >> 4, b = keypadPairs[i] & 15;
+    if (a >= 8 || b >= 8 || a == b) return scanKeypadPair();
+    ++degree[a]; ++degree[b];
+  }
+  uint8_t rowMask = 0, colMask = 0;
+  for (uint8_t pin = 0; pin < 8; ++pin) {
+    if (degree[pin] == 3) rowMask |= (1U << pin);
+    else if (degree[pin] == 4) colMask |= (1U << pin);
+  }
+  if (__builtin_popcount(static_cast<unsigned>(rowMask)) != 4 ||
+      __builtin_popcount(static_cast<unsigned>(colMask)) != 3)
+    return scanKeypadPair();
+  uint8_t sample = 0xFF;
+  if (!keypadWriteRead(static_cast<uint8_t>(~rowMask), sample)) {
+    keypadReleaseAll(); return -3;
+  }
+  if ((sample & colMask) == colMask) { keypadReleaseAll(); return -1; }
+  int found = -1;
+  uint8_t count = 0;
+  for (uint8_t row = 0; row < 8; ++row) {
+    if (!(rowMask & (1U << row))) continue;
+    if (!keypadWriteRead(static_cast<uint8_t>(~(1U << row)), sample)) {
+      keypadReleaseAll(); return -3;
+    }
+    for (uint8_t col = 0; col < 8; ++col) {
+      if (!(colMask & (1U << col)) || (sample & (1U << col))) continue;
+      const uint8_t low = row < col ? row : col;
+      const uint8_t high = row < col ? col : row;
+      found = (low << 4) | high;
+      ++count;
+    }
+  }
+  keypadReleaseAll();
+  if (count == 0) return -1;
+  return count == 1 ? found : -2;
+}
+
 static void printKeypadPair(uint8_t pair) {
   Serial.printf("P%u<->P%u", pair >> 4, pair & 0x0F);
 }
@@ -6511,16 +6565,25 @@ static void drawKeypadTestMode() {
 // fast presses while SPI operations hold the single-threaded loop.
 static void drawKeypadTestNumberValue() {
   if (!keypadTestActive || keypadTestPage != 1) return;
-  char number[84], last[84];
-  snprintf(number, sizeof(number), "NHAP: %s",
-           keypadTestDigitCount ? keypadTestDigits : "_");
-  snprintf(last, sizeof(last), "PHIM CUOI: %c | LAN %lu",
-           keypadTestLastKey, (unsigned long)keypadTestPressCount);
-  tft.fillRect(SCREEN_LEFT_MARGIN, 125, 216, 101, C_BG);
-  drawCenteredTextFit(number, SCREEN_LEFT_MARGIN, 128, 216, 42,
-                      FONT_SECTION, FONT_SECTION - 1, 2, C_TEXT, true);
-  drawCenteredTextFit(last, SCREEN_LEFT_MARGIN, 180, 216, 38,
-                      FONT_SECTION, FONT_SECTION - 1, 2, C_MUTED);
+  const uint32_t drawStartedUs = micros();
+  // Test numerals are ASCII, so avoid general multi-line/UTF8 text fitting.
+  // Only redraw the numeric value area and the tiny status line.
+  const char* digits = keypadTestDigitCount ? keypadTestDigits : "_";
+  tft.fillRect(SCREEN_LEFT_MARGIN, 125, 216, 103, C_BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_TEXT, C_BG);
+  tft.setTextSize(keypadTestDigitCount <= 8 ? 2 : 1);
+  tft.drawString(digits, SW / 2, 157, 2);
+  tft.setTextSize(1);
+  char last[50];
+  snprintf(last, sizeof(last), "PHIM %c | LAN %lu", keypadTestLastKey,
+           (unsigned long)keypadTestPressCount);
+  tft.setTextColor(C_MUTED, C_BG);
+  tft.drawString(last, SW / 2, 201, 2);
+  tft.setTextDatum(TL_DATUM);
+  keypadTestDrawLastUs = micros() - drawStartedUs;
+  if (keypadTestDrawLastUs > keypadTestDrawMaxUs)
+    keypadTestDrawMaxUs = keypadTestDrawLastUs;
 }
 
 static bool startKeypadTestMode() {
@@ -6533,6 +6596,11 @@ static bool startKeypadTestMode() {
   keypadTestDigits[0] = '\0'; keypadTestDigitCount = 0;
   keypadTestRawPair = -1; keypadTestRawLatch = -1;
   keypadTestLastKey = '-'; keypadTestPressCount = 0;
+  keypadTestScanLastUs = keypadTestScanMaxUs = 0;
+  keypadTestDrawLastUs = keypadTestDrawMaxUs = 0;
+  keypadTestLoopMaxGapMs = 0;
+  keypadTestLoopPreviousMs = 0;
+  keypadTestWebLastMs = 0;
   keypadTestLastActivity = millis();
   drawKeypadTestMode();
   Serial.println("[KEYPAD TEST] START, khong phat sinh giao dich MESFlow.");
@@ -6919,7 +6987,13 @@ void serviceKeypad() {
     keypadNumberBuffer[0] = '\0';
   }
 
-  const int pair = scanKeypadPair();
+  const uint32_t scanStartUs = micros();
+  const int pair = keypadTestActive ? scanMappedKeypadFast() : scanKeypadPair();
+  if (keypadTestActive) {
+    keypadTestScanLastUs = micros() - scanStartUs;
+    if (keypadTestScanLastUs > keypadTestScanMaxUs)
+      keypadTestScanMaxUs = keypadTestScanLastUs;
+  }
   if (pair == -3) {
     if (++keypadI2cErrors == 50) {
       Serial.println("[KEYPAD] 50 loi I2C lien tiep -> khoi dong lai bus.");
@@ -7358,6 +7432,28 @@ void loop() {
   otaUiTick();
   lastLoopAliveAt = millis();
   esp_task_wdt_reset();
+
+  if (keypadTestActive) {
+    // Handle physical keys BEFORE any synchronous HTTP operation.
+    const uint32_t now = millis();
+    if (keypadTestLoopPreviousMs) {
+      const uint32_t gap = now - keypadTestLoopPreviousMs;
+      if (gap > keypadTestLoopMaxGapMs) keypadTestLoopMaxGapMs = gap;
+    }
+    keypadTestLoopPreviousMs = now;
+    serviceKeypad();
+    // LAN status/Stop stay reachable, but an HTTP client should not be
+    // serviced on every single matrix-scan tick.
+    if (millis() - keypadTestWebLastMs >= 120) {
+      keypadTestWebLastMs = millis();
+      serviceDeviceManagement();
+      servicePendingWebCommand();
+      readSerialCommands();
+    }
+    delay(1);
+    return;
+  }
+  keypadTestLoopPreviousMs = 0;
 
   // Display the server-confirmed FINISH only after the HTTP/JSON stack
   // unwinds. Previous firmware immediately reset to READY here, giving the
