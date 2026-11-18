@@ -246,6 +246,17 @@ constexpr char KEYPAD_NVS_NAMESPACE[] = "mf_keypad";
 const char keypadCalibrationKeys[KEYPAD_KEY_COUNT + 1] = "123456789*0#";
 uint8_t keypadPairs[KEYPAD_KEY_COUNT] = {0};
 bool keypadAvailable = false;
+// Isolated keypad diagnostics: never writes MESFlow events or modifies saved mapping.
+static bool keypadTestActive = false;
+static uint8_t keypadTestPage = 0;
+static uint8_t keypadTestDemoPage = 0;
+static char keypadTestDigits[19] = "";
+static uint8_t keypadTestDigitCount = 0;
+static uint32_t keypadTestLastActivity = 0;
+static uint32_t keypadTestPressCount = 0;
+static int keypadTestRawPair = -1;
+static int keypadTestRawLatch = -1;
+static char keypadTestLastKey = '-';
 bool keypadMappingReady = false;
 uint8_t keypadAddress = 0;
 char keypadNumberBuffer[7] = "";  // 0..999999
@@ -381,6 +392,10 @@ bool emitActionEvent(const char* eventType, const char* category,
 void serviceActionEventQueue();
 void readScannerCommands();
 static bool requestRuntimeKeypadCalibration(const char* source);
+static bool startKeypadTestMode();
+static void stopKeypadTestMode();
+static void drawKeypadTestMode();
+static void handleKeypadTestKey(char key);
 static void serviceRuntimeKeypadCalibration();
 static void enterMaintenanceMode(bool duringBoot);
 static void openRecoveryMenu();
@@ -2311,6 +2326,9 @@ static String remoteHelpText() {
     "reset | r                 : ve man hinh READY\n"
     "touch-test                : mo man hinh test cam ung\n"
     "keypad-calibrate CONFIRM  : hieu chinh lai keypad ngay, khong reboot\n"
+    "keypad-test CONFIRM      : test I2C, phim, nhap so, chuyen man hinh\n"
+    "keypad-test next         : chuyen man hinh test (web)\n"
+    "keypad-test stop         : thoat test, ve READY\n"
     "scan <QR/so>              : gia lap may quet hoac ban phim\n"
     "test-data                 : xem QR da cache tren ESP\n"
     "clear-token CONFIRM       : xoa kiosk token\n"
@@ -2366,7 +2384,22 @@ static String executeRemoteCommand(String line, bool& delayedReboot, bool& openS
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); return "Da mo man hinh test cam ung.\n"; }
   if (cmd.startsWith("scanner-baud")) return cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n";
+  if (cmd == "keypad-test confirm" || cmd == "test-keypad confirm") {
+    return startKeypadTestMode()
+        ? "Da mo che do TEST BAN PHIM tren LCD. Khi chua co mapping, bam phim de xem cap chan raw. Hieu chinh tren web truoc khi nhap so.\n"
+        : "Tu choi: chi test khi READY, PCF8574T co ket noi, khong co giao dich dang cho.\n";
+  }
+  if (cmd == "keypad-test stop" || cmd == "test-keypad stop") {
+    stopKeypadTestMode();
+    return "Da thoat TEST BAN PHIM, kiosk ve READY.\n";
+  }
+  if (cmd == "keypad-test next" && keypadTestActive) {
+    keypadTestPage = (keypadTestPage + 1) % 4;
+    drawKeypadTestMode();
+    return "Chuyen man hinh test.\n";
+  }
   if (cmd == "keypad-calibrate confirm" || cmd == "calibrate-keypad confirm") {
+    if (keypadTestActive) stopKeypadTestMode();
     if (!requestRuntimeKeypadCalibration("WEB")) {
       return "Khong the hieu chinh luc nay. Dua kiosk ve READY, dam bao khong co giao dich dang cho va thu lai.\n";
     }
@@ -2471,6 +2504,12 @@ static void handleDeviceHealthApi() {
        (keypadMappingReady ? "PCF8574T READY" : "PCF8574T NEEDS CALIBRATION"));
   hardware["keypad_address"] = keypadAddress;
   hardware["keypad_calibrated"] = keypadMappingReady;
+  hardware["keypad_test_active"] = keypadTestActive;
+  hardware["keypad_test_page"] = keypadTestPage;
+  hardware["keypad_test_presses"] = keypadTestPressCount;
+  hardware["keypad_test_raw_pair"] = keypadTestRawPair;
+  hardware["keypad_test_digits"] = keypadTestDigits;
+  hardware["keypad_test_last_key"] = String(keypadTestLastKey);
   hardware["scanner_uart_configured"] = true;
   hardware["scanner_status"] = "UART1: RX GPIO44, TX disabled, " + String(scannerBaud) + " 8N1";
   hardware["usb_serial_status"] = "READY";
@@ -2512,14 +2551,16 @@ static String webConsolePage() {
 <div class="tabs"><button class="active" data-tab="dashboard">Dashboard</button><button data-tab="network">Network</button><button data-tab="hardware">Hardware</button><button data-tab="mes">MES</button><button data-tab="scanner">Máy quét ảo</button><button data-tab="logs">Logs & Diagnostics</button></div>
 <section id="dashboard" class="panel active"><div class="cards"><div class="card metric" id="healthCard"><small>Device Health</small><b id="health">--</b></div><div class="card metric"><small>Firmware</small><b id="firmware">--</b></div><div class="card metric"><small>Uptime</small><b id="uptime">--</b></div><div class="card metric"><small>CPU</small><b id="cpu">--</b></div></div><div class="grid2"><div class="card"><b>Memory</b><div class="kv"><div><span>Heap free</span><strong id="heapFree">--</strong></div><div><span>Heap min</span><strong id="heapMin">--</strong></div><div><span>Largest block</span><strong id="heapLargest">--</strong></div><div><span>PSRAM free / total</span><strong id="psram">--</strong></div></div></div><div class="card"><b>Storage</b><div class="kv"><div><span>Flash</span><strong id="flash">--</strong></div><div><span>LittleFS</span><strong id="littlefs">--</strong></div><div><span>LittleFS used</span><strong id="fsUsed">--</strong></div><div><span>Model</span><strong id="model">--</strong></div></div></div></div></section>
 <section id="network" class="panel"><div class="grid2"><div class="card"><b>Wi-Fi</b><div class="kv"><div><span>Status</span><strong id="wifiStatus">--</strong></div><div><span>SSID</span><strong id="ssid">--</strong></div><div><span>RSSI</span><strong id="rssi">--</strong></div><div><span>IP</span><strong id="ip">--</strong></div><div><span>Gateway</span><strong id="gateway">--</strong></div><div><span>DNS</span><strong id="dns">--</strong></div><div><span>MAC</span><strong id="mac">--</strong></div></div></div><div class="card"><b>MES Server</b><div class="kv"><div><span>URL</span><strong id="serverUrl">--</strong></div><div><span>Status</span><strong id="serverStatus">--</strong></div><div><span>Last HTTP</span><strong id="httpStatus">--</strong></div></div><div class="actions" style="margin-top:12px"><button onclick="quick('heartbeat')">Test server</button><button class="secondary" onclick="quick('bind')">Bind lại</button></div></div></div></section>
-<section id="hardware" class="panel"><div class="grid2"><div class="card"><b>Thiết bị</b><div class="kv"><div><span>LCD</span><strong id="lcd">--</strong></div><div><span>Touch</span><strong id="touch">--</strong></div><div><span>I2C keypad</span><strong id="keypad">--</strong></div><div><span>UART scanner</span><strong id="uartScanner">--</strong></div><div><span>USB Serial</span><strong id="usbSerial">--</strong></div></div><div class="actions" style="margin-top:12px"><button class="danger" onclick="if(confirm('Hiệu chỉnh lại keypad ngay? Kiosk sẽ tạm khóa thao tác và không khởi động lại.'))quick('keypad-calibrate CONFIRM')">Hiệu chỉnh lại keypad</button></div></div><div class="card"><b>Input activity</b><div class="kv"><div><span>Nguồn gần nhất</span><strong id="inputSource">--</strong></div><div><span>Lần cuối</span><strong id="inputAge">--</strong></div><div><span>Tổng sự kiện</span><strong id="inputCount">--</strong></div><div><span>Dữ liệu gần nhất</span><strong id="inputPreview">--</strong></div></div><p class="muted">Keypad PCF8574T và cảm ứng dùng chung I2C GPIO16/GPIO15. Bảy dây keypad có thể cắm vào P0..P7 theo thứ tự bất kỳ sau khi hiệu chỉnh. Máy quét UART dùng RX GPIO44, 9600 8N1.</p></div></div></section>
+<section id="hardware" class="panel"><div class="grid2"><div class="card"><b>Thiết bị</b><div class="kv"><div><span>LCD</span><strong id="lcd">--</strong></div><div><span>Touch</span><strong id="touch">--</strong></div><div><span>I2C keypad</span><strong id="keypad">--</strong></div><div><span>UART scanner</span><strong id="uartScanner">--</strong></div><div><span>USB Serial</span><strong id="usbSerial">--</strong></div></div><div class="actions" style="margin-top:12px"><button class="danger" onclick="if(confirm('Hiệu chỉnh lại keypad ngay? Kiosk sẽ tạm khóa thao tác và không khởi động lại.'))quick('keypad-calibrate CONFIRM')">Hiệu chỉnh lại keypad</button><button onclick="quick('keypad-test CONFIRM')">Test kết nối &amp; nhập số</button><button onclick="quick('keypad-test next')">Trang tiếp</button><button onclick="quick('keypad-test stop')">Thoát test</button></div></div><div class="card"><b>Input activity</b><div><span>Chế độ kiểm tra</span><strong id="keypadTestState">--</strong></div><div class="kv"><div><span>Nguồn gần nhất</span><strong id="inputSource">--</strong></div><div><span>Lần cuối</span><strong id="inputAge">--</strong></div><div><span>Tổng sự kiện</span><strong id="inputCount">--</strong></div><div><span>Dữ liệu gần nhất</span><strong id="inputPreview">--</strong></div></div><p class="muted">Keypad PCF8574T và cảm ứng dùng chung I2C GPIO16/GPIO15. Bảy dây keypad có thể cắm vào P0..P7 theo thứ tự bất kỳ sau khi hiệu chỉnh. Máy quét UART dùng RX GPIO44, 9600 8N1.</p></div></div></section>
 <section id="mes" class="panel"><div class="cards"><div class="card metric"><small>Bind</small><b id="bound">--</b></div><div class="card metric"><small>Workers</small><b id="workers">--</b></div><div class="card metric"><small>Operations</small><b id="operations">--</b></div><div class="card metric"><small>Offline queue</small><b id="queue">--</b></div></div><div class="card"><div class="kv"><div><span>Device ID</span><strong id="deviceId">--</strong></div><div><span>Station</span><strong id="station">--</strong></div><div><span>UI state</span><strong id="uiState">--</strong></div><div><span>Pending transaction</span><strong id="pending">--</strong></div><div><span>Last error</span><strong id="lastError">--</strong></div></div><div class="actions" style="margin-top:12px"><button onclick="refreshMesCatalog()">Tải catalog từ MES</button><button class="secondary" onclick="window.open('/api/device/catalog-debug','_blank')">Xem catalog debug</button><button class="secondary" onclick="window.open('/api/device/catalog-raw','_blank')">Xem JSON gốc</button><button class="secondary" onclick="quick('retry')">Đồng bộ lại</button></div></div></section>
 <section id="scanner" class="panel"><div class="card"><b>Máy quét ảo</b><p class="muted">Dùng dữ liệu thật từ MES để test luồng kiosk.</p><div class="grid2"><div><select id="workerQr"><option value="">-- Chọn QR nhân viên --</option></select><input id="workerCustom" style="margin-top:7px" placeholder="Hoặc nhập WF|EMP|..."><button style="margin-top:7px" onclick="sendVirtual('worker')">Quét nhân viên</button></div><div><select id="opQr"><option value="">-- Chọn QR operation --</option></select><input id="opCustom" style="margin-top:7px" placeholder="Hoặc nhập WF|OP|..."><button style="margin-top:7px" onclick="sendVirtual('op')">Quét operation</button></div></div><div class="row" style="margin-top:10px"><input id="qty" inputmode="numeric" value="1"><button onclick="sendQty()">Gửi số</button><button class="secondary" onclick="quick('scan 1')">Xác nhận</button><button class="secondary" onclick="quick('scan 2')">Sửa lại</button><button class="secondary" onclick="quick('reset')">READY</button></div></div></section>
 <section id="logs" class="panel"><div class="card"><div class="row"><input id="cmd" value="status" onkeydown="if(event.key==='Enter')runCmd()"><button onclick="runCmd()">Gửi</button><button class="secondary" onclick="refreshLogs()">Làm mới log</button><button class="secondary" onclick="clearOut()">Xóa</button></div></div><div class="card"><div id="out" class="terminal">Đang kết nối tới ESP32...</div></div></section>
 </div><script>
 const $=id=>document.getElementById(id),out=$('out');let timer=null;function esc(t){return String(t??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function paint(t){return esc(t).split('\n').map(x=>{let c=/ERROR|FAIL|LOI|HTTP 5/i.test(x)?'log-err':/WARN|OFFLINE|RETRY/i.test(x)?'log-warn':/ OK|CONNECTED|ONLINE|READY/i.test(x)?'log-ok':/^>|INFO|BIND|HEARTBEAT/i.test(x)?'log-info':'';return '<span class="'+c+'">'+x+'</span>'}).join('\n')}function append(t){out.innerHTML+=paint(t);out.scrollTop=out.scrollHeight}function clearOut(){out.innerHTML=''}function setConn(ok){let e=$('conn');e.textContent=ok?'Đã kết nối':'Mất kết nối';e.style.background=ok?'#dcfce7':'#fee2e2';e.style.color=ok?'#166534':'#991b1b'}function fmtBytes(n){n=Number(n||0);if(n>=1048576)return (n/1048576).toFixed(2)+' MB';if(n>=1024)return (n/1024).toFixed(1)+' KB';return n+' B'}function age(ms){if(!ms)return 'Chưa có';let s=Math.floor(ms/1000);return s<60?s+' giây trước':Math.floor(s/60)+' phút trước'}function val(id,v){$(id).textContent=v??'--'}
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab).classList.add('active')});
-async function health(){try{let r=await fetch('/api/device/health',{cache:'no-store'});let j=await r.json();if(!r.ok)throw Error('HTTP '+r.status);setConn(true);val('health',j.health_score+'/100');$('healthCard').className='card metric '+(j.health_score>=85?'ok':j.health_score>=60?'warn':'err');val('firmware',j.device.firmware);val('uptime',j.device.uptime);val('cpu',j.cpu.frequency_mhz+' MHz · '+Number(j.cpu.temperature_c).toFixed(1)+'°C');val('heapFree',fmtBytes(j.memory.heap_free)+' / '+fmtBytes(j.memory.heap_total));val('heapMin',fmtBytes(j.memory.heap_min_free));val('heapLargest',fmtBytes(j.memory.heap_largest_block));val('psram',fmtBytes(j.memory.psram_free)+' / '+fmtBytes(j.memory.psram_total));val('flash',fmtBytes(j.storage.flash_size));val('littlefs',j.storage.littlefs_ready?'READY':'NOT READY');val('fsUsed',fmtBytes(j.storage.littlefs_used)+' / '+fmtBytes(j.storage.littlefs_total));val('model',j.device.model);val('wifiStatus',j.network.wifi_connected?'CONNECTED':'DISCONNECTED');val('ssid',j.network.ssid);val('rssi',j.network.rssi+' dBm');val('ip',j.network.ip);val('gateway',j.network.gateway);val('dns',j.network.dns);val('mac',j.network.mac);val('serverUrl',j.network.server_url);val('serverStatus',j.network.server_online?'ONLINE':'OFFLINE');val('httpStatus',j.network.last_http_status);val('lcd',j.hardware.lcd);val('touch',j.hardware.touch);val('keypad',j.hardware.keypad+(j.hardware.keypad_address?' @ 0x'+Number(j.hardware.keypad_address).toString(16).toUpperCase():''));val('uartScanner',j.hardware.scanner_uart_configured?'CONFIGURED':j.hardware.scanner_status);val('usbSerial',j.hardware.usb_serial_status);val('inputSource',j.hardware.last_input_source);val('inputAge',age(j.hardware.last_input_age_ms));val('inputCount',j.hardware.input_event_count);val('inputPreview',j.hardware.last_input_preview||'--');val('bound',j.mes.bound?'YES':'NO');val('workers',j.mes.workers);val('operations',j.mes.operations);val('queue',j.mes.offline_queue);val('deviceId',j.device.device_id);val('station',j.device.station);val('uiState',j.mes.ui_state);val('pending',j.mes.pending_transaction?'YES':'NO');val('lastError',j.mes.last_error||'Không có')}catch(e){setConn(false)}}
+async function health(){try{let r=await fetch('/api/device/health',{cache:'no-store'});let j=await r.json();if(!r.ok)throw Error('HTTP '+r.status);setConn(true);val('health',j.health_score+'/100');$('healthCard').className='card metric '+(j.health_score>=85?'ok':j.health_score>=60?'warn':'err');val('firmware',j.device.firmware);val('uptime',j.device.uptime);val('cpu',j.cpu.frequency_mhz+' MHz · '+Number(j.cpu.temperature_c).toFixed(1)+'°C');val('heapFree',fmtBytes(j.memory.heap_free)+' / '+fmtBytes(j.memory.heap_total));val('heapMin',fmtBytes(j.memory.heap_min_free));val('heapLargest',fmtBytes(j.memory.heap_largest_block));val('psram',fmtBytes(j.memory.psram_free)+' / '+fmtBytes(j.memory.psram_total));val('flash',fmtBytes(j.storage.flash_size));val('littlefs',j.storage.littlefs_ready?'READY':'NOT READY');val('fsUsed',fmtBytes(j.storage.littlefs_used)+' / '+fmtBytes(j.storage.littlefs_total));val('model',j.device.model);val('wifiStatus',j.network.wifi_connected?'CONNECTED':'DISCONNECTED');val('ssid',j.network.ssid);val('rssi',j.network.rssi+' dBm');val('ip',j.network.ip);val('gateway',j.network.gateway);val('dns',j.network.dns);val('mac',j.network.mac);val('serverUrl',j.network.server_url);val('serverStatus',j.network.server_online?'ONLINE':'OFFLINE');val('httpStatus',j.network.last_http_status);val('lcd',j.hardware.lcd);val('touch',j.hardware.touch);val('keypad',j.hardware.keypad+(j.hardware.keypad_address?' @ 0x'+Number(j.hardware.keypad_address).toString(16).toUpperCase():''));
+val('keypadTestState',(j.hardware.keypad_test_active?'ĐANG TEST — trang '+(j.hardware.keypad_test_page+1):'CHƯA BẬT')+' | lần bấm '+j.hardware.keypad_test_presses+' | số '+(j.hardware.keypad_test_digits||'--'));
+val('uartScanner',j.hardware.scanner_uart_configured?'CONFIGURED':j.hardware.scanner_status);val('usbSerial',j.hardware.usb_serial_status);val('inputSource',j.hardware.last_input_source);val('inputAge',age(j.hardware.last_input_age_ms));val('inputCount',j.hardware.input_event_count);val('inputPreview',j.hardware.last_input_preview||'--');val('bound',j.mes.bound?'YES':'NO');val('workers',j.mes.workers);val('operations',j.mes.operations);val('queue',j.mes.offline_queue);val('deviceId',j.device.device_id);val('station',j.device.station);val('uiState',j.mes.ui_state);val('pending',j.mes.pending_transaction?'YES':'NO');val('lastError',j.mes.last_error||'Không có')}catch(e){setConn(false)}}
 async function api(command,silent=false){try{let r=await fetch('/api/device/console',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command})});let j=await r.json();if(!r.ok)throw Error(j.message||('HTTP '+r.status));setConn(true);if(!silent)append('> '+command+'\n'+j.output+'\n');return j}catch(e){setConn(false);if(!silent)append('[ERROR] '+e+'\n')}}function runCmd(){let c=$('cmd').value.trim();if(c)api(c)}function quick(c){$('cmd').value=c;return api(c)}async function refreshLogs(){let a=await api('status',true),l=await api('logs',true);if(a&&l)out.innerHTML=paint(a.output+'\n--- RECENT LOGS ---\n'+l.output)}
 async function loadTestData(){try{let r=await fetch('/api/device/test-data',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);let j=await r.json(),w=$('workerQr'),o=$('opQr');w.innerHTML='<option value="">-- Chọn QR nhân viên --</option>';o.innerHTML='<option value="">-- Chọn QR operation --</option>';(j.workers||[]).forEach(x=>w.add(new Option((x.code||x.qr)+' - '+(x.name||''),x.qr)));(j.operations||[]).forEach(x=>o.add(new Option((x.name||x.qr)+(x.po?' · '+x.po:''),x.qr)));if(!(j.workers||[]).length&&!(j.operations||[]).length)append('[WARN] Cache QR đang trống. Bấm Tải catalog từ MES.\n');else append('[OK] Đã nạp '+(j.workers||[]).length+' nhân viên, '+(j.operations||[]).length+' operation vào danh sách.\n')}catch(e){append('[ERROR] Không tải được QR: '+e+'\n')}}async function refreshMesCatalog(){try{append('[INFO] Đang tải catalog từ MES...\n');let r=await fetch('/api/device/catalog-refresh',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw Error(j.message||('HTTP '+r.status));append('[OK] '+j.workers+' nhân viên, '+j.operations+' operation · '+(j.message||'OK')+'\n');await loadTestData();await health()}catch(e){append('[ERROR] '+e+'\n')}}function sendVirtual(type){let v=$(type==='worker'?'workerCustom':'opCustom').value.trim()||$(type==='worker'?'workerQr':'opQr').value;if(!v)return append('[WARN] Chưa chọn QR.\n');quick('scan '+v).then(health)}function sendQty(){let v=$('qty').value.trim();if(!/^\d+$/.test(v))return append('[WARN] Số lượng không hợp lệ.\n');quick('scan '+v).then(health)}
 health();loadTestData();refreshLogs();timer=setInterval(health,5000);
@@ -5709,6 +5750,10 @@ static bool handleConsoleCommand(String line) {
 void handleSerialLine(String line) {
   line.trim();
   if (!line.length()) return;
+  if (keypadTestActive) {
+    Serial.println("[KEYPAD TEST] Bo qua scanner/scan gia lap trong che do test.");
+    return;
+  }
   lastInputAtMs = millis();
   inputEventCount++;
   safeCopy(lastInputPreview, sizeof(lastInputPreview), line.c_str());
@@ -6428,6 +6473,86 @@ bool initKeypad() {
   return keypadMappingReady;
 }
 
+
+// Four isolated LCD pages. The first page works without an NVS mapping;
+// after guided calibration, digits and #/* are interpreted normally.
+static void drawKeypadTestMode() {
+  if (!keypadTestActive) return;
+  char a[84], b[84], c[84];
+  if (keypadTestPage == 0) {
+    snprintf(a, sizeof(a), "PCF8574T @ 0x%02X - %s", keypadAddress,
+             keypadMappingReady ? "MAP OK" : "CHUA MAP");
+    if (keypadTestRawPair >= 0)
+      snprintf(b, sizeof(b), "RAW P%d - P%d | LAN %lu",
+               keypadTestRawPair >> 4, keypadTestRawPair & 15,
+               (unsigned long)keypadTestPressCount);
+    else
+      snprintf(b, sizeof(b), "BAM PHIM | LAN %lu", (unsigned long)keypadTestPressCount);
+    snprintf(c, sizeof(c), keypadMappingReady ? "# NHAP SO | * THOAT" : "WEB: HIEU CHINH 12 PHIM");
+    drawSimple("TEST KET NOI I2C", a, b, c, keypadMappingReady ? C_OK : C_WARN);
+  } else if (keypadTestPage == 1) {
+    snprintf(a, sizeof(a), "NHAP: %s", keypadTestDigitCount ? keypadTestDigits : "_");
+    snprintf(b, sizeof(b), "PHIM CUOI: %c | LAN %lu", keypadTestLastKey,
+             (unsigned long)keypadTestPressCount);
+    drawSimple("TEST NHAP SO", a, b, "0-9 NHAP | * XOA | # TIEP", C_INFO);
+  } else if (keypadTestPage == 2) {
+    snprintf(a, sizeof(a), "MAN HINH %d / 3", (int)keypadTestDemoPage + 1);
+    snprintf(b, sizeof(b), "SO DA NHAP: %s", keypadTestDigitCount ? keypadTestDigits : "_");
+    drawSimple("TEST CHUYEN MAN", a, b, "2 TIEP | 8 LUI | # XONG", C_INFO);
+  } else {
+    snprintf(a, sizeof(a), "SO: %s", keypadTestDigitCount ? keypadTestDigits : "_");
+    snprintf(b, sizeof(b), "SO LAN BAM: %lu", (unsigned long)keypadTestPressCount);
+    drawSimple("TEST HOAN TAT", a, b, "# THOAT | * QUAY LAI", C_OK);
+  }
+}
+static bool startKeypadTestMode() {
+  if (!keypadAvailable || keypadAddress == 0 || keypadCalibrationRequested ||
+      keypadCalibrationInProgress || maintenanceMode || setupPortalActive ||
+      uiState != UiState::READY || hasPendingTransaction()) return false;
+  keypadTestActive = true;
+  keypadTestPage = 0; keypadTestDemoPage = 0;
+  keypadTestDigits[0] = '\0'; keypadTestDigitCount = 0;
+  keypadTestRawPair = -1; keypadTestRawLatch = -1;
+  keypadTestLastKey = '-'; keypadTestPressCount = 0;
+  keypadTestLastActivity = millis();
+  drawKeypadTestMode();
+  Serial.println("[KEYPAD TEST] START, khong phat sinh giao dich MESFlow.");
+  return true;
+}
+static void stopKeypadTestMode() {
+  if (!keypadTestActive) return;
+  keypadTestActive = false;
+  keypadTestRawLatch = -1;
+  Serial.println("[KEYPAD TEST] STOP.");
+  setUi(UiState::READY);
+}
+static void handleKeypadTestKey(char key) {
+  if (!keypadTestActive) return;
+  keypadTestLastActivity = millis();
+  keypadTestLastKey = key;
+  ++keypadTestPressCount;
+  if (keypadTestPage == 0) {
+    if (key == '#') keypadTestPage = 1;
+    else if (key == '*') { stopKeypadTestMode(); return; }
+  } else if (keypadTestPage == 1) {
+    if (key >= '0' && key <= '9' && keypadTestDigitCount < sizeof(keypadTestDigits) - 1) {
+      keypadTestDigits[keypadTestDigitCount++] = key;
+      keypadTestDigits[keypadTestDigitCount] = '\0';
+    } else if (key == '*' && keypadTestDigitCount) {
+      keypadTestDigits[--keypadTestDigitCount] = '\0';
+    } else if (key == '#') keypadTestPage = 2;
+  } else if (keypadTestPage == 2) {
+    if (key == '2') keypadTestDemoPage = (keypadTestDemoPage + 1) % 3;
+    else if (key == '8') keypadTestDemoPage = (keypadTestDemoPage + 2) % 3;
+    else if (key == '#') keypadTestPage = 3;
+    else if (key == '*') keypadTestPage = 1;
+  } else {
+    if (key == '#') { stopKeypadTestMode(); return; }
+    if (key == '*') keypadTestPage = 2;
+  }
+  drawKeypadTestMode();
+}
+
 static bool detectBootWifiSetupShortcut() {
   if (!keypadAvailable || !keypadMappingReady) return false;
   const int firstPair = scanKeypadPair();
@@ -6613,6 +6738,7 @@ void handleKeypadKey(char key) {
   snprintf(lastInputPreview, sizeof(lastInputPreview), "KEYPAD '%c'", key);
   Serial.printf("[KEYPAD] phim='%c' state=%s\n", key, stateName(uiState));
 
+  if (keypadTestActive) { handleKeypadTestKey(key); return; }
   if (recoveryMenuActive) { handleRecoveryMenuKey(key); return; }
 
   if (maintenanceMode) {
@@ -6738,8 +6864,22 @@ static void serviceKeypadPresence() {
 
 void serviceKeypad() {
   serviceKeypadPresence();
-  if (!keypadAvailable || !keypadMappingReady || millis() - keypadLastPollAt < 12) return;
+  if (keypadTestActive && millis() - keypadTestLastActivity > 10UL * 60UL * 1000UL)
+    stopKeypadTestMode();  // Never leave a kiosk in the test view indefinitely.
+  if (!keypadAvailable || millis() - keypadLastPollAt < 12) return;
   keypadLastPollAt = millis();
+  if (!keypadMappingReady) {
+    if (!keypadTestActive) return;
+    const int raw = scanKeypadPair();
+    if (raw == -1) keypadTestRawLatch = -1;
+    else if (raw >= 0 && raw != keypadTestRawLatch) {
+      keypadTestRawLatch = raw; keypadTestRawPair = raw;
+      ++keypadTestPressCount; keypadTestLastActivity = millis();
+      Serial.printf("[KEYPAD TEST] RAW P%d-P%d\n", raw >> 4, raw & 15);
+      drawKeypadTestMode();
+    } else if (raw == -3) Serial.println("[KEYPAD TEST] I2C READ ERROR");
+    return;
+  }
 
   const uint8_t stateNow = static_cast<uint8_t>(uiState);
   if (keypadBufferState != stateNow) {
