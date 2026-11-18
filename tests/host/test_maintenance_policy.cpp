@@ -1,6 +1,7 @@
 // Host unit tests for esp/mesflow_maintenance_policy.h (pure logic, not a hardware test).
 // Build+run: g++ -std=c++17 -Wall -Wextra -Werror -I esp tests/host/test_maintenance_policy.cpp -o /tmp/m && /tmp/m
 #include <cstdio>
+#include <string>
 #include "mesflow_maintenance_policy.h"
 
 using namespace mfmt;
@@ -32,6 +33,11 @@ int main() {
   CHECK(!allowedDuringMaintenance("usb-provision-proof short"));
   CHECK(!allowedDuringMaintenance("usb-provision-proof 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"));
   CHECK(allowedDuringMaintenance("usb-provision-commit esp32-kiosk-396c"));
+  CHECK(allowedDuringMaintenance("usb-provision-config eyJmb28iOiJiYXIifQ"));
+  CHECK(!allowedDuringMaintenance("usb-provision-config short"));
+  CHECK(!allowedDuringMaintenance("usb-provision-config eyJmb28iOiJiYXIifQ="));
+  std::string boundedConfig = "usb-provision-config " + std::string(600, 'a');
+  CHECK(allowedDuringMaintenance(boundedConfig.c_str()));
   CHECK(!allowedDuringMaintenance("usb-provision-commit esp32-kiosk-39xz"));
   CHECK(!allowedDuringMaintenance("factory-reset"));
   CHECK(!allowedDuringMaintenance("clear-offline"));

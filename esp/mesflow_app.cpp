@@ -20,6 +20,7 @@
 #include <Update.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/md.h>
+#include <mbedtls/base64.h>
 #include <esp_task_wdt.h>
 #include "mesflow_ota_policy.h"
 #include "mesflow_keypad_policy.h"
@@ -1991,6 +1992,90 @@ static bool handleUsbProvisionCommit(const String& requestedId) {
     safeCopy(DEVICE_ID,sizeof(DEVICE_ID),desiredId);
   }
   Serial.printf("[USB-PROVISION] DEVICE_ID_SAVED %s\n",desiredId); return true;
+}
+
+// Read-only USB identity handshake. Deliberately omits DEVICE_SECRET, kiosk
+// tokens, Wi-Fi password and any enrollment proof.
+static void handleUsbProvisionHello() {
+  DynamicJsonDocument doc(512);
+  char mac[18]="";
+  mfusb::canonicalMac(WiFi.macAddress().c_str(),mac);
+  Preferences cred; cred.begin("mesflow",true);
+  bool credentialPresent=rt.kioskToken[0] || cred.getString("token","").length() ||
+                         cred.getString("alt_token","").length();
+  cred.end();
+  doc["device_uuid"]=DEVICE_UUID; doc["mac_address"]=mac;
+  doc["device_id"]=DEVICE_ID; doc["station_code"]=STATION_CODE;
+  doc["server_url"]=SERVER_BASE; doc["wifi_ssid"]=WIFI_SSID;
+  doc["bound"]=rt.bound; doc["credential_present"]=credentialPresent;
+  doc["idle"]=(uiState==UiState::READY || uiState==UiState::OFFLINE);
+  doc["pending_transaction"]=hasPendingTransaction();
+  doc["queued_events"]=(countPendingOfflineEvents()>0);
+  doc["ota_in_progress"]=otaInstallInProgress;
+  Serial.print("MESFLOW_USB_HELLO:"); serializeJson(doc,Serial); Serial.println();
+}
+
+// Accept explicit initial config only on a fresh, unbound and idle device.
+// The host supplies identity/server/Wi-Fi/station from its protected manifest;
+// firmware never creates or changes the persistent UUID or device secret here.
+static bool handleUsbProvisionConfig(const String& encoded) {
+  if (encoded.length()<8 || encoded.length()>820) return false;
+  String standard=encoded; standard.replace('-', '+'); standard.replace('_','/');
+  while (standard.length()%4) standard += '=';
+  uint8_t decoded[640]; size_t decodedLength=0;
+  if (mbedtls_base64_decode(decoded,sizeof(decoded),&decodedLength,
+      reinterpret_cast<const unsigned char*>(standard.c_str()),standard.length())!=0 ||
+      decodedLength==0 || decodedLength>=sizeof(decoded)) return false;
+  decoded[decodedLength]='\0';
+  DynamicJsonDocument doc(768);
+  if (deserializeJson(doc,reinterpret_cast<char*>(decoded),decodedLength)) {
+    memset(decoded,0,sizeof(decoded)); return false;
+  }
+  memset(decoded,0,sizeof(decoded));
+  char mac[18]="", desiredId[32]="";
+  String currentMac=WiFi.macAddress();
+  if (!mfusb::canonicalMac(currentMac.c_str(),mac) || !mfusb::deriveDeviceId(mac,desiredId)) return false;
+  Preferences cred; cred.begin("mesflow",true);
+  bool storedCredential=cred.getString("token","").length() || cred.getString("alt_token","").length();
+  cred.end();
+  bool safeState=mfusb::mayAutoConfigure(maintenanceMode,rt.bound,
+      storedCredential || rt.kioskToken[0],
+      uiState==UiState::READY || uiState==UiState::OFFLINE,
+      hasPendingTransaction(),countPendingOfflineEvents()>0,otaInstallInProgress,
+      DEVICE_UUID[0] && String(doc["expected_uuid"] | "")==DEVICE_UUID &&
+        String(doc["mac_address"] | "")==mac,
+      mfusb::factoryOrSameId(DEVICE_ID,desiredId));
+  String ssid=doc["wifi_ssid"] | "", password=doc["wifi_password"] | "";
+  String server=doc["server_url"] | "", station=doc["station_code"] | "";
+  if (!safeState || ssid.length()==0 || ssid.length()>32 || password.length()>64 ||
+      !server.startsWith("https://") || !validServerBase(server) ||
+      station.length()==0 || station.length()>=sizeof(STATION_CODE) ||
+      String(doc["device_id"] | "")!=desiredId) return false;
+
+  char oldSsid[sizeof(WIFI_SSID)],oldPass[sizeof(WIFI_PASSWORD)],oldServer[sizeof(SERVER_BASE)];
+  char oldId[sizeof(DEVICE_ID)],oldName[sizeof(DEVICE_NAME)],oldStation[sizeof(STATION_CODE)];
+  safeCopy(oldSsid,sizeof(oldSsid),WIFI_SSID); safeCopy(oldPass,sizeof(oldPass),WIFI_PASSWORD);
+  safeCopy(oldServer,sizeof(oldServer),SERVER_BASE); safeCopy(oldId,sizeof(oldId),DEVICE_ID);
+  safeCopy(oldName,sizeof(oldName),DEVICE_NAME); safeCopy(oldStation,sizeof(oldStation),STATION_CODE);
+  copyConfigValue(WIFI_SSID,sizeof(WIFI_SSID),ssid); copyConfigValue(WIFI_PASSWORD,sizeof(WIFI_PASSWORD),password);
+  copyConfigValue(SERVER_BASE,sizeof(SERVER_BASE),server); copyConfigValue(STATION_CODE,sizeof(STATION_CODE),station);
+  copyConfigValue(DEVICE_ID,sizeof(DEVICE_ID),desiredId);
+  snprintf(DEVICE_NAME,sizeof(DEVICE_NAME),"ESP32 Kiosk %.4s",desiredId+12);
+  if (!saveDeviceConfig() || !loadDeviceConfig() || strcmp(WIFI_SSID,ssid.c_str()) ||
+      strcmp(WIFI_PASSWORD,password.c_str()) || strcmp(SERVER_BASE,server.c_str()) ||
+      strcmp(STATION_CODE,station.c_str()) || strcmp(DEVICE_ID,desiredId)) {
+    safeCopy(WIFI_SSID,sizeof(WIFI_SSID),oldSsid); safeCopy(WIFI_PASSWORD,sizeof(WIFI_PASSWORD),oldPass);
+    safeCopy(SERVER_BASE,sizeof(SERVER_BASE),oldServer); safeCopy(DEVICE_ID,sizeof(DEVICE_ID),oldId);
+    safeCopy(DEVICE_NAME,sizeof(DEVICE_NAME),oldName); safeCopy(STATION_CODE,sizeof(STATION_CODE),oldStation);
+    bool restored=saveDeviceConfig() && loadDeviceConfig() && !strcmp(WIFI_SSID,oldSsid) &&
+      !strcmp(WIFI_PASSWORD,oldPass) && !strcmp(SERVER_BASE,oldServer) &&
+      !strcmp(DEVICE_ID,oldId) && !strcmp(DEVICE_NAME,oldName) && !strcmp(STATION_CODE,oldStation);
+    Serial.println(restored ? "[USB-PROVISION] Config write failed; previous settings restored." :
+      "[USB-PROVISION] Config write failed; rollback verification failed; device remains unbound.");
+    return false;
+  }
+  Serial.println("USB_CONFIG_APPLIED"); Serial.flush(); delay(400); ESP.restart();
+  return true;
 }
 
 static void saveCurrentCredential() {
@@ -6010,6 +6095,7 @@ static void handleUsbConsoleLine(String line) {
   if (!line.length()) return;
   String cmd = line;
   cmd.toLowerCase();
+  if (cmd == "usb-provision-hello") { handleUsbProvisionHello(); return; }
   if (maintenanceMode) {
     if (!mfmt::allowedDuringMaintenance(cmd.c_str())) {
       Serial.println("[MAINT] Lenh USB khong duoc phep trong che do bao tri.");
@@ -6023,6 +6109,10 @@ static void handleUsbConsoleLine(String line) {
     if (cmd.startsWith("usb-provision-commit ")) {
       String requestedId=line.substring(strlen("usb-provision-commit ")); requestedId.trim();
       handleUsbProvisionCommit(requestedId); lastMaintenanceActivityAt=millis(); return;
+    }
+    if (cmd.startsWith("usb-provision-config ")) {
+      String encoded=line.substring(strlen("usb-provision-config ")); encoded.trim();
+      handleUsbProvisionConfig(encoded); lastMaintenanceActivityAt=millis(); return;
     }
     lastMaintenanceActivityAt = millis();
   }
@@ -6042,7 +6132,8 @@ void readSerialCommands() {
     if (c == '\r' || c == '\n') {
       if (line.length() > 0) {
         String lowerLine=line; lowerLine.toLowerCase();
-        if (lowerLine.startsWith("usb-provision-proof ")) Serial.println("[SERIAL RX] usb-provision-proof [redacted]");
+        if (lowerLine.startsWith("usb-provision-config ")) Serial.println("[SERIAL RX] usb-provision-config [redacted]");
+        else if (lowerLine.startsWith("usb-provision-proof ")) Serial.println("[SERIAL RX] usb-provision-proof [redacted]");
         else if (lowerLine.startsWith("usb-provision-commit ")) Serial.println("[SERIAL RX] usb-provision-commit [redacted]");
         else Serial.printf("[SERIAL RX] %s\n", line.c_str());
         lastInputWasVirtual = false;
@@ -6053,13 +6144,14 @@ void readSerialCommands() {
       continue;
     }
 
-    if (line.length() < 512) line += c;
+    if (line.length() < 900) line += c;
   }
 
   // Ke ca Serial Monitor dang de "No line ending", van xu ly sau 350 ms.
   if (line.length() > 0 && millis() - lastCharAt >= 350) {
     String lowerLine=line; lowerLine.toLowerCase();
-    if (lowerLine.startsWith("usb-provision-proof ")) Serial.println("[SERIAL RX/TIMEOUT] usb-provision-proof [redacted]");
+    if (lowerLine.startsWith("usb-provision-config ")) Serial.println("[SERIAL RX/TIMEOUT] usb-provision-config [redacted]");
+    else if (lowerLine.startsWith("usb-provision-proof ")) Serial.println("[SERIAL RX/TIMEOUT] usb-provision-proof [redacted]");
     else if (lowerLine.startsWith("usb-provision-commit ")) Serial.println("[SERIAL RX/TIMEOUT] usb-provision-commit [redacted]");
     else Serial.printf("[SERIAL RX/TIMEOUT] %s\n", line.c_str());
     lastInputWasVirtual = false;

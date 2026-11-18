@@ -32,6 +32,14 @@ inline bool mayProvision(bool maintenance, bool pending, bool bound, bool idle,
                          bool pendingTransaction, bool queuedEvents) {
   return maintenance && pending && !bound && idle && !pendingTransaction && !queuedEvents;
 }
+inline bool mayAutoConfigure(bool maintenance, bool bound, bool credentialPresent,
+                             bool idle, bool pendingTransaction, bool queuedEvents,
+                             bool otaInProgress, bool identityMatches,
+                             bool existingIdIsSafe) {
+  return maintenance && !bound && !credentialPresent && idle &&
+         !pendingTransaction && !queuedEvents && !otaInProgress &&
+         identityMatches && existingIdIsSafe;
+}
 inline bool factoryOrSameId(const char* current, const char* desired) {
   return current && desired && (strcmp(current,"ESP32-KIOSK-001")==0 || strcmp(current,desired)==0);
 }

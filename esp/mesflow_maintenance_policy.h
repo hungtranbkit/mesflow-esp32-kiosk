@@ -81,8 +81,17 @@ inline bool allowedDuringMaintenance(const char* lowerTrimmed) {
   const char commitPrefix[] = "usb-provision-commit ";
   a=commitPrefix; b=lowerTrimmed;
   while (*a && *a==*b) { ++a; ++b; }
-  if (*a || strlen(b)!=16 || strncmp(b,"esp32-kiosk-",12)!=0) return false;
-  for (size_t i=12;i<16;i++) if (!( (b[i]>='0'&&b[i]<='9') || (b[i]>='a'&&b[i]<='f') )) return false;
+  if (!*a && strlen(b)==16 && strncmp(b,"esp32-kiosk-",12)==0) {
+    bool valid=true;
+    for (size_t i=12;i<16;i++) if (!( (b[i]>='0'&&b[i]<='9') || (b[i]>='a'&&b[i]<='f') )) valid=false;
+    if (valid) return true;
+  }
+  const char configPrefix[] = "usb-provision-config ";
+  a=configPrefix; b=lowerTrimmed;
+  while (*a && *a==*b) { ++a; ++b; }
+  if (*a || strlen(b)<8 || strlen(b)>820) return false;
+  for (;*b;++b) if (!( (*b>='a'&&*b<='z') || (*b>='A'&&*b<='Z') ||
+      (*b>='0'&&*b<='9') || *b=='-' || *b=='_' )) return false;
   return true;
 }
 

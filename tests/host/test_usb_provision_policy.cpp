@@ -15,5 +15,14 @@ int main(){
   CHECK(!mayProvision(true,true,true,true,false,false)); CHECK(!mayProvision(true,true,false,false,false,false));
   CHECK(!mayProvision(true,true,false,true,true,false)); CHECK(!mayProvision(true,true,false,true,false,true));
   CHECK(factoryOrSameId("ESP32-KIOSK-001",id)); CHECK(factoryOrSameId(id,id)); CHECK(!factoryOrSameId("ESP32-KIOSK-0001",id));
+  CHECK(mayAutoConfigure(true,false,false,true,false,false,false,true,true));
+  CHECK(!mayAutoConfigure(false,false,false,true,false,false,false,true,true));
+  CHECK(!mayAutoConfigure(true,true,false,true,false,false,false,true,true));
+  CHECK(!mayAutoConfigure(true,false,true,true,false,false,false,true,true));
+  CHECK(!mayAutoConfigure(true,false,false,true,true,false,false,true,true));
+  CHECK(!mayAutoConfigure(true,false,false,true,false,true,false,true,true));
+  CHECK(!mayAutoConfigure(true,false,false,true,false,false,true,true,true));
+  CHECK(!mayAutoConfigure(true,false,false,true,false,false,false,false,true));
+  CHECK(!mayAutoConfigure(true,false,false,true,false,false,false,true,false));
   std::printf("%d/%d checks passed\n",total-failures,total); return failures?1:0;
 }
