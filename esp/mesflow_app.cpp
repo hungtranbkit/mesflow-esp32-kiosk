@@ -6566,21 +6566,25 @@ static void drawKeypadTestMode() {
 static void drawKeypadTestNumberValue() {
   if (!keypadTestActive || keypadTestPage != 1) return;
   const uint32_t drawStartedUs = micros();
-  // Test numerals are ASCII, so avoid general multi-line/UTF8 text fitting.
-  // Only redraw the numeric value area and the tiny status line.
+  // This board uses Adafruit_GFX, not TFT_eSPI. Its built-in 5x7 ASCII
+  // raster font makes digit feedback much cheaper than UTF-8 text layout.
   const char* digits = keypadTestDigitCount ? keypadTestDigits : "_";
   tft.fillRect(SCREEN_LEFT_MARGIN, 125, 216, 103, C_BG);
-  tft.setTextDatum(MC_DATUM);
+  const uint8_t fontSize = strlen(digits) <= 10 ? 3 : 2;
+  const int16_t digitsWidth = static_cast<int16_t>(strlen(digits) * 6 * fontSize);
   tft.setTextColor(C_TEXT, C_BG);
-  tft.setTextSize(keypadTestDigitCount <= 8 ? 2 : 1);
-  tft.drawString(digits, SW / 2, 157, 2);
-  tft.setTextSize(1);
+  tft.setTextSize(fontSize);
+  tft.setTextWrap(false);
+  tft.setCursor((SW - digitsWidth) / 2, 141);
+  tft.print(digits);
   char last[50];
   snprintf(last, sizeof(last), "PHIM %c | LAN %lu", keypadTestLastKey,
            (unsigned long)keypadTestPressCount);
+  const int16_t lastWidth = static_cast<int16_t>(strlen(last) * 6);
+  tft.setTextSize(1);
   tft.setTextColor(C_MUTED, C_BG);
-  tft.drawString(last, SW / 2, 201, 2);
-  tft.setTextDatum(TL_DATUM);
+  tft.setCursor((SW - lastWidth) / 2, 198);
+  tft.print(last);
   keypadTestDrawLastUs = micros() - drawStartedUs;
   if (keypadTestDrawLastUs > keypadTestDrawMaxUs)
     keypadTestDrawMaxUs = keypadTestDrawLastUs;

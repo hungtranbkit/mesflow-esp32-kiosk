@@ -89,6 +89,6 @@ def test_fast_number_entry_prioritizes_physical_keypad_before_web():
 def test_fast_lcd_avoids_full_redraw_and_tracks_duration():
     body = section("static void drawKeypadTestNumberValue() {",
                    "static bool startKeypadTestMode() {")
-    assert "tft.drawString(digits" in body
+    assert "tft.print(digits" in body
     assert "tft.fillScreen(" not in body
     assert "keypadTestDrawLastUs = micros()" in body
