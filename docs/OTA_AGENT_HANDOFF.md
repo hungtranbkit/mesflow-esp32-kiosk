@@ -63,3 +63,11 @@ Check the current heads again before running acceptance. Earlier readiness docs 
 Read `AGENTS.md` at the repository root. On a connected local node, read its private `OTA_SITE_SETTINGS.local.md` (maintained outside Git) for absolute paths, device IDs and current executable commands. This public runbook deliberately omits internal addresses and hardware serial IDs. If the private file is absent, discover and verify local settings afresh rather than guessing.
 
 Update the **date** and **exact commit SHA** each time an acceptance gate changes. Keep historical evidence as history; do not overwrite it with a current-success claim.
+
+## 2026-11-21 host-native permissions resolution (verified)
+
+**Do not confuse the Terminal MCP user namespace with the host's actual USB ACL.** The isolated M910 Terminal MCP shell showed `nobody:nogroup` and cannot open the USB serial device, but an authorized **host-native SSH session from the HP QA node to M910** runs under the normal `mesflow` account, which belongs to `dialout`. From that host session the exact target USB-ID symlink was validated, the tty was owned by `root:dialout` with mode `0660`, and read/write permission tests passed. A private, identity-checked, no-reset/no-flash probe script on the HP node returned `HOST_SERIAL_ACCESS_PASS`, exit 0.
+
+**Result:** Host-side serial **permission access is PASS without udev or chmod changes**. The previously prepared udev installer remains **uninstalled** and is no longer the preferred path. Use the authorized existing SSH route for hardware diagnostics. This access result does **not** establish the board's ROM MAC, running image, firmware safe point, flash backup, or an actual OTA-over-network transfer; all those still require independent evidence.
+
+HP QA also exhausted Docker's automatic bridge address pools during an isolated MESFlow test run. A **dedicated, verified non-overlapping subnet override for the QA Compose project** successfully started the isolated test stack without deleting other projects' networks or changing the global Docker daemon. This is a QA-only workaround, not an instruction to reuse a fixed subnet on every host. As of this note, the isolated WebKit 1.62.1 Kiosk regression run was started; do not claim it passed until checking the recorded final test exit code.
