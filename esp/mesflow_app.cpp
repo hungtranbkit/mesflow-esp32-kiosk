@@ -22,6 +22,7 @@
 #include <esp_task_wdt.h>
 #include "mesflow_ota_policy.h"
 #include "mesflow_keypad_policy.h"
+#include "mesflow_scanner_rest_policy.h"
 #include "mesflow_maintenance_policy.h"
 #include "mesflow_server_credential_policy.h"
 #include "mesflow_vietnamese_font.h"
@@ -222,6 +223,34 @@ String applyScannerBaudCommand(const String& arg){
 }
 static uint8_t scannerFrame[SCANNER_FRAME_MAX] = {0};
 static size_t scannerFrameLength = 0;
+// This is input suppression only. GM65 TX is wired to ESP RX; there is no
+// verified ESP-to-scanner control wire or power switch on this profile.
+static mfscan::Config scannerRest{true, 22 * 60, 6 * 60};
+static bool scannerSuppressed = false;
+static bool scannerRestClockValid = false;
+static void loadScannerRestConfig() {
+  Preferences p;
+  if (!p.begin("scanner_rest", true)) return;
+  const unsigned start = p.getUInt("start", 22 * 60), end = p.getUInt("end", 6 * 60);
+  scannerRest.enabled = p.getBool("enabled", true);
+  scannerRest.start = start < 1440 ? start : 22 * 60;
+  scannerRest.end = end < 1440 ? end : 6 * 60;
+  p.end();
+}
+static void updateScannerRest() {
+  time_t now = time(nullptr); struct tm local = {};
+  const bool valid = now >= 1704067200 && localtime_r(&now, &local) != nullptr;
+  const uint16_t minute = valid ? local.tm_hour * 60 + local.tm_min : 0;
+  const bool next = mfscan::suppressed(scannerRest, valid, minute);
+  if (next != scannerSuppressed || valid != scannerRestClockValid) {
+    // Discard partial frames both on entering and leaving the window.
+    scannerFrameLength = 0;
+    while (ScannerSerial.available() > 0) ScannerSerial.read();
+    scannerSuppressed = next; scannerRestClockValid = valid;
+    Serial.printf("[SCANNER WINDOW] input=%s clock=%s (power unchanged)\n", next ? "SUPPRESSED" : "ACTIVE", valid ? "VALID" : "UNAVAILABLE");
+  }
+}
+
 static uint32_t scannerLastByteAt = 0;
 static uint32_t scannerByteCount = 0;
 static uint32_t scannerFrameCount = 0;
@@ -5555,6 +5584,7 @@ static void consolePrintStatus() {
                 workerCacheCount, operationCacheCount, offlineSessionCount);
   Serial.printf("LittleFS : %s\n", fsReady ? "READY" : "NOT READY");
   Serial.printf("Scanner  : UART1 GPIO44 baud=%lu bytes=%lu\n", (unsigned long)scannerBaud, (unsigned long)scannerByteCount);
+  Serial.printf("ScanWindow: %s %02u:%02u-%02u:%02u input=%s clock=%s power=UNCHANGED\n", scannerRest.enabled ? "ON" : "OFF", scannerRest.start / 60, scannerRest.start % 60, scannerRest.end / 60, scannerRest.end % 60, scannerSuppressed ? "SUPPRESSED" : "ACTIVE", scannerRestClockValid ? "VALID" : "UNAVAILABLE");
   Serial.printf("Keypad   : %s", !keypadAvailable ? "NOT FOUND" :
                 (keypadMappingReady ? "READY" : "NEEDS CALIBRATION"));
   if (keypadAvailable) Serial.printf(" @ 0x%02X", keypadAddress);
@@ -5741,6 +5771,22 @@ static bool handleConsoleCommand(String line) {
     return true;
   }
   if (cmd.startsWith("key ") && cmd.length() == 5) { handleKeypadKey(line.charAt(4)); return true; }
+  if (cmd == "scanner-window off") {
+    Preferences p; if (!p.begin("scanner_rest", false)) { Serial.println("[SCANNER WINDOW] NVS ERROR"); return true; }
+    const bool ok = p.putBool("enabled", false) > 0; p.end();
+    if (ok) { scannerRest.enabled = false; updateScannerRest(); }
+    Serial.println(ok ? "[SCANNER WINDOW] DISABLED" : "[SCANNER WINDOW] NVS ERROR"); return true;
+  }
+  if (cmd.startsWith("scanner-window on ")) {
+    unsigned h1,m1,h2,m2; char extra;
+    if (sscanf(cmd.c_str(), "scanner-window on %u:%u %u:%u %c", &h1,&m1,&h2,&m2,&extra) != 4 || h1>23 || h2>23 || m1>59 || m2>59 || (h1==h2 && m1==m2)) { Serial.println("[SCANNER WINDOW] INVALID (use on HH:MM HH:MM)"); return true; }
+    const unsigned start=h1*60+m1, end=h2*60+m2;
+    Preferences p; if (!p.begin("scanner_rest", false)) { Serial.println("[SCANNER WINDOW] NVS ERROR"); return true; }
+    const bool ok = p.putBool("enabled",false)>0 && p.putUInt("start",start)>0 && p.putUInt("end",end)>0 && p.putBool("enabled",true)>0; p.end();
+    if (ok) { scannerRest = {true, static_cast<uint16_t>(start), static_cast<uint16_t>(end)}; updateScannerRest(); }
+    else { scannerRest.enabled=false; updateScannerRest(); }
+    Serial.println(ok ? "[SCANNER WINDOW] CONFIGURED" : "[SCANNER WINDOW] NVS ERROR: DISABLED"); return true;
+  }
   if (cmd.startsWith("scanner-baud")) { Serial.print(cmd.length() > 13 ? applyScannerBaudCommand(cmd.substring(13)) : String("scanner-baud = ") + String(scannerBaud) + "\n"); return true; }
   if (cmd == "bind") { bindKiosk(); return true; }
   if (cmd == "heartbeat") { sendHeartbeat(); return true; }
@@ -6119,6 +6165,8 @@ void dispatchScannerFrame(const char* reason) {
 }
 
 void readScannerCommands() {
+  updateScannerRest();
+  if (scannerSuppressed) { while (ScannerSerial.available() > 0) ScannerSerial.read(); scannerFrameLength = 0; return; }
   while (ScannerSerial.available() > 0) {
     const int raw = ScannerSerial.read();
     if (raw < 0) continue;
@@ -7247,6 +7295,8 @@ void setup() {
   esp_task_wdt_add(NULL);
 
   Serial.begin(115200);
+  loadScannerRestConfig();
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
   pinMode(SCANNER_RX_PIN, INPUT_PULLUP);
   ScannerSerial.setRxBufferSize(1024);
   {
@@ -7399,7 +7449,6 @@ void setup() {
     if (bootWifiSetupRequested) enterMaintenanceMode(true);
     return;
   } else {
-    configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
     startLanProvisioning();
   }
 
