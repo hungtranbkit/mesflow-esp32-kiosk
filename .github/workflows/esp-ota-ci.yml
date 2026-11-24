@@ -31,6 +31,8 @@ jobs:
           /tmp/test_scanner_rest_policy
           g++ -std=c++17 -Wall -Wextra -Werror -I esp tests/host/test_kiosk_sleep_policy.cpp -o /tmp/test_kiosk_sleep_policy
           /tmp/test_kiosk_sleep_policy
+          g++ -std=c++17 -pthread -Wall -Wextra -Werror -I esp tests/host/test_sleep_ota_gate.cpp -o /tmp/test_sleep_ota_gate
+          /tmp/test_sleep_ota_gate
       - name: Python tools tests (OTA phase1, offline queue, release verifier)
         run: |
           python3 -m pip install pytest==9.2.0

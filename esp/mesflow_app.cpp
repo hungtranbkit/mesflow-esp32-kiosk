@@ -24,6 +24,7 @@
 #include "mesflow_keypad_policy.h"
 #include "mesflow_scanner_rest_policy.h"
 #include "mesflow_kiosk_sleep_policy.h"
+#include "mesflow_sleep_ota_gate.h"
 #include <esp_sleep.h>
 #include "mesflow_maintenance_policy.h"
 #include "mesflow_server_credential_policy.h"
@@ -561,6 +562,8 @@ uint32_t lastOtaCheckAt = 0;
 bool otaAvailableWaitingIdle = false;
 bool otaCheckSucceeded = false;
 volatile bool otaCheckTaskRunning = false;
+static portMUX_TYPE otaSleepMux = portMUX_INITIALIZER_UNLOCKED;
+static mfks::OtaSleepGate otaSleepGate;
 bool otaLinkReady = false;
 char otaFirmwareId[40] = "", otaTargetVersion[40] = "", otaTargetBuild[40] = "";
 char otaDownloadUrl[384] = "", otaExpectedSha256[65] = "";
@@ -5361,7 +5364,10 @@ static void checkForOta() {
 
 static void otaCheckTask(void*) {
   checkForOta();
+  portENTER_CRITICAL(&otaSleepMux);
   otaCheckTaskRunning = false;
+  otaSleepGate.endOta();
+  portEXIT_CRITICAL(&otaSleepMux);
   vTaskDelete(nullptr);
 }
 
@@ -5380,10 +5386,17 @@ static void scheduleOtaCheck() {
   if (otaCheckTaskRunning || !rt.bound || WiFi.status() != WL_CONNECTED || !rt.online) return;
   const uint32_t interval = otaAvailableWaitingIdle || !otaCheckSucceeded ? otaRetryIntervalMs() : OTA_CHECK_INTERVAL_MS;
   if (lastOtaCheckAt && millis() - lastOtaCheckAt < interval) return;
-  otaCheckTaskRunning = true;
+  portENTER_CRITICAL(&otaSleepMux);
+  const bool otaReserved = otaSleepGate.beginOta();
+  if (otaReserved) otaCheckTaskRunning = true;
+  portEXIT_CRITICAL(&otaSleepMux);
+  if (!otaReserved) return;
   // HTTPS + ArduinoJson parsing uses more stack than the normal UI task.
   if (xTaskCreatePinnedToCore(otaCheckTask, "mesflow-ota-check", 24576, nullptr, 1, nullptr, 0) != pdPASS) {
+    portENTER_CRITICAL(&otaSleepMux);
     otaCheckTaskRunning = false;
+    otaSleepGate.endOta();
+    portEXIT_CRITICAL(&otaSleepMux);
     Serial.println("[OTA] Cannot allocate OTA check task");
   }
 }
@@ -5597,11 +5610,15 @@ static bool startKioskSleep(uint32_t seconds, bool allowQueuedTelemetry = false)
     Serial.printf("[KIOSK SLEEP] REFUSED ui=%s pending=%d offline=%u action=%u worker=%d op=%d session=%d open=%u frame=%u ota=%d checking=%d available=%d maint=%d setup=%d diag=%d calibration=%d recovery=%d enroll=%d\n", stateName(uiState), int(hasPendingTransaction()), unsigned(countPendingOfflineEvents()), unsigned(actionQueueCount()), int(rt.hasWorker), int(rt.hasOperation), rt.activeSessionId, unsigned(openOpCount), unsigned(scannerFrameLength), int(otaInstallInProgress), int(otaCheckTaskRunning), int(otaAvailableSince!=0), int(maintenanceMode), int(setupPortalActive), int(keypadTestActive), int(keypadCalibrationRequested||keypadCalibrationInProgress), int(recoveryMenuActive), int(enrollmentPending));
     return false;
   }
+  portENTER_CRITICAL(&otaSleepMux);
+  const bool sleepReserved = otaSleepGate.beginSleep();
+  portEXIT_CRITICAL(&otaSleepMux);
+  if (!sleepReserved) { Serial.println("[KIOSK SLEEP] REFUSED OTA gate"); return false; }
   const esp_err_t e=esp_sleep_enable_timer_wakeup(uint64_t(seconds)*1000000ULL);
-  if (e!=ESP_OK) { Serial.printf("[KIOSK SLEEP] TIMER ERROR %d\n",int(e)); return false; }
+  if (e!=ESP_OK) { portENTER_CRITICAL(&otaSleepMux); otaSleepGate.endSleep(); portEXIT_CRITICAL(&otaSleepMux); Serial.printf("[KIOSK SLEEP] TIMER ERROR %d\n",int(e)); return false; }
   Serial.printf("[KIOSK SLEEP] START seconds=%lu scanner_power=UNCHANGED\n",(unsigned long)seconds);
   Serial.flush(); digitalWrite(TFT_BL, LOW); delay(100); esp_deep_sleep_start();
-  digitalWrite(TFT_BL, HIGH); Serial.println("[KIOSK SLEEP] ERROR RETURNED"); return false;
+  digitalWrite(TFT_BL, HIGH); portENTER_CRITICAL(&otaSleepMux); otaSleepGate.endSleep(); portEXIT_CRITICAL(&otaSleepMux); Serial.println("[KIOSK SLEEP] ERROR RETURNED"); return false;
 }
 static void serviceKioskSleep() {
   if (!kioskSleep.enabled || millis()<120000UL || kioskSleepBusy() ||
@@ -5835,6 +5852,7 @@ static bool handleConsoleCommand(String line) {
     Serial.println(saveKioskSleep(next) ? "[KIOSK SLEEP] CONFIGURED" : "[KIOSK SLEEP] NVS ERROR"); return true;
   }
   if (cmd == "kiosk-sleep test 15") { startKioskSleep(15, true); return true; }
+  if (cmd == "kiosk-sleep test 30") { startKioskSleep(30, true); return true; }
   if (cmd == "scanner-window off") {
     Preferences p; if (!p.begin("scanner_rest", false)) { Serial.println("[SCANNER WINDOW] NVS ERROR"); return true; }
     const bool ok = p.putBool("enabled", false) > 0; p.end();
