@@ -23,6 +23,8 @@
 #include "mesflow_ota_policy.h"
 #include "mesflow_keypad_policy.h"
 #include "mesflow_scanner_rest_policy.h"
+#include "mesflow_kiosk_sleep_policy.h"
+#include <esp_sleep.h>
 #include "mesflow_maintenance_policy.h"
 #include "mesflow_server_credential_policy.h"
 #include "mesflow_vietnamese_font.h"
@@ -5563,6 +5565,55 @@ void resetForNextWorker() {
 // Administrative commands are handled before QR/session blocking so that
 // recovery commands remain available even while a transaction is pending.
 // ============================================================
+// Disabled until an operator has verified timer wake and the USB recovery path.
+struct KioskSleepRecord { uint32_t magic; uint16_t start; uint16_t end; uint8_t enabled; uint8_t reserved[3]; };
+static KioskSleepRecord kioskSleep{0x4b535031, 22*60, 6*60, 0, {0,0,0}};
+static uint32_t kioskTimerWakes = 0;
+static void recordTimerWake() {
+  Preferences p; if (!p.begin("kiosk_sleep", false)) return;
+  kioskTimerWakes=p.getUInt("timer_wakes",0);
+  if (esp_sleep_get_wakeup_cause()==ESP_SLEEP_WAKEUP_TIMER) { ++kioskTimerWakes; p.putUInt("timer_wakes",kioskTimerWakes); }
+  p.end();
+}
+static void loadKioskSleep() {
+  Preferences p; KioskSleepRecord saved{};
+  if (!p.begin("kiosk_sleep", true)) return;
+  const bool ok = p.getBytesLength("config") == sizeof(saved) && p.getBytes("config", &saved, sizeof(saved)) == sizeof(saved); p.end();
+  if (ok && saved.magic==0x4b535031 && saved.start<1440 && saved.end<1440 && saved.start!=saved.end && saved.enabled<=1) kioskSleep=saved;
+}
+static bool saveKioskSleep(const KioskSleepRecord& r) {
+  Preferences p; if (!p.begin("kiosk_sleep", false)) return false;
+  const bool ok = p.putBytes("config", &r, sizeof(r))==sizeof(r); p.end();
+  if (ok) kioskSleep=r; return ok;
+}
+static bool kioskSleepBusy(bool allowQueuedTelemetry = false) {
+  return uiState!=UiState::READY || hasPendingTransaction() || countPendingOfflineEvents()>0 || (!allowQueuedTelemetry && actionQueueCount()>0) ||
+         rt.hasWorker || rt.hasOperation || rt.activeSessionId != 0 || openOpCount > 0 || scannerFrameLength > 0 ||
+         otaInstallInProgress || otaCheckTaskRunning || otaAvailableSince || maintenanceMode || setupPortalActive ||
+         keypadTestActive || keypadCalibrationRequested || keypadCalibrationInProgress || recoveryMenuActive || enrollmentPending;
+}
+static bool startKioskSleep(uint32_t seconds, bool allowQueuedTelemetry = false) {
+  if (!seconds || kioskSleepBusy(allowQueuedTelemetry)) {
+    Serial.printf("[KIOSK SLEEP] REFUSED ui=%s pending=%d offline=%u action=%u worker=%d op=%d session=%d open=%u frame=%u ota=%d checking=%d available=%d maint=%d setup=%d diag=%d calibration=%d recovery=%d enroll=%d\n", stateName(uiState), int(hasPendingTransaction()), unsigned(countPendingOfflineEvents()), unsigned(actionQueueCount()), int(rt.hasWorker), int(rt.hasOperation), rt.activeSessionId, unsigned(openOpCount), unsigned(scannerFrameLength), int(otaInstallInProgress), int(otaCheckTaskRunning), int(otaAvailableSince!=0), int(maintenanceMode), int(setupPortalActive), int(keypadTestActive), int(keypadCalibrationRequested||keypadCalibrationInProgress), int(recoveryMenuActive), int(enrollmentPending));
+    return false;
+  }
+  const esp_err_t e=esp_sleep_enable_timer_wakeup(uint64_t(seconds)*1000000ULL);
+  if (e!=ESP_OK) { Serial.printf("[KIOSK SLEEP] TIMER ERROR %d\n",int(e)); return false; }
+  Serial.printf("[KIOSK SLEEP] START seconds=%lu scanner_power=UNCHANGED\n",(unsigned long)seconds);
+  Serial.flush(); digitalWrite(TFT_BL, LOW); delay(100); esp_deep_sleep_start();
+  digitalWrite(TFT_BL, HIGH); Serial.println("[KIOSK SLEEP] ERROR RETURNED"); return false;
+}
+static void serviceKioskSleep() {
+  if (!kioskSleep.enabled || millis()<120000UL || kioskSleepBusy() ||
+      (lastUserActionAt && millis()-lastUserActionAt<120000UL) ||
+      (lastInputAtMs && millis()-lastInputAtMs<120000UL)) return;
+  const time_t now=time(nullptr); struct tm local={};
+  const bool valid=now>=1704067200 && localtime_r(&now,&local)!=nullptr;
+  const uint32_t day=valid ? uint32_t(local.tm_hour)*3600+local.tm_min*60+local.tm_sec : 0;
+  const uint32_t seconds=mfks::waitSeconds({true,kioskSleep.start,kioskSleep.end},valid,day);
+  if (mfks::maySleep(true,valid,false,false) && seconds) startKioskSleep(seconds);
+}
+
 static void consolePrintStatus() {
   Serial.println("\n================ MESFLOW STATUS ================");
   Serial.printf("Firmware : %s\n", APP_VERSION);
@@ -5597,6 +5648,8 @@ static void consolePrintStatus() {
                 static_cast<unsigned>(ESP.getPsramSize()),
                 static_cast<unsigned>(ESP.getFreePsram()),
                 offlineBuffersReady ? "READY" : "DISABLED");
+  Serial.printf("KioskTimerWakes: %lu\n",(unsigned long)kioskTimerWakes);
+  Serial.printf("KioskSleep: %s %02u:%02u-%02u:%02u (GM65 power unchanged)\n",kioskSleep.enabled ? "ON" : "OFF",kioskSleep.start/60,kioskSleep.start%60,kioskSleep.end/60,kioskSleep.end%60);
   Serial.println("=================================================\n");
 }
 
@@ -5771,6 +5824,17 @@ static bool handleConsoleCommand(String line) {
     return true;
   }
   if (cmd.startsWith("key ") && cmd.length() == 5) { handleKeypadKey(line.charAt(4)); return true; }
+  if (cmd == "kiosk-sleep off") {
+    KioskSleepRecord next=kioskSleep; next.enabled=0;
+    Serial.println(saveKioskSleep(next) ? "[KIOSK SLEEP] DISABLED" : "[KIOSK SLEEP] NVS ERROR"); return true;
+  }
+  if (cmd.startsWith("kiosk-sleep on ")) {
+    unsigned h1,m1,h2,m2; char extra;
+    if (sscanf(cmd.c_str(),"kiosk-sleep on %u:%u %u:%u %c",&h1,&m1,&h2,&m2,&extra)!=4 || h1>23 || h2>23 || m1>59 || m2>59 || (h1==h2 && m1==m2)) { Serial.println("[KIOSK SLEEP] INVALID"); return true; }
+    KioskSleepRecord next=kioskSleep; next.start=h1*60+m1; next.end=h2*60+m2; next.enabled=1;
+    Serial.println(saveKioskSleep(next) ? "[KIOSK SLEEP] CONFIGURED" : "[KIOSK SLEEP] NVS ERROR"); return true;
+  }
+  if (cmd == "kiosk-sleep test 15") { startKioskSleep(15, true); return true; }
   if (cmd == "scanner-window off") {
     Preferences p; if (!p.begin("scanner_rest", false)) { Serial.println("[SCANNER WINDOW] NVS ERROR"); return true; }
     const bool ok = p.putBool("enabled", false) > 0; p.end();
@@ -7295,6 +7359,9 @@ void setup() {
   esp_task_wdt_add(NULL);
 
   Serial.begin(115200);
+  loadKioskSleep();
+  recordTimerWake();
+  Serial.printf("[KIOSK SLEEP] wake_cause=%d schedule=%s\n",int(esp_sleep_get_wakeup_cause()),kioskSleep.enabled ? "ON" : "OFF");
   loadScannerRestConfig();
   configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
   pinMode(SCANNER_RX_PIN, INPUT_PULLUP);
@@ -7544,6 +7611,7 @@ void loop() {
     delay(2);
     return;
   }
+  serviceKioskSleep();
   readScannerCommands();
   serviceKeypad();
   handleTouch();
