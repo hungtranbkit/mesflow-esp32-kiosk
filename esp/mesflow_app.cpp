@@ -28,6 +28,7 @@
 #include <esp_sleep.h>
 #include "mesflow_maintenance_policy.h"
 #include "mesflow_server_credential_policy.h"
+#include "mesflow_device_identity.h"
 #include "mesflow_vietnamese_font.h"
 
 #ifndef MESFLOW_UI_SCREENSHOT
@@ -85,10 +86,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.6"
-#define FW_BUILD "20261112.0003"
+#define FW_VERSION "5.6.9"
+#define FW_BUILD "20261127.0003"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.6-KIMEX-OTA-SCOPED";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.9-KIMEX-IDENTITY";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -114,6 +115,16 @@ static const uint16_t OTA_EXPECTED_CHIP_ID = CONFIG_IDF_FIRMWARE_CHIP_ID;
 #else
 static const uint16_t OTA_EXPECTED_CHIP_ID = 9;  // ESP32-S3
 #endif
+// A legacy single-app table can return the running partition as the next OTA
+// candidate. It is not an inactive destination and must never be advertised
+// or used for OTA, regardless of a stale/forced server offer.
+static const esp_partition_t* inactiveOtaPartition() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+  if (!running || !next || running->address == next->address) return nullptr;
+  return next;
+}
+
 // Arduino marks every boot valid unless this returns true. Returning true
 // keeps a freshly OTA'd image in PENDING_VERIFY until otaLocalSelfCheck()
 // passes, so a crashing image is rolled back by the bootloader instead of
@@ -618,11 +629,10 @@ int16_t touchSliderValue = 50;
 // NTP remains a fallback. The screen only redraws the clock when the minute
 // changes, so it does not flicker or waste SPI bandwidth.
 constexpr time_t MIN_VALID_EPOCH = 1700000000;
-// 240px kiosk header: keep the clock centered and reserve the right edge for
-// the Wi-Fi signal indicator. Kimex remains anchored at the left.
-constexpr int16_t CLOCK_X = 88;
+// 240px header: name + stable ID on the left, clock and signal at the right.
+constexpr int16_t CLOCK_X = 150;
 constexpr int16_t CLOCK_Y = 6;
-constexpr int16_t CLOCK_W = 64;
+constexpr int16_t CLOCK_W = 56;
 constexpr int16_t CLOCK_H = 22;
 
 // Header network indicator: blinking green means Wi-Fi + MES connection are alive.
@@ -1958,7 +1968,8 @@ bool saveDeviceConfig() {
   // An empty Agent URL is valid (OTA not configured yet); never fail the save on it.
   if (OTA_AGENT_BASE[0]) prefs.putString("ota_agent", OTA_AGENT_BASE); else prefs.remove("ota_agent");
   ok &= prefs.putString("device_id", DEVICE_ID) > 0;
-  ok &= prefs.putString("device_name", DEVICE_NAME) > 0;
+  if (prefs.getString("device_name", "") != DEVICE_NAME)
+    ok &= prefs.putString("device_name", DEVICE_NAME) > 0;
   ok &= prefs.putString("station", STATION_CODE) > 0;
   prefs.putUInt("cfg_ver", 1);
   prefs.end();
@@ -1976,6 +1987,7 @@ static bool validServerBase(const String& value) {
 // when the kiosk is moved to another server (e.g. production -> staging).
 bool enrollmentPending = false;
 char enrollmentCode[7] = "";
+static mfidentity::DisplayChanges identityDisplayChanges;
 
 static void computeEnrollmentCode(char out[7]) {
   uint8_t digest[32];
@@ -1985,12 +1997,39 @@ static void computeEnrollmentCode(char out[7]) {
   mfcred::enrollmentCodeFromDigest(digest, out);
 }
 
-static void saveCurrentCredential() {
-  prefs.begin("mesflow", false);
-  if (rt.kioskToken[0]) { prefs.putString("token", rt.kioskToken); prefs.putString("token_srv", SERVER_BASE); }
-  else { prefs.remove("token"); prefs.remove("token_srv"); }
-  prefs.putString("station", STATION_CODE);
+static bool saveCurrentCredential() {
+  if (!prefs.begin("mesflow", false)) return false;
+  bool ok = true;
+  if (rt.kioskToken[0]) {
+    ok &= prefs.putString("token", rt.kioskToken) > 0;
+    ok &= prefs.putString("token_srv", SERVER_BASE) > 0;
+  } else {
+    prefs.remove("token"); prefs.remove("token_srv");
+  }
+  ok &= prefs.putString("station", STATION_CODE) > 0;
+  ok &= prefs.getString("token", "") == rt.kioskToken;
+  ok &= prefs.getString("token_srv", "") == (rt.kioskToken[0] ? SERVER_BASE : "");
+  ok &= prefs.getString("station", "") == STATION_CODE;
   prefs.end();
+  return ok;
+}
+
+// The server owns the friendly name. Never infer it from legacy DEVICE_ID,
+// and never publish a name whose durable write failed.
+static bool adoptServerDeviceName(JsonVariantConst value) {
+  if (!value.is<const char*>()) return false;
+  const JsonString name = value.as<JsonString>();
+  const bool changed = mfidentity::adoptName(name.c_str(), name.size(), DEVICE_NAME,
+      sizeof(DEVICE_NAME), [](const char* text) {
+        Preferences config;
+        if (!config.begin("mesflow_cfg", false)) return false;
+        bool saved = config.putString("device_name", text) > 0;
+        saved &= config.getString("device_name", "") == text;
+        config.end();
+        return saved;
+      });
+  if (changed) identityDisplayChanges.renamed();
+  return changed;
 }
 
 // Called BEFORE SERVER_BASE is replaced by newServer. Never deletes a
@@ -3259,7 +3298,14 @@ void handleTouch() {
 void drawIndustrialHeader(uint16_t statusColor = C_OK) {
   // One consistent header on every production screen.
   tft.fillRect(0, 0, SW, HEADER_H, C_BG);
-  printText(10, 10, "Kimex", FONT_HEADER, C_TEXT, true);
+  // Use the Vietnamese font and UTF-8 aware fitting for editable names.
+  drawTextBox(DEVICE_NAME, 10, 1, CLOCK_X - 16, 21,
+              FONT_SECTION, FONT_HEADER, 1, TextAlign::LEFT, C_TEXT, true);
+  char shortId[9], label[16];
+  snprintf(label, sizeof(label), "ID %s",
+           mfidentity::shortDeviceId(DEVICE_UUID, shortId) ? shortId : "--");
+  printText(10, 21, label, FONT_HEADER, C_MUTED);
+  identityDisplayChanges.drawn();
   // Worker screens expose only signal strength; detailed network state remains
   // in hidden Maintenance and logs.
   tft.drawFastHLine(10, HEADER_H - 1, SW - 20, C_PANEL_2);
@@ -3580,6 +3626,24 @@ static void redrawProductionUi() {
     case UiState::ERROR_STATE: drawError(); break;
     default: drawReady(); break;
   }
+}
+
+// Background bind/heartbeat may run during a worker flow. Repaint only idle
+// screens, without setUi() or clearing any worker/operation/quantity state.
+static void refreshDeviceIdentityDisplay() {
+  const bool idle = uiState == UiState::READY || uiState == UiState::OFFLINE;
+  // loop() calls this every tick. Check pending display work before touching
+  // the LittleFS journal, and keep all cheap busy guards ahead of that scan.
+  if (identityDisplayChanges.needed(idle, false) == mfidentity::Refresh::NONE) return;
+  const bool busy = rt.hasWorker || rt.hasOperation || maintenanceMode || setupPortalActive ||
+      keypadCalibrationRequested || keypadCalibrationInProgress || keypadTestActive ||
+      recoveryMenuActive || otaInstallInProgress || otaCheckTaskRunning ||
+      hasPendingTransaction() || countPendingOfflineEvents() > 0;
+  const mfidentity::Refresh refresh = identityDisplayChanges.needed(idle, busy);
+  if (refresh == mfidentity::Refresh::NONE) return;
+  if (refresh == mfidentity::Refresh::APPROVAL) redrawProductionUi();
+  else drawIndustrialHeader();
+  drawTopClock(true);
 }
 
 static void enterMaintenanceMode(bool duringBoot) {
@@ -4625,7 +4689,7 @@ bool bindKiosk() {
   request["hardware_model"] = HW_MODEL;
   request["hardware_profile"] = HW_PROFILE;
   request["firmware_artifact_id"] = otaRunningArtifact;
-  request["ota_capable"] = true;
+  request["ota_capable"] = inactiveOtaPartition() != nullptr;
   request["boot_id"] = String(bootId, HEX);
   request["boot_reason"] = String((int)esp_reset_reason());
   request["browser"] = "MESFlow Embedded Kiosk";
@@ -4666,26 +4730,40 @@ bool bindKiosk() {
     return false;
   }
 
+  const bool wasEnrollmentPending = enrollmentPending;
+  char previousToken[sizeof(rt.kioskToken)], previousStation[sizeof(STATION_CODE)];
+  safeCopy(previousToken, sizeof(previousToken), rt.kioskToken);
+  safeCopy(previousStation, sizeof(previousStation), STATION_CODE);
   safeCopy(rt.kioskToken, sizeof(rt.kioskToken), token);
   const char* assignedStation = response["station_code"] | "";
-  const char* assignedName = response["device_name"] | "";
   if (assignedStation[0]) safeCopy(STATION_CODE, sizeof(STATION_CODE), assignedStation);
-  if (assignedName[0]) safeCopy(DEVICE_NAME, sizeof(DEVICE_NAME), assignedName);
+  // A successful HTTP response is insufficient: keep pending/retryable until
+  // the token, issuing server and station have been written and read back.
+  if (!saveCurrentCredential()) {
+    safeCopy(rt.kioskToken, sizeof(rt.kioskToken), previousToken);
+    safeCopy(STATION_CODE, sizeof(STATION_CODE), previousStation);
+    Serial.println("[BIND] Credential save failed; approval remains retryable.");
+    remoteLogf("BIND credential persistence failed");
+    if (showBindingScreen) setUi(UiState::READY);
+    return false;
+  }
   rt.bound = true;
   enrollmentPending = false; enrollmentCode[0] = '\0';
-  saveCurrentCredential();  // token + the server that issued it
+  if (wasEnrollmentPending) identityDisplayChanges.approved();
   // Keep the server-approved station consistent across both existing NVS namespaces.
   // This is a persistence fix only; Multi-OP and scanner logic are unchanged.
   if (!saveDeviceConfig()) {
     Serial.println("[BIND] Warning: station config save failed");
   }
 
+  adoptServerDeviceName(response["device_name"]);
   Serial.println("Kiosk bind OK; token da luu NVS.");
   remoteLogf("BIND OK station=%s", STATION_CODE);
   if (showBindingScreen || uiState == UiState::BINDING) {
     setUi(UiState::READY);
     Serial.println("[READY] Bind thanh cong; san sang quet the.");
   }
+  refreshDeviceIdentityDisplay();
   return true;
 }
 
@@ -4966,7 +5044,7 @@ bool sendHeartbeat() {
   request["hardware_model"] = HW_MODEL;
   request["hardware_profile"] = HW_PROFILE;
   request["firmware_artifact_id"] = otaRunningArtifact;
-  request["ota_capable"] = true;
+  request["ota_capable"] = inactiveOtaPartition() != nullptr;
   request["boot_id"] = String(bootId, HEX);
   request["boot_reason"] = String((int)esp_reset_reason());
 
@@ -5043,10 +5121,12 @@ bool sendHeartbeat() {
   String payload(body);
   int status = http.POST(payload);
   String responseBody;
+  bool responseJsonValid = false;
   if (status > 0) {
     responseBody = http.getString();
     if (responseBody.length()) {
       DeserializationError err = deserializeJson(response, responseBody);
+      responseJsonValid = !err;
       if (err && status >= 200 && status < 300) {
         Serial.printf("[heartbeat] JSON loi: %s\n", err.c_str());
       }
@@ -5080,6 +5160,8 @@ bool sendHeartbeat() {
     if (response["config_version"].is<int>()) {
       Serial.printf("[heartbeat] config_version=%d\n", response["config_version"].as<int>());
     }
+    if (responseJsonValid) adoptServerDeviceName(response["device_name"]);
+    refreshDeviceIdentityDisplay();
     adoptAdvertisedOtaAgent(response["ota_agent_url"] | "");
 
     Serial.printf("[heartbeat] OK RSSI=%d heap=%u\n",
@@ -5178,7 +5260,7 @@ static bool performOtaUpdate() {
     return otaFailNow("OTA_FAILED", "OTA_ORIGIN_MISMATCH", "Download URL is not on the Agent origin");
   if (mfota::compareVersions(otaTargetVersion, FW_VERSION) < 0 && !otaAllowDowngrade)
     return otaFailNow("OTA_FAILED", "OTA_DOWNGRADE_REFUSED", otaTargetVersion);
-  const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+  const esp_partition_t* next = inactiveOtaPartition();
   if (!next || otaExpectedSize == 0 || otaExpectedSize > next->size)
     return otaFailNow("OTA_FAILED", "OTA_NO_SPACE", "Firmware exceeds inactive OTA partition");
   otaEvent("OTA_DOWNLOAD_START");
@@ -7635,6 +7717,7 @@ void loop() {
   handleTouch();
   serviceStateWatchdog();
   maintainConnection();
+  refreshDeviceIdentityDisplay();
   // Background telemetry is lowest priority. Do not let its HTTP POST delay a
   // recent Web Console command or scanner interaction.
   if (millis() - lastWebCommandAcceptedAt > 8000) serviceActionEventQueue();

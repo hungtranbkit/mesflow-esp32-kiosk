@@ -2,6 +2,81 @@
 
 Living handoff for the next agent. Code/tests/git/runtime evidence win over these notes.
 
+## Existing M910 single-app layout — 2026-11-27, firmware 5.6.9
+
+- Actual A's verified flash table matches Arduino 3.3.11 huge_app exactly;
+  it has one 3MiB app and no inactive OTA slot. See
+  docs/M910_HUGE_APP_SERIAL.md for provenance and preservation requirements.
+- Build 20261127.0003 adds an explicit VERIFIED serial-app-only profile
+  and reuses the release compiler/verifier without producing an OTA ZIP.
+  Default dual-slot OTA profiles and their release path remain unchanged.
+- Runtime OTA capability and installation require a distinct inactive app
+  partition. Identity, pending-display recovery, scanner, keypad and
+  sleep/OTA interlock behavior are retained.
+- Preserve frozen 5.6.7 and 5.6.8 artifacts; neither was flashed to A.
+  After a read-only trial, the unchanged old app was restored and verified
+  on LAN/LCD using the installed esptool watchdog-reset exit.
+
+## Approval display and device identity — 2026-11-27, firmware 5.6.8
+
+- Prepared branch: `agent/codex/esp-approval-identity-v567-20261127`, based on
+  `fix/deepsleep-ota-gate-20261124` / b88928ec251c17ed0e86bf38d05989b4cc119025.
+  Its entire git tree is identical to the actual M910 gated source commit
+  ecd93e0f092cff13c9dc5dad8ea5fcc9e41040d6. ECD descends from A's sleep
+  source 356b4dbd02 and B's keypad source 2b131c1354; all those features remain.
+- A's running 5.6.6 image was built before ECD was committed: embedded build
+  `20261112.0003.g356b4dbd02.sleep-ota-gate`, verified existing app SHA256
+  ef2e649de6b2cb13e33621c061d0c326a0b77a441d20dc95ce8261b7d5b84d03.
+  The version label alone is not binary provenance. B's existing image has build
+  `20261112.0003.g2b131c1354.keypad-test` and app SHA256
+  dc0b1e517c5eaebf7d61fd91b0bb65aaed07ba451e222e82d8df9c913b9e3054.
+- Confirmed defect: successful background bind cleared enrollment flags while
+  leaving the pending LCD pixels. Approval now waits for durable credential
+  writes/readback, and requests an idle repaint. Worker, operation and quantity
+  screens are preserved; no runtime selection reset is performed.
+- Authenticated successful bind and valid successful heartbeat JSON accept the
+  optional canonical server `device_name`. Invalid, absent or unchanged names
+  are ignored. Names must be nonblank valid UTF-8, at most 63 encoded bytes,
+  without C0/DEL controls. No Unicode normalization is applied. Changed names
+  are persisted before publication; flash-write failure remains retryable.
+- The existing Vietnamese renderer shows name plus `ID XXXXXXXX` in the
+  unchanged 36 px header. The ID is the last eight UUID hex digits, uppercase.
+  Full UUID, secret, token, station, scanner baud, keypad mapping and sleep/OTA
+  configuration keep their existing namespaces and values.
+  Initial administrator naming: Máy 1 = B / MAC ending 39:6C / ID 99B57712;
+  Máy 2 = A / MAC ending 39:84 / ID 2457DB39. Names remain server-editable.
+- Verification before compile: all eight C++ host test executables pass with
+  -Wall -Wextra -Werror; the established Python gate plus the new regression
+  passes 45 tests. The regression executes the real bindKiosk function with
+  fake HTTP/NVS/LCD edges: it failed on the old pending pixels and passes after
+  the fix, including failed persistence and active quantity-entry preservation.
+- Review corrections for 5.6.8 / build 20261127.0002: move the name box to
+  y=1 so the tallest Vietnamese accent glyphs remain on screen. Pixel tests
+  using the actual font assets cover every name glyph: FONT16 ink y=0..19,
+  fallback FONT12 y=1..16, above the ID row and header separator.
+  Check pending display work and cheap busy flags before the LittleFS journal,
+  so normal loop ticks and active screens perform zero journal reads for this
+  service. Both regressions failed before these corrections and now pass.
+- The unflashed 5.6.7 candidate at 94930d0b873d8a858b9d2a5dd9fda6c7a3d8c192
+  is retired, preserved unchanged for traceability. Its app SHA256 is
+  1b370ad553dada9b2605e72e86ca5d293d7f42d4671ec326adae223b08370e57; never
+  substitute or overwrite it with 5.6.8 bytes. Compile the new version once.
+- Full release build uses the verified ES3C28P N16R8 profile:
+  `esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_8MB,PSRAM=opi,CDCOnBoot=cdc`.
+  Pinned toolchain: ESP32 3.3.11, GFX 1.13.0, ILI9341 1.7.0, BusIO 1.17.4,
+  ArduinoJson 6.21.5. Dell uses isolated copies of the actual M910 libraries,
+  without changing its default Arduino installation.
+- At this commit, firmware is prepared and not flashed/deployed. Full compile,
+  manifest/SHA verification and physical framebuffer acceptance are still to be
+  recorded in the PR/release evidence. Do not run the visual suite's synthetic
+  screen commands on working production devices. The existing A/B LCDs were
+  recovered separately using a guarded UI-only reset, with no hardware reboot.
+- Release evidence/logs are under
+  `/home/dell/workspace/mesflow/artifacts/esp-display-identity-20261127`.
+  Next: review the exact build artifact and target, deploy through the existing
+  device-scoped path, verify canonical name/ID and idle approval transition.
+  Keep the same artifact digest for qualification and deployment.
+
 ## Current state (2026-10-07)
 - The reference board (ES3C28P, ESP32-S3 N16R8, MAC 28:84:85:85:75:10) on **dell `/dev/ttyACM0`** runs this
   firmware again, **FW 5.5.7 built from `main` 92a80d4 unchanged**, after the from-scratch rebuild

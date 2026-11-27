@@ -33,7 +33,7 @@ def verify(pkg: Path, profiles_dir: Path) -> list[str]:
         arts = rel.get("artifacts") or []
         if not arts:
             errors.append("NO_ARTIFACTS")
-        expected = {pid for pid, p in profiles.items() if p.get("status") == "VERIFIED"}
+        expected = {pid for pid, p in profiles.items() if p.get("status") == "VERIFIED" and p.get("delivery", "ota") == "ota"}
         got = {a["profile_id"] for a in arts}
         if got != expected:
             errors.append(f"PROFILE_SET {sorted(got)} != VERIFIED {sorted(expected)}")
@@ -48,6 +48,8 @@ def verify(pkg: Path, profiles_dir: Path) -> list[str]:
             tag = f"[{pid}]"
             if prof.get("status") != "VERIFIED":
                 errors.append(f"{tag} PROFILE_NOT_VERIFIED {prof.get('status')}")
+            if prof.get("delivery", "ota") != "ota":
+                errors.append(f"{tag} PROFILE_SERIAL_ONLY")
             if hashlib.sha256(data).hexdigest() != m.get("sha256"):
                 errors.append(f"{tag} SHA256_MISMATCH")
             if len(data) != m.get("size"):
