@@ -1,11 +1,11 @@
 from pathlib import Path
+import re
 
 SOURCE=(Path(__file__).parents[1]/"esp/mesflow_app.cpp").read_text()
 POLICY=(Path(__file__).parents[1]/"esp/mesflow_ota_policy.h").read_text()
 
 
 def test_identity_and_partition_safe_contract():
-    assert '#define FW_VERSION "5.6.6"' in SOURCE
     assert 'MESFLOW_FW_IDENTITY:version=" FW_VERSION' in SOURCE
     assert '#define HW_MODEL "ES3C28P"' in SOURCE
     assert 'esp_ota_get_next_update_partition' in SOURCE
@@ -42,7 +42,10 @@ def test_boot_validation_and_rollback_support():
     assert 'OTA_BOOT_NEW_VERSION' in SOURCE and 'OTA_HEALTHCHECK_OK' in SOURCE
 
 
-def test_header_layout_contract():
-    assert 'constexpr int16_t CLOCK_X = 88;' in SOURCE
-    assert 'constexpr int16_t NET_LED_X = 220;' in SOURCE
-    assert 'printText(10, 10, "Kimex"' in SOURCE
+def test_header_clock_and_signal_regions_do_not_overlap():
+    # Check geometric boundaries, not a fixed brand label or clock position.
+    def value(name):
+        return int(re.search(r"constexpr int16_t " + name + r" = (\d+);", SOURCE).group(1))
+    assert value("CLOCK_X") + value("CLOCK_W") <= value("NET_LED_X") - 10
+    assert value("CLOCK_Y") + value("CLOCK_H") < value("HEADER_H")
+    assert value("NET_LED_X") + 15 <= value("SW")

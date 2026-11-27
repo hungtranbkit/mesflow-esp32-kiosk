@@ -44,8 +44,8 @@ def test_switch_stashes_or_restores_never_deletes_spare():
 def test_token_is_bound_only_for_its_issuing_server():
     setup = body("void setup() {")
     assert "mfcred::tokenUsableFor(true, storedTokenServer.c_str(), SERVER_BASE)" in setup
-    assert 'putString("token_srv", SERVER_BASE)' in body("static void saveCurrentCredential() {")
-    assert "saveCurrentCredential();" in body("bool bindKiosk() {")
+    assert 'putString("token_srv", SERVER_BASE)' in body("static bool saveCurrentCredential() {")
+    # Durable-write failure behavior is executed in test_enrollment_display.py.
 
 
 def test_bind_shows_enrollment_code_and_still_sends_device_secret():

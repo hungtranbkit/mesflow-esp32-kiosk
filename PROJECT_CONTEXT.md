@@ -2,6 +2,55 @@
 
 Living handoff for the next agent. Code/tests/git/runtime evidence win over these notes.
 
+## Approval display and device identity — 2026-11-27, firmware 5.6.7
+
+- Prepared branch: `agent/codex/esp-approval-identity-v567-20261127`, based on
+  `fix/deepsleep-ota-gate-20261124` / b88928ec251c17ed0e86bf38d05989b4cc119025.
+  Its entire git tree is identical to the actual M910 gated source commit
+  ecd93e0f092cff13c9dc5dad8ea5fcc9e41040d6. ECD descends from A's sleep
+  source 356b4dbd02 and B's keypad source 2b131c1354; all those features remain.
+- A's running 5.6.6 image was built before ECD was committed: embedded build
+  `20261112.0003.g356b4dbd02.sleep-ota-gate`, verified existing app SHA256
+  ef2e649de6b2cb13e33621c061d0c326a0b77a441d20dc95ce8261b7d5b84d03.
+  The version label alone is not binary provenance. B's existing image has build
+  `20261112.0003.g2b131c1354.keypad-test` and app SHA256
+  dc0b1e517c5eaebf7d61fd91b0bb65aaed07ba451e222e82d8df9c913b9e3054.
+- Confirmed defect: successful background bind cleared enrollment flags while
+  leaving the pending LCD pixels. Approval now waits for durable credential
+  writes/readback, and requests an idle repaint. Worker, operation and quantity
+  screens are preserved; no runtime selection reset is performed.
+- Authenticated successful bind and valid successful heartbeat JSON accept the
+  optional canonical server `device_name`. Invalid, absent or unchanged names
+  are ignored. Names must be nonblank valid UTF-8, at most 63 encoded bytes,
+  without C0/DEL controls. No Unicode normalization is applied. Changed names
+  are persisted before publication; flash-write failure remains retryable.
+- The existing Vietnamese renderer shows name plus `ID XXXXXXXX` in the
+  unchanged 36 px header. The ID is the last eight UUID hex digits, uppercase.
+  Full UUID, secret, token, station, scanner baud, keypad mapping and sleep/OTA
+  configuration keep their existing namespaces and values.
+  Initial administrator naming: Máy 1 = B / MAC ending 39:6C / ID 99B57712;
+  Máy 2 = A / MAC ending 39:84 / ID 2457DB39. Names remain server-editable.
+- Verification before compile: all eight C++ host test executables pass with
+  -Wall -Wextra -Werror; the established Python gate plus the new regression
+  passes 43 tests. The regression executes the real bindKiosk function with
+  fake HTTP/NVS/LCD edges: it failed on the old pending pixels and passes after
+  the fix, including failed persistence and active quantity-entry preservation.
+- Full release build uses the verified ES3C28P N16R8 profile:
+  `esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_8MB,PSRAM=opi,CDCOnBoot=cdc`.
+  Pinned toolchain: ESP32 3.3.11, GFX 1.13.0, ILI9341 1.7.0, BusIO 1.17.4,
+  ArduinoJson 6.21.5. Dell uses isolated copies of the actual M910 libraries,
+  without changing its default Arduino installation.
+- At this commit, firmware is prepared and not flashed/deployed. Full compile,
+  manifest/SHA verification and physical framebuffer acceptance are still to be
+  recorded in the PR/release evidence. Do not run the visual suite's synthetic
+  screen commands on working production devices. The existing A/B LCDs were
+  recovered separately using a guarded UI-only reset, with no hardware reboot.
+- Release evidence/logs are under
+  `/home/dell/workspace/mesflow/artifacts/esp-display-identity-20261127`.
+  Next: review the exact build artifact and target, deploy through the existing
+  device-scoped path, verify canonical name/ID and idle approval transition.
+  Keep the same artifact digest for qualification and deployment.
+
 ## Current state (2026-10-07)
 - The reference board (ES3C28P, ESP32-S3 N16R8, MAC 28:84:85:85:75:10) on **dell `/dev/ttyACM0`** runs this
   firmware again, **FW 5.5.7 built from `main` 92a80d4 unchanged**, after the from-scratch rebuild
