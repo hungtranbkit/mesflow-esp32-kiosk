@@ -86,10 +86,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.7"
-#define FW_BUILD "20261127.0001"
+#define FW_VERSION "5.6.8"
+#define FW_BUILD "20261127.0002"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.7-KIMEX-IDENTITY";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.8-KIMEX-IDENTITY";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -3289,7 +3289,7 @@ void drawIndustrialHeader(uint16_t statusColor = C_OK) {
   // One consistent header on every production screen.
   tft.fillRect(0, 0, SW, HEADER_H, C_BG);
   // Use the Vietnamese font and UTF-8 aware fitting for editable names.
-  drawTextBox(DEVICE_NAME, 10, 0, CLOCK_X - 16, 21,
+  drawTextBox(DEVICE_NAME, 10, 1, CLOCK_X - 16, 21,
               FONT_SECTION, FONT_HEADER, 1, TextAlign::LEFT, C_TEXT, true);
   char shortId[9], label[16];
   snprintf(label, sizeof(label), "ID %s",
@@ -3622,10 +3622,13 @@ static void redrawProductionUi() {
 // screens, without setUi() or clearing any worker/operation/quantity state.
 static void refreshDeviceIdentityDisplay() {
   const bool idle = uiState == UiState::READY || uiState == UiState::OFFLINE;
-  const bool busy = rt.hasWorker || rt.hasOperation || hasPendingTransaction() ||
-      countPendingOfflineEvents() > 0 || maintenanceMode || setupPortalActive ||
+  // loop() calls this every tick. Check pending display work before touching
+  // the LittleFS journal, and keep all cheap busy guards ahead of that scan.
+  if (identityDisplayChanges.needed(idle, false) == mfidentity::Refresh::NONE) return;
+  const bool busy = rt.hasWorker || rt.hasOperation || maintenanceMode || setupPortalActive ||
       keypadCalibrationRequested || keypadCalibrationInProgress || keypadTestActive ||
-      recoveryMenuActive || otaInstallInProgress || otaCheckTaskRunning;
+      recoveryMenuActive || otaInstallInProgress || otaCheckTaskRunning ||
+      hasPendingTransaction() || countPendingOfflineEvents() > 0;
   const mfidentity::Refresh refresh = identityDisplayChanges.needed(idle, busy);
   if (refresh == mfidentity::Refresh::NONE) return;
   if (refresh == mfidentity::Refresh::APPROVAL) redrawProductionUi();

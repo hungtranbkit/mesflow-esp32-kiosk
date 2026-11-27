@@ -2,7 +2,7 @@
 
 Living handoff for the next agent. Code/tests/git/runtime evidence win over these notes.
 
-## Approval display and device identity — 2026-11-27, firmware 5.6.7
+## Approval display and device identity — 2026-11-27, firmware 5.6.8
 
 - Prepared branch: `agent/codex/esp-approval-identity-v567-20261127`, based on
   `fix/deepsleep-ota-gate-20261124` / b88928ec251c17ed0e86bf38d05989b4cc119025.
@@ -32,9 +32,20 @@ Living handoff for the next agent. Code/tests/git/runtime evidence win over thes
   Máy 2 = A / MAC ending 39:84 / ID 2457DB39. Names remain server-editable.
 - Verification before compile: all eight C++ host test executables pass with
   -Wall -Wextra -Werror; the established Python gate plus the new regression
-  passes 43 tests. The regression executes the real bindKiosk function with
+  passes 45 tests. The regression executes the real bindKiosk function with
   fake HTTP/NVS/LCD edges: it failed on the old pending pixels and passes after
   the fix, including failed persistence and active quantity-entry preservation.
+- Review corrections for 5.6.8 / build 20261127.0002: move the name box to
+  y=1 so the tallest Vietnamese accent glyphs remain on screen. Pixel tests
+  using the actual font assets cover every name glyph: FONT16 ink y=0..19,
+  fallback FONT12 y=1..16, above the ID row and header separator.
+  Check pending display work and cheap busy flags before the LittleFS journal,
+  so normal loop ticks and active screens perform zero journal reads for this
+  service. Both regressions failed before these corrections and now pass.
+- The unflashed 5.6.7 candidate at 94930d0b873d8a858b9d2a5dd9fda6c7a3d8c192
+  is retired, preserved unchanged for traceability. Its app SHA256 is
+  1b370ad553dada9b2605e72e86ca5d293d7f42d4671ec326adae223b08370e57; never
+  substitute or overwrite it with 5.6.8 bytes. Compile the new version once.
 - Full release build uses the verified ES3C28P N16R8 profile:
   `esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_8MB,PSRAM=opi,CDCOnBoot=cdc`.
   Pinned toolchain: ESP32 3.3.11, GFX 1.13.0, ILI9341 1.7.0, BusIO 1.17.4,

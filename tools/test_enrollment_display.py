@@ -58,6 +58,7 @@ bool keypadTestActive = false, otaInstallInProgress = false, otaCheckTaskRunning
 bool recoveryMenuActive = false, pendingTransaction = false;
 unsigned queuedEvents = 0, telemetry = 0, openOpCount = 0;
 int repaints = 0;
+unsigned journalReads = 0;
 std::string pixels = "CHỜ DUYỆT KIOSK";
 struct SerialStub {
   template<class... T> void printf(const char*, T...) {}
@@ -86,7 +87,7 @@ bool saveCurrentCredential() { credentialSaved = credentialSaveOk; return creden
 bool saveDeviceConfig() { return true; }
 void computeEnrollmentCode(char out[7]) { std::strcpy(out, "74C150"); }
 bool hasPendingTransaction() { return pendingTransaction; }
-unsigned countPendingOfflineEvents() { return queuedEvents; }
+unsigned countPendingOfflineEvents() { ++journalReads; return queuedEvents; }
 unsigned actionQueueCount() { return telemetry; }
 struct Value {
   std::string value;
@@ -147,7 +148,28 @@ int main() {
   assert(bindKiosk());
   assert(uiState == UiState::OFFLINE && repaints == 1 && pixels == "SCAN");
 #endif
-  puts("PASS bind approval repaint, durable save failure, active workflow, deferred idle");
+#ifdef IDENTITY_POLICY
+  // loop() invokes the display service every tick; unchanged screens must
+  // not open/scan the LittleFS journal just to discover nothing needs drawing.
+  journalReads = 0;
+  refreshDeviceIdentityDisplay();
+  assert(journalReads == 0);
+
+  identityDisplayChanges.renamed();
+  uiState = UiState::INPUT_GOOD;
+  refreshDeviceIdentityDisplay();
+  assert(journalReads == 0);
+  assert(identityDisplayChanges.needed(true, false) == mfidentity::Refresh::HEADER);
+  uiState = UiState::READY;
+  maintenanceMode = true;
+  refreshDeviceIdentityDisplay();
+  assert(journalReads == 0);
+  maintenanceMode = false;
+  refreshDeviceIdentityDisplay();
+  assert(journalReads == 1);
+  assert(identityDisplayChanges.needed(true, false) == mfidentity::Refresh::NONE);
+#endif
+  puts("PASS approval, persistence, workflow preservation, deferred idle and zero idle journal scans");
 }
 """
 
