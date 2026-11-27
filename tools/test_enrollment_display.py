@@ -49,6 +49,7 @@ constexpr int HEX = 16;
 unsigned bootId = 1;
 std::string String(unsigned value, int = 10) { return std::to_string(value); }
 int esp_reset_reason() { return 1; }
+const void* inactiveOtaPartition() { return nullptr; }
 bool enrollmentPending = true, suppressNetworkUiErrors = false;
 char enrollmentCode[7] = "74C150";
 bool credentialSaveOk = true, credentialSaved = false, posted = true;

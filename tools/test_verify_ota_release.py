@@ -58,6 +58,13 @@ class VerifyRelease(unittest.TestCase):
         self.assertTrue(any("PROFILE_SET" in e for e in errs))
         self.assertIn("[p-linux] PROFILE_NOT_VERIFIED UNVERIFIED", errs)
 
+    def test_verified_serial_profile_is_excluded_from_ota_set(self):
+        (self.profiles / "p-serial.json").write_text(json.dumps(dict(PROF, profile_id="p-serial", delivery="serial-app-only")))
+        self.assertEqual(v.verify(self.pkg([("p-ok", app_image(), None)]), self.profiles), [])
+        errors = v.verify(self.pkg([("p-ok", app_image(), None),
+                                   ("p-serial", app_image("p-serial"), None)]), self.profiles)
+        self.assertIn("[p-serial] PROFILE_SERIAL_ONLY", errors)
+
     def test_bootloader_or_merged_image_rejected(self):
         errs = v.verify(self.pkg([("p-ok", app_image(magic=0x12345678), None)]), self.profiles)
         self.assertIn("[p-ok] NOT_APP_IMAGE", errs)

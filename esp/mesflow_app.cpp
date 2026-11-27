@@ -86,10 +86,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.8"
-#define FW_BUILD "20261127.0002"
+#define FW_VERSION "5.6.9"
+#define FW_BUILD "20261127.0003"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.8-KIMEX-IDENTITY";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.9-KIMEX-IDENTITY";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -115,6 +115,16 @@ static const uint16_t OTA_EXPECTED_CHIP_ID = CONFIG_IDF_FIRMWARE_CHIP_ID;
 #else
 static const uint16_t OTA_EXPECTED_CHIP_ID = 9;  // ESP32-S3
 #endif
+// A legacy single-app table can return the running partition as the next OTA
+// candidate. It is not an inactive destination and must never be advertised
+// or used for OTA, regardless of a stale/forced server offer.
+static const esp_partition_t* inactiveOtaPartition() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+  if (!running || !next || running->address == next->address) return nullptr;
+  return next;
+}
+
 // Arduino marks every boot valid unless this returns true. Returning true
 // keeps a freshly OTA'd image in PENDING_VERIFY until otaLocalSelfCheck()
 // passes, so a crashing image is rolled back by the bootloader instead of
@@ -4679,7 +4689,7 @@ bool bindKiosk() {
   request["hardware_model"] = HW_MODEL;
   request["hardware_profile"] = HW_PROFILE;
   request["firmware_artifact_id"] = otaRunningArtifact;
-  request["ota_capable"] = true;
+  request["ota_capable"] = inactiveOtaPartition() != nullptr;
   request["boot_id"] = String(bootId, HEX);
   request["boot_reason"] = String((int)esp_reset_reason());
   request["browser"] = "MESFlow Embedded Kiosk";
@@ -5034,7 +5044,7 @@ bool sendHeartbeat() {
   request["hardware_model"] = HW_MODEL;
   request["hardware_profile"] = HW_PROFILE;
   request["firmware_artifact_id"] = otaRunningArtifact;
-  request["ota_capable"] = true;
+  request["ota_capable"] = inactiveOtaPartition() != nullptr;
   request["boot_id"] = String(bootId, HEX);
   request["boot_reason"] = String((int)esp_reset_reason());
 
@@ -5250,7 +5260,7 @@ static bool performOtaUpdate() {
     return otaFailNow("OTA_FAILED", "OTA_ORIGIN_MISMATCH", "Download URL is not on the Agent origin");
   if (mfota::compareVersions(otaTargetVersion, FW_VERSION) < 0 && !otaAllowDowngrade)
     return otaFailNow("OTA_FAILED", "OTA_DOWNGRADE_REFUSED", otaTargetVersion);
-  const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+  const esp_partition_t* next = inactiveOtaPartition();
   if (!next || otaExpectedSize == 0 || otaExpectedSize > next->size)
     return otaFailNow("OTA_FAILED", "OTA_NO_SPACE", "Firmware exceeds inactive OTA partition");
   otaEvent("OTA_DOWNLOAD_START");

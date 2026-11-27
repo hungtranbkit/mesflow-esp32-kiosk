@@ -2,6 +2,21 @@
 
 Living handoff for the next agent. Code/tests/git/runtime evidence win over these notes.
 
+## Existing M910 single-app layout — 2026-11-27, firmware 5.6.9
+
+- Actual A's verified flash table matches Arduino 3.3.11 huge_app exactly;
+  it has one 3MiB app and no inactive OTA slot. See
+  docs/M910_HUGE_APP_SERIAL.md for provenance and preservation requirements.
+- Build 20261127.0003 adds an explicit VERIFIED serial-app-only profile
+  and reuses the release compiler/verifier without producing an OTA ZIP.
+  Default dual-slot OTA profiles and their release path remain unchanged.
+- Runtime OTA capability and installation require a distinct inactive app
+  partition. Identity, pending-display recovery, scanner, keypad and
+  sleep/OTA interlock behavior are retained.
+- Preserve frozen 5.6.7 and 5.6.8 artifacts; neither was flashed to A.
+  After a read-only trial, the unchanged old app was restored and verified
+  on LAN/LCD using the installed esptool watchdog-reset exit.
+
 ## Approval display and device identity — 2026-11-27, firmware 5.6.8
 
 - Prepared branch: `agent/codex/esp-approval-identity-v567-20261127`, based on

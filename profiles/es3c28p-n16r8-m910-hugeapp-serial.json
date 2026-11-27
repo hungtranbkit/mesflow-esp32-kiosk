@@ -1,0 +1,17 @@
+{
+  "profile_id": "es3c28p-n16r8-m910-hugeapp-serial",
+  "status": "VERIFIED",
+  "delivery": "serial-app-only",
+  "evidence": "docs/M910_HUGE_APP_SERIAL.md: actual A flash table and prior gated app verified 2026-11-27; table exactly matches Arduino ESP32 3.3.11 huge_app.csv. App-only USB delivery; no inactive OTA slot.",
+  "hardware_model": "ES3C28P",
+  "chip": "esp32s3",
+  "min_chip_revision": 0,
+  "flash_size": "16MB",
+  "psram": "8MB-OPI",
+  "board": "ES3C28P-M910-USB-CDC",
+  "scanner_interface": "GM65-UART1-RX44-TXNC",
+  "fqbn": "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=huge_app,PSRAM=opi,CDCOnBoot=cdc",
+  "partition_table_sha256": "aaae2888c5a6a348004b5b436f47abb25ae32e72d9003902955a998eda723edd",
+  "app_slot_size": 3145728,
+  "app_offset": 65536
+}

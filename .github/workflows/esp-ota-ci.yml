@@ -38,7 +38,7 @@ jobs:
       - name: Python tools tests (OTA phase1, offline queue, release verifier)
         run: |
           python3 -m pip install pytest==9.2.0
-          python3 -m pytest -v -p no:cacheprovider tools/test_ota_phase1.py tools/test_offline_queue.py tools/test_verify_ota_release.py tools/test_keypad_boot_regression.py tools/test_maintenance_usb_only.py tools/test_server_credential_switch.py tools/test_legacy_agent_ota.py tools/test_enrollment_display.py tools/test_identity_header.py
+          python3 -m pytest -v -p no:cacheprovider tools/test_ota_phase1.py tools/test_offline_queue.py tools/test_verify_ota_release.py tools/test_keypad_boot_regression.py tools/test_maintenance_usb_only.py tools/test_server_credential_switch.py tools/test_legacy_agent_ota.py tools/test_enrollment_display.py tools/test_identity_header.py tools/test_serial_release.py
 
   build-release:
     runs-on: ubuntu-latest
@@ -71,6 +71,17 @@ jobs:
           pkg=$(ls dist/release/*.ota.zip)
           python3 tools/verify_ota_release.py "$pkg"
           sha256sum "$pkg" dist/release/stage/*/app.bin
+      - name: Build explicit serial-only app (existing huge_app layout)
+        run: |
+          ./scripts/build-serial-release.sh es3c28p-n16r8-m910-hugeapp-serial
+          sha256sum dist/serial-release/stage/*/app.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp-serial-app
+          path: |
+            dist/serial-release/stage/*/app.bin
+            dist/serial-release/stage/*/manifest.json
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: esp-ota-release
