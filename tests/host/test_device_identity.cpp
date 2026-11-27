@@ -50,6 +50,32 @@ int main() {
   assert(!mfidentity::adoptName(limit.c_str(), limit.size(), name, sizeof(name), persist));
   assert(writes == 2);  // no repeated flash writes or invalid-data writes
 
+
+  // Display numbers are allocated by MESFlow, never derived from UUID/name.
+  const struct { uint32_t number; const char* text; } displayCases[] = {
+    {0, "--"}, {1, "01"}, {2, "02"}, {9, "09"}, {10, "10"},
+    {99, "99"}, {100, "100"}, {2147483647u, "2147483647"}, {UINT32_MAX, "--"}
+  };
+  for (const auto& test : displayCases) {
+    char text[11];
+    mfidentity::formatDisplayNumber(test.number, text);
+    assert(std::strcmp(text, test.text) == 0);
+  }
+  mfidentity::DisplayNumberRecord record;
+  assert(mfidentity::makeDisplayNumberRecord(2, "HTTPS://MESFLOW.NET:443///",
+      "0f2d2ad3-06d7-417f-a1e7-da3d2457db39", record));
+  assert(std::strcmp(record.server, "https://mesflow.net:443") == 0);
+  assert(mfidentity::displayNumberFor(record, "https://mesflow.net:443/",
+      "0f2d2ad3-06d7-417f-a1e7-da3d2457db39") == 2);
+  assert(mfidentity::displayNumberFor(record, "https://staging.mesflow.net",
+      "0f2d2ad3-06d7-417f-a1e7-da3d2457db39") == 0);
+  assert(mfidentity::displayNumberFor(record, "https://mesflow.net:443",
+      "fc0c33a9-2f76-424f-a256-217699b57712") == 0);
+  record.server[0] = '\n';
+  assert(!mfidentity::validDisplayNumberRecord(record));
+  std::memset(record.server, 'x', sizeof(record.server));
+  assert(!mfidentity::validDisplayNumberRecord(record));
+
   mfidentity::DisplayChanges changes;
   changes.renamed();
   assert(changes.needed(false, false) == mfidentity::Refresh::NONE);
@@ -59,5 +85,10 @@ int main() {
   assert(changes.needed(true, false) == mfidentity::Refresh::APPROVAL);
   changes.drawn();
   assert(changes.needed(true, false) == mfidentity::Refresh::NONE);
+  changes.numbered();
+  assert(changes.needed(false, false) == mfidentity::Refresh::NONE);
+  assert(changes.needed(true, true) == mfidentity::Refresh::NONE);
+  assert(changes.needed(true, false) == mfidentity::Refresh::HEADER);
+  changes.drawn();
   puts("PASS device identity: UUID mapping, UTF-8 boundaries, durable rename, deferred display");
 }

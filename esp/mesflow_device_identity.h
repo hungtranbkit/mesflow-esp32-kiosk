@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
+#include "mesflow_server_credential_policy.h"
 
 namespace mfidentity {
 
@@ -72,18 +74,94 @@ inline bool shortDeviceId(const char* uuid, char out[9]) {
   return true;
 }
 
+
+// One versioned NVS value binds a display-only number to its issuing server
+// and complete UUID. ESP32 persists uint32 fields little-endian; changing this
+// layout requires a new schema version, never reinterpret an existing record.
+struct DisplayNumberRecord {
+  uint32_t version = 1;
+  uint32_t number = 0;
+  char server[192] = {};
+  char uuid[40] = {};
+};
+static_assert(sizeof(DisplayNumberRecord) == 240, "Display number NVS schema changed");
+
+inline bool validDisplayNumber(uint32_t number) {
+  return number > 0 && number <= INT32_MAX;
+}
+
+inline bool makeDisplayNumberRecord(uint32_t number, const char* server,
+                                    const char* uuid, DisplayNumberRecord& out) {
+  if (!validDisplayNumber(number) || !server || !uuid) return false;
+  size_t serverSize = 0, uuidSize = 0;
+  while (serverSize < sizeof(out.server) && server[serverSize]) ++serverSize;
+  while (uuidSize < sizeof(out.uuid) && uuid[uuidSize]) ++uuidSize;
+  if (serverSize == sizeof(out.server) || uuidSize != 36) return false;
+  char ignoredId[9];
+  if (!shortDeviceId(uuid, ignoredId)) return false;
+  size_t size = serverSize;
+  while (size && server[size - 1] == '/') --size;
+  if (!size) return false;
+  DisplayNumberRecord next;
+  next.number = number;
+  for (size_t i = 0; i < size; ++i) {
+    char c = server[i];
+    if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) return false;
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    next.server[i] = c;
+  }
+  memcpy(next.uuid, uuid, 36);
+  out = next;
+  return true;
+}
+
+inline bool validDisplayNumberRecord(const DisplayNumberRecord& record) {
+  if (record.version != 1) return false;
+  DisplayNumberRecord normalized;
+  return makeDisplayNumberRecord(record.number, record.server, record.uuid, normalized) &&
+         strcmp(record.server, normalized.server) == 0;
+}
+
+inline uint32_t displayNumberFor(const DisplayNumberRecord& record,
+                                const char* server, const char* uuid) {
+  if (!validDisplayNumberRecord(record) || !server || !uuid ||
+      strcmp(record.uuid, uuid) != 0 || !mfcred::sameServer(record.server, server)) return 0;
+  return record.number;
+}
+
+// Persist the entire scoped record before changing the published value.
+template<class Persist>
+inline bool adoptDisplayNumber(uint32_t number, const char* server, const char* uuid,
+                               DisplayNumberRecord& current, Persist persist) {
+  if (!validDisplayNumber(number) || displayNumberFor(current, server, uuid) == number) return false;
+  DisplayNumberRecord next;
+  if (!makeDisplayNumberRecord(number, server, uuid, next) || !persist(next)) return false;
+  current = next;
+  return true;
+}
+
+inline void formatDisplayNumber(uint32_t number, char out[11]) {
+  if (!validDisplayNumber(number)) {
+    memcpy(out, "--", 3);
+    return;
+  }
+  // Width is a minimum: 100 and larger keep every digit.
+  snprintf(out, 11, "%02lu", static_cast<unsigned long>(number));
+}
+
 enum class Refresh : uint8_t { NONE, HEADER, APPROVAL };
 
 class DisplayChanges {
  public:
   void approved() { approval_ = true; }
   void renamed() { name_ = true; }
+  void numbered() { name_ = true; }
   Refresh needed(bool idle, bool busy) const {
     if (!idle || busy) return Refresh::NONE;
     return approval_ ? Refresh::APPROVAL : (name_ ? Refresh::HEADER : Refresh::NONE);
   }
   // Called by the real header renderer. A natural screen transition also
-  // consumes the change, so a deferred rename never redraws a worker screen.
+  // consumes the change, so deferred identity changes never redraw a worker screen.
   void drawn() { approval_ = name_ = false; }
  private:
   bool approval_ = false;
