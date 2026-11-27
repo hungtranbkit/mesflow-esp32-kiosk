@@ -58,7 +58,7 @@ bool keypadCalibrationRequested = false, keypadCalibrationInProgress = false;
 bool keypadTestActive = false, otaInstallInProgress = false, otaCheckTaskRunning = false;
 bool recoveryMenuActive = false, pendingTransaction = false;
 unsigned queuedEvents = 0, telemetry = 0, openOpCount = 0;
-int repaints = 0;
+int repaints = 0, headerDraws = 0;
 unsigned journalReads = 0;
 std::string pixels = "CHỜ DUYỆT KIOSK";
 struct SerialStub {
@@ -71,6 +71,7 @@ void safeCopy(char* dest, size_t capacity, const char* value) {
 }
 void drawTopClock(bool) {}
 void drawIndustrialHeader() {
+  ++headerDraws;
 #ifdef IDENTITY_POLICY
   identityDisplayChanges.drawn();
 #endif
@@ -107,6 +108,7 @@ bool httpPostJson(const char*, DynamicJsonDocument&, DynamicJsonDocument& out, b
   out = reply; return posted;
 }
 bool adoptServerDeviceName(const Value&) { return false; }
+bool adoptServerDisplayNumber(const Value&) { return false; }
 """
 
 CASES = r"""
@@ -170,6 +172,25 @@ int main() {
   assert(journalReads == 1);
   assert(identityDisplayChanges.needed(true, false) == mfidentity::Refresh::NONE);
 #endif
+
+  // A newly received number follows the same guarded header-only path.
+  identityDisplayChanges.numbered();
+  uiState = UiState::INPUT_GOOD;
+  rt.hasWorker = rt.hasOperation = true;
+  pixels = "QUANTITY 22";
+  const int beforeHeaders = headerDraws;
+  journalReads = 0;
+  refreshDeviceIdentityDisplay();
+  assert(headerDraws == beforeHeaders && pixels == "QUANTITY 22" && journalReads == 0);
+  assert(rt.hasWorker && rt.hasOperation && uiState == UiState::INPUT_GOOD);
+  uiState = UiState::READY;
+  refreshDeviceIdentityDisplay();
+  assert(headerDraws == beforeHeaders && journalReads == 0);
+  rt.hasWorker = rt.hasOperation = false;
+  refreshDeviceIdentityDisplay();
+  assert(headerDraws == beforeHeaders + 1 && journalReads == 1);
+  assert(identityDisplayChanges.needed(true, false) == mfidentity::Refresh::NONE);
+
   puts("PASS approval, persistence, workflow preservation, deferred idle and zero idle journal scans");
 }
 """

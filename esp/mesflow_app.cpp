@@ -86,10 +86,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.9"
-#define FW_BUILD "20261127.0003"
+#define FW_VERSION "5.6.10"
+#define FW_BUILD "20261127.0004"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.9-KIMEX-IDENTITY";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.10-KIMEX-NUMERIC-ID";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -1936,6 +1936,25 @@ static void saveOtaAgentSource() {
   om.putUChar("agent_src", static_cast<uint8_t>(otaAgentSource)); om.putUInt("cfg_ver", 2); om.end();
 }
 
+static mfidentity::DisplayNumberRecord displayNumberRecord;
+
+static uint32_t effectiveDisplayNumber() {
+  return mfidentity::displayNumberFor(displayNumberRecord, SERVER_BASE, DEVICE_UUID);
+}
+
+static void loadDisplayNumberConfig() {
+  mfidentity::DisplayNumberRecord record;
+  Preferences config;
+  bool loaded = false;
+  if (config.begin("mesflow_cfg", true)) {
+    loaded = config.getBytesLength("display_num") == sizeof(record) &&
+             config.getBytes("display_num", &record, sizeof(record)) == sizeof(record);
+    config.end();
+  }
+  displayNumberRecord = loaded && mfidentity::validDisplayNumberRecord(record)
+      ? record : mfidentity::DisplayNumberRecord{};
+}
+
 bool loadDeviceConfig() {
   prefs.begin("mesflow_cfg", true);
   String ssid = prefs.getString("wifi_ssid", WIFI_SSID);
@@ -1955,6 +1974,7 @@ bool loadDeviceConfig() {
   copyConfigValue(DEVICE_ID, sizeof(DEVICE_ID), deviceId);
   copyConfigValue(DEVICE_NAME, sizeof(DEVICE_NAME), deviceName);
   copyConfigValue(STATION_CODE, sizeof(STATION_CODE), station);
+  loadDisplayNumberConfig();
   return WIFI_SSID[0] != '\0';
 }
 
@@ -2032,6 +2052,30 @@ static bool adoptServerDeviceName(JsonVariantConst value) {
   return changed;
 }
 
+// Only authenticated server responses may supply a display number. A missing
+// field on an older server keeps the existing same-server cache.
+static bool adoptServerDisplayNumber(JsonVariantConst value) {
+  if (!value.is<int32_t>()) return false;
+  const int32_t number = value.as<int32_t>();
+  if (number <= 0) return false;
+  const bool changed = mfidentity::adoptDisplayNumber(static_cast<uint32_t>(number),
+      SERVER_BASE, DEVICE_UUID, displayNumberRecord,
+      [](const mfidentity::DisplayNumberRecord& record) {
+        Preferences config;
+        if (!config.begin("mesflow_cfg", false)) return false;
+        mfidentity::DisplayNumberRecord readback;
+        const bool saved =
+            config.putBytes("display_num", &record, sizeof(record)) == sizeof(record) &&
+            config.getBytesLength("display_num") == sizeof(readback) &&
+            config.getBytes("display_num", &readback, sizeof(readback)) == sizeof(readback) &&
+            memcmp(&record, &readback, sizeof(record)) == 0;
+        config.end();
+        return saved;
+      });
+  if (changed) identityDisplayChanges.numbered();
+  return changed;
+}
+
 // Called BEFORE SERVER_BASE is replaced by newServer. Never deletes a
 // credential: it is stashed, restored, or the change is refused.
 static bool applyServerChange(const String& newServer, String& error) {
@@ -2053,6 +2097,7 @@ static bool applyServerChange(const String& newServer, String& error) {
     return false;
   }
   if (d == mfcred::Switch::NO_CHANGE) return true;
+  identityDisplayChanges.numbered();  // Re-evaluate the display cache for the new server.
   enrollmentPending = false; enrollmentCode[0] = '\0';
   prefs.begin("mesflow", false);
   if (d == mfcred::Switch::STASH_AND_UNBIND) {
@@ -2264,6 +2309,8 @@ static bool provisionAuthorized() {
 static void sendDeviceInfo(WebServer& web) {
   DynamicJsonDocument doc(1536);
   doc["type"] = "mesflow_kiosk";
+  const uint32_t number = effectiveDisplayNumber();
+  if (number) doc["display_number"] = number;
   doc["device_id"] = DEVICE_ID;
   doc["device_uuid"] = DEVICE_UUID;
   doc["device_name"] = DEVICE_NAME;
@@ -3301,9 +3348,9 @@ void drawIndustrialHeader(uint16_t statusColor = C_OK) {
   // Use the Vietnamese font and UTF-8 aware fitting for editable names.
   drawTextBox(DEVICE_NAME, 10, 1, CLOCK_X - 16, 21,
               FONT_SECTION, FONT_HEADER, 1, TextAlign::LEFT, C_TEXT, true);
-  char shortId[9], label[16];
-  snprintf(label, sizeof(label), "ID %s",
-           mfidentity::shortDeviceId(DEVICE_UUID, shortId) ? shortId : "--");
+  char number[11], label[16];
+  mfidentity::formatDisplayNumber(effectiveDisplayNumber(), number);
+  snprintf(label, sizeof(label), "ID %s", number);
   printText(10, 21, label, FONT_HEADER, C_MUTED);
   identityDisplayChanges.drawn();
   // Worker screens expose only signal strength; detailed network state remains
@@ -4757,6 +4804,7 @@ bool bindKiosk() {
   }
 
   adoptServerDeviceName(response["device_name"]);
+  adoptServerDisplayNumber(response["display_number"]);
   Serial.println("Kiosk bind OK; token da luu NVS.");
   remoteLogf("BIND OK station=%s", STATION_CODE);
   if (showBindingScreen || uiState == UiState::BINDING) {
@@ -5160,7 +5208,10 @@ bool sendHeartbeat() {
     if (response["config_version"].is<int>()) {
       Serial.printf("[heartbeat] config_version=%d\n", response["config_version"].as<int>());
     }
-    if (responseJsonValid) adoptServerDeviceName(response["device_name"]);
+    if (responseJsonValid) {
+      adoptServerDeviceName(response["device_name"]);
+      adoptServerDisplayNumber(response["display_number"]);
+    }
     refreshDeviceIdentityDisplay();
     adoptAdvertisedOtaAgent(response["ota_agent_url"] | "");
 

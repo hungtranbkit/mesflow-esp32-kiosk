@@ -40,7 +40,7 @@ def test_vietnamese_name_glyphs_fit_above_id_without_top_clipping():
         SOURCE).groups())
     id_y = int(re.search(r"printText\(10,\s*(\d+),\s*label,", SOURCE).group(1))
     id_bitmap, id_glyphs, (id_ascent, _) = font_data(12)
-    id_top = min(yy for cp in "ID 2457DB39"
+    id_top = min(yy for cp in "ID 02"
                  for _, yy in pixels(id_bitmap, id_glyphs[ord(cp)], 10, id_y + id_ascent))
     for size in (16, 12):  # preferred name font and existing long-name fallback
         bitmap, glyphs, (ascent, line_height) = font_data(size)
@@ -53,12 +53,12 @@ def test_vietnamese_name_glyphs_fit_above_id_without_top_clipping():
             assert max(yy for _, yy in ink) < id_top, f"name/ID collision: U+{cp:04X}"
 
 
-def test_both_ids_fit_in_header_without_clock_overlap():
+def test_display_numbers_fit_in_header_without_clock_overlap():
     bitmap, glyphs, (ascent, _) = font_data(12)
     id_y = int(re.search(r"printText\(10,\s*(\d+),\s*label,", SOURCE).group(1))
     clock_x = int(re.search(r"CLOCK_X = (\d+);", SOURCE).group(1))
     header_h = int(re.search(r"HEADER_H = (\d+);", SOURCE).group(1))
-    for text in ("ID 2457DB39", "ID 99B57712"):
+    for text in ("ID --", "ID 01", "ID 02", "ID 100", "ID 2147483647"):
         x, ink = 10, []
         for cp in text:
             glyph = glyphs[ord(cp)]
