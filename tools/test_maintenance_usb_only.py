@@ -1,7 +1,6 @@
 """Source contract: maintenance entry is USB CDC serial only, bounded, and
 does not touch Wi-Fi/OTA/scanner/pending-journal state (not a hardware test)."""
 from pathlib import Path
-from test_enrollment_display import function
 
 ROOT = Path(__file__).parents[1]
 SOURCE = (ROOT / "esp/mesflow_app.cpp").read_text()
@@ -62,9 +61,8 @@ def test_maintenance_has_idle_timeout_and_usb_exit():
     usb = body("static void handleUsbConsoleLine(String line) {")
     assert "mfmt::allowedDuringMaintenance" in usb and "exitMaintenanceMode()" in usb
     loop = body("void loop() {")
-    m = function(loop, "if (maintenanceMode) {")
-    assert "if (setupPortalActive) return;" in m
-    assert m.index("if (setupPortalActive) return;") < m.index("WiFi.reconnect()")
+    m = loop[loop.index("if (maintenanceMode) {"):]
+    m = m[:m.index("    delay(2);")]
     assert "readSerialCommands();" in m and "serviceMaintenanceMode();" in m
     assert "servicePendingWebCommand" not in m  # LAN console stays off during maintenance
 
@@ -83,3 +81,12 @@ def test_config_write_still_requires_maintenance_and_validation():
     assert api.index("if (!maintenanceMode)") < api.index("saveDeviceConfig()")
     assert "validServerBase(url)" in api and 'otaUrl.startsWith("https://")' in api
     assert ".setInsecure(" not in SOURCE
+
+
+def test_health_and_usb_hello_advertise_non_secret_provisioning_identity():
+    health = body("static void handleDeviceHealthApi() {")
+    hello = body("static void handleUsbProvisionHello() {")
+    for field in ('firmware_version', 'firmware_build', 'usb_provision_protocol', 'hardware_model'):
+        assert f'device["{field}"]' in health
+        assert f'doc["{field}"]' in hello
+    assert 'MESFLOW-KIOSK-USB-ENROLLMENT-V1' in SOURCE

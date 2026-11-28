@@ -20,6 +20,8 @@
 #include <esp_ota_ops.h>
 #include <Update.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
+#include <mbedtls/base64.h>
 #include <esp_task_wdt.h>
 #include "mesflow_ota_policy.h"
 #include "mesflow_keypad_policy.h"
@@ -32,6 +34,7 @@
 #include "mesflow_maintenance_policy.h"
 #include "mesflow_server_credential_policy.h"
 #include "mesflow_device_identity.h"
+#include "mesflow_usb_provision_policy.h"
 #include "mesflow_vietnamese_font.h"
 
 #ifndef MESFLOW_UI_SCREENSHOT
@@ -96,10 +99,11 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.16"
-#define FW_BUILD "20261128.0006"
+#define FW_VERSION "5.6.17"
+#define FW_BUILD "20261128.0007"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.16-KIMEX-INTEGRATED";
+static const char* USB_PROVISION_PROTOCOL = "MESFLOW-KIOSK-USB-ENROLLMENT-V1";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.17-KIMEX-INTEGRATED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -2093,6 +2097,172 @@ static void computeEnrollmentCode(char out[7]) {
   mfcred::enrollmentCodeFromDigest(digest, out);
 }
 
+// USB physical-presence attestation. The device secret is reduced to the
+// same SHA-256 key stored by MESFlow; only a challenge-bound HMAC leaves USB.
+static bool handleUsbProvisionProof(const String& challenge) {
+  if (!mfusb::isHex64(challenge.c_str()) ||
+      !mfusb::mayProvision(maintenanceMode, enrollmentPending, rt.bound,
+        uiState==UiState::READY || uiState==UiState::OFFLINE,
+        hasPendingTransaction(), countPendingOfflineEvents()>0) ||
+      otaInstallInProgress || !DEVICE_UUID[0] || !DEVICE_SECRET[0]) {
+    Serial.println("[USB-PROVISION] Tu choi: kiosk khong o trang thai enrollment an toan.");
+    return false;
+  }
+  char mac[18], desiredId[32];
+  String rawMac=WiFi.macAddress();
+  if (!mfusb::canonicalMac(rawMac.c_str(),mac) || !mfusb::deriveDeviceId(mac,desiredId) ||
+      !mfusb::factoryOrSameId(DEVICE_ID,desiredId)) {
+    Serial.println("[USB-PROVISION] Tu choi: Device ID hien tai khong the doi an toan.");
+    return false;
+  }
+  uint8_t key[32],macDigest[32];
+  mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha,0);
+  mbedtls_sha256_update(&sha,reinterpret_cast<const unsigned char*>(DEVICE_SECRET),strlen(DEVICE_SECRET));
+  mbedtls_sha256_finish(&sha,key); mbedtls_sha256_free(&sha);
+  String message=String("MESFLOW-KIOSK-USB-ENROLLMENT-V1\n")+DEVICE_UUID+"\n"+challenge+"\n"+
+    mac+"\n"+desiredId+"\n"+STATION_CODE+"\n"+FW_VERSION;
+  const mbedtls_md_info_t* md=mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!md || mbedtls_md_hmac(md,key,sizeof(key),
+      reinterpret_cast<const unsigned char*>(message.c_str()),message.length(),macDigest)!=0) {
+    memset(key,0,sizeof(key));
+    Serial.println("[USB-PROVISION] Khong tao duoc proof."); return false;
+  }
+  memset(key,0,sizeof(key));
+  char proof[65]; for(size_t i=0;i<32;i++) snprintf(proof+i*2,3,"%02x",macDigest[i]);
+  DynamicJsonDocument doc(512); doc["type"]="mesflow_usb_proof"; doc["device_uuid"]=DEVICE_UUID;
+  doc["device_id"]=desiredId; doc["mac_address"]=mac; doc["station_code"]=STATION_CODE;
+  doc["firmware_version"]=FW_VERSION; doc["proof"]=proof;
+  Serial.print("MESFLOW_USB_PROOF:"); serializeJson(doc,Serial); Serial.println();
+  memset(proof,0,sizeof(proof)); memset(macDigest,0,sizeof(macDigest));
+  return true;
+}
+
+static bool handleUsbProvisionCommit(const String& requestedId) {
+  if (!mfusb::mayProvision(maintenanceMode,enrollmentPending,rt.bound,
+      uiState==UiState::READY || uiState==UiState::OFFLINE,
+      hasPendingTransaction(),countPendingOfflineEvents()>0) || otaInstallInProgress || !DEVICE_UUID[0]) {
+    Serial.println("[USB-PROVISION] Tu choi commit: kiosk khong o trang thai enrollment an toan."); return false;
+  }
+  char mac[18],desiredId[32]; String rawMac=WiFi.macAddress();
+  if (!mfusb::canonicalMac(rawMac.c_str(),mac) || !mfusb::deriveDeviceId(mac,desiredId) ||
+      requestedId!=desiredId || !mfusb::factoryOrSameId(DEVICE_ID,desiredId)) {
+    Serial.println("[USB-PROVISION] Tu choi commit: Device ID khong khop voi MAC."); return false;
+  }
+  char oldId[sizeof(DEVICE_ID)]; safeCopy(oldId,sizeof(oldId),DEVICE_ID);
+  if (strcmp(oldId,desiredId)!=0) {
+    Preferences cfg; cfg.begin("mesflow_cfg",false);
+    size_t n=cfg.putString("device_id",desiredId); String verify=cfg.getString("device_id",""); cfg.end();
+    if (!n || verify!=desiredId) {
+      Preferences restore; restore.begin("mesflow_cfg",false); restore.putString("device_id",oldId); restore.end();
+      Serial.println("[USB-PROVISION] Loi luu Device ID; da khoi phuc gia tri truoc."); return false;
+    }
+    safeCopy(DEVICE_ID,sizeof(DEVICE_ID),desiredId);
+  }
+  Serial.printf("[USB-PROVISION] DEVICE_ID_SAVED %s\n",desiredId); return true;
+}
+
+// Read-only USB identity handshake. Deliberately omits DEVICE_SECRET, kiosk
+// tokens, Wi-Fi password and any enrollment proof.
+static void handleUsbProvisionHello() {
+  DynamicJsonDocument doc(512);
+  char mac[18]="";
+  mfusb::canonicalMac(WiFi.macAddress().c_str(),mac);
+  Preferences cred; cred.begin("mesflow",true);
+  bool credentialPresent=rt.kioskToken[0] || cred.getString("token","").length() ||
+                         cred.getString("alt_token","").length();
+  cred.end();
+  doc["device_uuid"]=DEVICE_UUID; doc["mac_address"]=mac;
+  doc["device_id"]=DEVICE_ID; doc["station_code"]=STATION_CODE;
+  doc["firmware_version"]=FW_VERSION; doc["firmware_build"]=FW_BUILD_ID;
+  doc["usb_provision_protocol"]=USB_PROVISION_PROTOCOL; doc["hardware_model"]=HW_MODEL;
+  doc["server_url"]=SERVER_BASE; doc["wifi_ssid"]=WIFI_SSID;
+  doc["bound"]=rt.bound; doc["credential_present"]=credentialPresent;
+  doc["idle"]=(uiState==UiState::READY || uiState==UiState::OFFLINE);
+  doc["pending_transaction"]=hasPendingTransaction();
+  doc["queued_events"]=(countPendingOfflineEvents()>0);
+  doc["ota_in_progress"]=otaInstallInProgress;
+  Serial.print("MESFLOW_USB_HELLO:"); serializeJson(doc,Serial); Serial.println();
+}
+
+// Accept explicit initial config only on a fresh, unbound and idle device.
+// The host supplies identity/server/Wi-Fi/station from its protected manifest;
+// firmware never creates or changes the persistent UUID or device secret here.
+static bool handleUsbProvisionConfig(const String& encoded) {
+  if (encoded.length()<8 || encoded.length()>820) return false;
+  String standard=encoded; standard.replace('-', '+'); standard.replace('_','/');
+  while (standard.length()%4) standard += '=';
+  uint8_t decoded[640]; size_t decodedLength=0;
+  if (mbedtls_base64_decode(decoded,sizeof(decoded),&decodedLength,
+      reinterpret_cast<const unsigned char*>(standard.c_str()),standard.length())!=0 ||
+      decodedLength==0 || decodedLength>=sizeof(decoded)) return false;
+  decoded[decodedLength]='\0';
+  DynamicJsonDocument doc(768);
+  if (deserializeJson(doc,reinterpret_cast<char*>(decoded),decodedLength)) {
+    memset(decoded,0,sizeof(decoded)); return false;
+  }
+  memset(decoded,0,sizeof(decoded));
+  char mac[18]="", desiredId[32]="";
+  String currentMac=WiFi.macAddress();
+  if (!mfusb::canonicalMac(currentMac.c_str(),mac) || !mfusb::deriveDeviceId(mac,desiredId)) return false;
+  Preferences cred; cred.begin("mesflow",true);
+  bool storedCredential=cred.getString("token","").length() || cred.getString("alt_token","").length();
+  cred.end();
+  bool safeState=mfusb::mayAutoConfigure(maintenanceMode,rt.bound,
+      storedCredential || rt.kioskToken[0],
+      uiState==UiState::READY || uiState==UiState::OFFLINE,
+      hasPendingTransaction(),countPendingOfflineEvents()>0,otaInstallInProgress,
+      DEVICE_UUID[0] && String(doc["expected_uuid"] | "")==DEVICE_UUID &&
+        String(doc["mac_address"] | "")==mac,
+      mfusb::factoryOrSameId(DEVICE_ID,desiredId));
+  String ssid=doc["wifi_ssid"] | "", password=doc["wifi_password"] | "";
+  String server=doc["server_url"] | "", station=doc["station_code"] | "";
+  if (!safeState || ssid.length()==0 || ssid.length()>32 || password.length()>64 ||
+      !server.startsWith("https://") || !validServerBase(server) ||
+      station.length()==0 || station.length()>=sizeof(STATION_CODE) ||
+      String(doc["device_id"] | "")!=desiredId) return false;
+
+  // Only update first-boot defaults or values already matching the protected manifest.
+  // Read the durable primary settings and fail closed on any non-default mismatch.
+  Preferences cfg;
+  if (!cfg.begin("mesflow_cfg", false)) return false;
+  String oldSsid=cfg.getString("wifi_ssid", "panda");
+  String oldPass=cfg.getString("wifi_pass", "12345678a");
+  String oldServer=cfg.getString("server", "");
+  String oldStation=cfg.getString("station", "LASER-01");
+  String oldId=cfg.getString("device_id", "ESP32-KIOSK-001");
+  if (!mfusb::configValueUnchangedOrFactoryDefault(oldSsid.c_str(),ssid.c_str(),"panda") ||
+      !mfusb::configValueUnchangedOrFactoryDefault(oldPass.c_str(),password.c_str(),"12345678a") ||
+      !mfusb::configValueUnchangedOrFactoryDefault(oldServer.c_str(),server.c_str(),"") ||
+      !mfusb::configValueUnchangedOrFactoryDefault(oldStation.c_str(),station.c_str(),"LASER-01") ||
+      !mfusb::configValueUnchangedOrFactoryDefault(oldId.c_str(),desiredId,"ESP32-KIOSK-001")) {
+    cfg.end(); Serial.println("[USB-PROVISION] Existing config differs; refusing overwrite."); return false;
+  }
+  bool saved = cfg.putString("wifi_ssid",ssid) > 0 && cfg.putString("wifi_pass",password) > 0 &&
+      cfg.putString("server",server) > 0 && cfg.putString("station",station) > 0 &&
+      cfg.putString("device_id",desiredId) > 0;
+  bool verified = saved && cfg.getString("wifi_ssid","")==ssid && cfg.getString("wifi_pass","")==password &&
+      cfg.getString("server","")==server && cfg.getString("station","")==station &&
+      cfg.getString("device_id","")==desiredId;
+  if (!verified) {
+    cfg.putString("wifi_ssid",oldSsid); cfg.putString("wifi_pass",oldPass);
+    cfg.putString("server",oldServer); cfg.putString("station",oldStation); cfg.putString("device_id",oldId);
+    bool restored=cfg.getString("wifi_ssid","")==oldSsid && cfg.getString("wifi_pass","")==oldPass &&
+      cfg.getString("server","")==oldServer && cfg.getString("station","")==oldStation &&
+      cfg.getString("device_id","")==oldId;
+    cfg.end();
+    Serial.println(restored ? "[USB-PROVISION] Config write failed; previous settings restored." :
+      "[USB-PROVISION] Config write failed; rollback verification failed; device remains unbound.");
+    return false;
+  }
+  cfg.end();
+  copyConfigValue(WIFI_SSID,sizeof(WIFI_SSID),ssid); copyConfigValue(WIFI_PASSWORD,sizeof(WIFI_PASSWORD),password);
+  copyConfigValue(SERVER_BASE,sizeof(SERVER_BASE),server); copyConfigValue(STATION_CODE,sizeof(STATION_CODE),station);
+  copyConfigValue(DEVICE_ID,sizeof(DEVICE_ID),desiredId);
+  Serial.println("USB_CONFIG_APPLIED"); Serial.flush(); delay(400); ESP.restart();
+  return true;
+}
+
+
 static bool saveCurrentCredential() {
   if (!prefs.begin("mesflow", false)) return false;
   bool ok = true;
@@ -2835,6 +3005,10 @@ static void handleDeviceHealthApi() {
   doc["updated_ms"] = now;
   JsonObject device = doc.createNestedObject("device");
   device["firmware"] = APP_VERSION;
+  device["firmware_version"] = FW_VERSION;
+  device["firmware_build"] = FW_BUILD_ID;
+  device["usb_provision_protocol"] = USB_PROVISION_PROTOCOL;
+  device["hardware_model"] = HW_MODEL;
   device["model"] = "ESP32-S3 N16R8";
   device["device_id"] = DEVICE_ID;
   device["device_name"] = DEVICE_NAME;
@@ -6733,12 +6907,25 @@ static void handleUsbConsoleLine(String line) {
   if (!line.length()) return;
   String cmd = line;
   cmd.toLowerCase();
+  if (cmd == "usb-provision-hello") { handleUsbProvisionHello(); return; }
   if (maintenanceMode) {
     if (!mfmt::allowedDuringMaintenance(cmd.c_str())) {
-      Serial.println("[MAINT] Dang bao tri: chi nhan 'maintenance exit', 'status', 'help', 'scanner-probe'.");
+      Serial.println("[MAINT] USB command is not allowed in maintenance mode.");
       return;
     }
     if (cmd == "maintenance exit") { exitMaintenanceMode(); return; }
+    if (cmd.startsWith("usb-provision-proof ")) {
+      String challenge=cmd.substring(strlen("usb-provision-proof ")); challenge.trim();
+      handleUsbProvisionProof(challenge); lastMaintenanceActivityAt=millis(); return;
+    }
+    if (cmd.startsWith("usb-provision-commit ")) {
+      String requestedId=line.substring(strlen("usb-provision-commit ")); requestedId.trim();
+      handleUsbProvisionCommit(requestedId); lastMaintenanceActivityAt=millis(); return;
+    }
+    if (cmd.startsWith("usb-provision-config ")) {
+      String encoded=line.substring(strlen("usb-provision-config ")); encoded.trim();
+      handleUsbProvisionConfig(encoded); lastMaintenanceActivityAt=millis(); return;
+    }
     lastMaintenanceActivityAt = millis();
   }
   if (handleConsoleCommand(line)) { lastInputAtMs = millis(); return; }
@@ -6756,7 +6943,11 @@ void readSerialCommands() {
     // Chap nhan ca New Line, Carriage Return va Both NL & CR.
     if (c == '\r' || c == '\n') {
       if (line.length() > 0) {
-        Serial.printf("[SERIAL RX] %s\n", line.c_str());
+        String lowerLine=line; lowerLine.toLowerCase();
+        if (lowerLine.startsWith("usb-provision-config ")) Serial.println("[SERIAL RX] usb-provision-config [redacted]");
+        else if (lowerLine.startsWith("usb-provision-proof ")) Serial.println("[SERIAL RX] usb-provision-proof [redacted]");
+        else if (lowerLine.startsWith("usb-provision-commit ")) Serial.println("[SERIAL RX] usb-provision-commit [redacted]");
+        else Serial.printf("[SERIAL RX] %s\n", line.c_str());
         lastInputWasVirtual = false;
         lastInputWasKeypad = false;
         handleUsbConsoleLine(line);
@@ -6765,12 +6956,16 @@ void readSerialCommands() {
       continue;
     }
 
-    if (line.length() < 512) line += c;
+    if (line.length() < 900) line += c;
   }
 
   // Ke ca Serial Monitor dang de "No line ending", van xu ly sau 350 ms.
   if (line.length() > 0 && millis() - lastCharAt >= 350) {
-    Serial.printf("[SERIAL RX/TIMEOUT] %s\n", line.c_str());
+    String lowerLine=line; lowerLine.toLowerCase();
+    if (lowerLine.startsWith("usb-provision-config ")) Serial.println("[SERIAL RX/TIMEOUT] usb-provision-config [redacted]");
+    else if (lowerLine.startsWith("usb-provision-proof ")) Serial.println("[SERIAL RX/TIMEOUT] usb-provision-proof [redacted]");
+    else if (lowerLine.startsWith("usb-provision-commit ")) Serial.println("[SERIAL RX/TIMEOUT] usb-provision-commit [redacted]");
+    else Serial.printf("[SERIAL RX/TIMEOUT] %s\n", line.c_str());
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
     handleUsbConsoleLine(line);
