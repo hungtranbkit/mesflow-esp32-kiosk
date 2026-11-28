@@ -2,6 +2,44 @@
 
 Living handoff for the next agent. Code/tests/git/runtime evidence win over these notes.
 
+## Integrated scanner + Wi-Fi setup cancellation candidate — 5.6.11 (2026-11-28)
+
+- Worktree/branch: `/home/dell/workspace/mesflow/.worktrees/esp-po6391-v5611-integration`, `agent/codex/esp-po6391-v5611-integration-20261128`.
+  Source baseline is PR #4 merge `c0a80ce3d3c8888ffd07ddce5e175eed2636eeb4` on
+  `fix/deepsleep-ota-gate-20261124`, not `main`/92a80d4/5.5.7. Scanner PR #6
+  (`fix/scanner-utf8-v5610-20261128`, head `ad37cba`) carries the UTF-8 QR
+  decoder, `WF|OPID|` support and host tests. This branch adds Wi-Fi cancel
+  commit `3ad628d` (port of `81bb5f6`) and version/test commit `b18cc4b`.
+  Draft stacked PR #8 targets PR #6's branch; PR #6 must merge first.
+- Candidate source identity is 5.6.11 / `20261128.0001`; release builder
+  appends the exact source SHA to build ID `20261128.0001.gb18cc4bb7d`.
+  Scanner keeps UTF-8 bytes and the pre-existing printable ASCII ratio used
+  for rejected-frame baud recovery; the local worker-required guard remains.
+  Wi-Fi cancellation is non-destructive, scoped to physical `#` or the active
+  setup AP nonce, and gated against active workflow/OTA. It does not reboot or
+  write NVS/config/journal; same-SSID password preservation is explicit and
+  stored Wi-Fi password is not rendered. Setup/sleep/OTA share a tested gate.
+- Verified local release artifact is serial-only M910 huge_app:
+  `/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-v5611-m910-serial/`.
+  App size 1,445,504 bytes / 3,145,728-byte app0; app SHA256
+  `e46c5bd41d3ee8db984d43ead663f315966eb09c366c86240c3e38c7cad9c835`;
+  manifest SHA256 `50efa235e401e13ad59b6f76842a0df0ffc5b1e2f2fba676c1a526e772a1eb4`.
+  Partition SHA matches the verified huge_app table. Manifest declares
+  `delivery=serial-app-only`, `ota_capable=false`; no OTA ZIP was created.
+- Tests on the integrated source before the doc-only handoff commit: 61 Python
+  tests pass, all eight C++ host suites pass (`-Wall -Wextra -Werror`), including
+  1,000 threaded OTA/sleep/setup race interleavings. The Wi-Fi regression failed
+  on baseline c0a80ce (6 failed, 1 passed) and passed after the patch. The
+  serial-only build/manifest verifier passed. Real hardware cancel, physical
+  target attribution and rollback on the candidate were not tested.
+- Available latest physical evidence is historical: A / Máy 2 reported 5.6.10
+  on 2026-11-27; B / Máy 1 reported 5.6.6. PO6391 target firmware remains
+  unverified. Dell USB reference MAC `28:84:85:85:75:10` is not A's accepted
+  M910 MAC; no serial session, reset, flash, OTA, production mutation, merge,
+  or deployment was performed. Do not treat this serial-only artifact as OTA
+  eligible. Require exact target/profile and authorized rollback qualification.
+- Separate continuation handoff: `/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-integrated-v5611-handoff.md`.
+
 ## Current change — numeric display IDs, firmware 5.6.10 (2026-11-27)
 
 - Owned branch: agent/codex/esp-display-number-v5610-20261127.
