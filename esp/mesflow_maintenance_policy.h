@@ -18,6 +18,7 @@
 //  * maintenance ends by itself after MAINTENANCE_IDLE_TIMEOUT_MS without
 //    activity, so a board is never left with the config page open.
 #include <stdint.h>
+#include <string.h>
 
 namespace mfmt {
 
@@ -69,6 +70,27 @@ inline bool allowedDuringMaintenance(const char* lowerTrimmed) {
     const char* a = w; const char* b = lowerTrimmed;
     while (*a && *a == *b) { ++a; ++b; }
     if (!*a && !*b) return true;
+  }
+  const char* prefixes[] = {"usb-provision-proof ", "usb-provision-commit ", "usb-provision-config "};
+  for (const char* prefix : prefixes) {
+    const char* a = prefix; const char* b = lowerTrimmed;
+    while (*a && *a == *b) { ++a; ++b; }
+    if (*a) continue;
+    if (!*b) return false;
+    if (strcmp(prefix, prefixes[0]) == 0) {  // proof: fixed 64-char lowercase hex challenge
+      if (strlen(b) != 64) return false;
+      for (; *b; ++b) if (!( (*b >= '0' && *b <= '9') || (*b >= 'a' && *b <= 'f') )) return false;
+      return true;
+    }
+    if (strcmp(prefix, prefixes[1]) == 0) {  // commit: derived 16-char kiosk ID
+      if (strlen(b) != 16 || strncmp(b, "esp32-kiosk-", 12) != 0) return false;
+      for (size_t i = 12; i < 16; ++i)
+        if (!( (b[i] >= '0' && b[i] <= '9') || (b[i] >= 'a' && b[i] <= 'f') )) return false;
+      return true;
+    }
+    if (strlen(b) > 820) return false;  // bounded base64 JSON configuration
+    for (; *b; ++b) if (!( (*b >= 'a' && *b <= 'z') || (*b >= 'A' && *b <= 'Z') || (*b >= '0' && *b <= '9') || *b == '+' || *b == '/' || *b == '=' || *b == '-' || *b == '_' )) return false;
+    return true;
   }
   return false;
 }

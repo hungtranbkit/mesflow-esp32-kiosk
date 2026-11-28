@@ -29,6 +29,13 @@ int main() {
   CHECK(allowedDuringMaintenance("status"));
   CHECK(allowedDuringMaintenance("help"));
   CHECK(allowedDuringMaintenance("scanner-probe"));
+  CHECK(allowedDuringMaintenance("usb-provision-proof 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+  CHECK(!allowedDuringMaintenance("usb-provision-proof short"));
+  CHECK(allowedDuringMaintenance("usb-provision-commit esp32-kiosk-396c"));
+  CHECK(!allowedDuringMaintenance("usb-provision-commit arbitrary"));
+  CHECK(allowedDuringMaintenance("usb-provision-config eyJ3aWZpX3NzaWQiOiJ4In0="));
+  CHECK(!allowedDuringMaintenance("usb-provision-config bad!"));
+  CHECK(!allowedDuringMaintenance("usb-provision-config"));
   CHECK(!allowedDuringMaintenance("factory-reset"));
   CHECK(!allowedDuringMaintenance("clear-offline"));
   CHECK(!allowedDuringMaintenance("WF|EMP|E001"));

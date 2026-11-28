@@ -28,3 +28,11 @@
 ## Recent handoff
 
 - 2026-11-28: PR #9 merged 5.6.15; PR #10 merged 5.6.16 after exact-head CI success. PR #1 and #5–#8 closed as superseded with source branches retained. Follow up on post-merge main CI and release artifact promotion. No hardware writes until a unique safe rollback-capable target is proven.
+
+## USB provisioning candidate handoff (2026-11-28)
+
+- Main remains canonical 5.6.16 / `20261128.0006` at PR #11 merge `0c1d1adc`; this task branch `agent/codex/esp-usb-provisioning-5616` is based on that SHA and is the only firmware integration candidate. PR #2 / 5.6.6 is a source reference only; do not use its old binary or merge its old base.
+- Firmware USB protocol is being ported as candidate 5.6.17 / `20261128.0007`. It runs only through an explicit USB serial command and maintenance gate; no auto watcher/service is installed. Server-side provisioner stays disabled unless the dedicated hashed service token and exact UUID allowlist are configured. Do not flash pending hardware acceptance.
+- `esp/mesflow_app.cpp` adds read-only hello, challenge-bound HMAC proof, exact derived-ID commit, and config application guarded by UUID+MAC, unbound/no-credential/idle/no-queue/no-OTA state. Config writes are limited to primary SSID/password, server, station, and derived device ID; existing non-default differing values fail closed, with readback/restore on failure. UUID/token, secondary SSIDs, OTA agent and display name are not written. Secret-bearing USB command lines are redacted in serial logs.
+- `esp/mesflow_maintenance_policy.h` and host tests constrain protocol commands to maintenance; CI runs the USB policy and source preservation contracts. Candidate local verification: 10 C++ host suites PASS; Python official set was rerun after version update (record final result below); app build pending. JC4827W543 stays test-only/UNVERIFIED; no new profile or pin assumptions.
+- MESFlow companion branch is separately based on current `main` 8c595689 and changes legacy PR #52 migration 0057 collision to additive migration 0058 after deployed .396's 0057 display-number head. Strict PostgreSQL tests and isolated migration upgrade were run; full official Docker E2E gate still active at checkpoint time. No production migration/deploy or device write was performed.
