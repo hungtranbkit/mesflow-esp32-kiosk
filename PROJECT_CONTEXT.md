@@ -2,7 +2,7 @@
 
 ## Current canonical candidate
 
-- Branch/worktree: `integration/esp-canonical-release-20261128` at `/home/dell/workspace/mesflow/.worktrees/integration-esp-canonical-release-20261128`; head `dcd1deb05ba90eb1227f24fb1e2c4ce5a3a65f2a`.
+- Branch/worktree: `integration/esp-canonical-release-20261128` at `/home/dell/workspace/mesflow/.worktrees/integration-esp-canonical-release-20261128`; release code source commit `dcd1deb05ba90eb1227f24fb1e2c4ce5a3a65f2a`, followed only by documentation refresh commits.
 - Draft PR #9 targets `main`: https://github.com/hungtranbkit/mesflow-esp32-kiosk/pull/9. PR state OPEN, mergeable, host-tests and build-release PASS on this head; review decision is still pending, so do not merge or mark ready.
 - Firmware candidate `5.6.14`, build `20261128.0004.gdcd1deb05b`. This is candidate source identity, not evidence of a production device's installed version.
 - The branch is based on current `main` `92a80d4`, integrates PR #8's 5.6.11 lineage (PR #4 numeric ID/approval/OTA/deep-sleep, PR #6 UTF-8/OPID scanner, PR #7 Wi-Fi cancel), and carries verified three-network Wi-Fi behavior from PR #1. PRs #5/#6/#7/#8 remain legacy/stacked; PR #9 is the canonical direct-to-main path.
