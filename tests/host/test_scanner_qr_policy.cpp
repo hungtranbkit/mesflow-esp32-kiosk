@@ -26,5 +26,13 @@ int main() {
   assert(mfqr::isOperationQr("WF|OPID|83001"));
   assert(!mfqr::isOperationQr("WF|EMP|NV001"));
   assert(!mfqr::isOperationQr("not-a-MESFlow-QR"));
+  assert(mfqr::isMesflowQr("WF|EMP|NV001"));
+  assert(mfqr::isMesflowQr("WF|OPID|83001"));
+  assert(mfqr::isRecentRepeat("WF|OP|6391 - GHẾ KHÔNG TAY", "WF|OP|6391 - GHẾ KHÔNG TAY", 0));
+  assert(mfqr::isRecentRepeat("WF|EMP|NV001", "WF|EMP|NV001", 2999));
+  assert(!mfqr::isRecentRepeat("WF|EMP|NV001", "WF|EMP|NV001", 3000));
+  assert(!mfqr::isRecentRepeat("WF|EMP|NV002", "WF|EMP|NV001", 100));
+  assert(!mfqr::isRecentRepeat("not-a-QR", "not-a-QR", 100));
+  assert(!mfqr::isRecentRepeat("WF|OPID|1", "WF|OPID|1", 100, 0));
   std::puts("scanner QR UTF-8 policy: PASS");
 }
