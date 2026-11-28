@@ -25,5 +25,24 @@ The intermediate local 5.6.12 compile used unpinned Dell libraries and is
 superseded; its app/manifest/ZIP were preserved under
 `task-artifacts/po6391-diagnosis-20261128/retired-v5612-unpinned/` and are not
 release inputs.
-Each 5.6.12 profile is built from one source commit, with profile-specific
+
+## Build artifacts
+
+Source commit `6492beb89ae9e1fe96cd67a511c9acb82fa57da5`; build ID
+`20261128.0003.g6492beb89a`. Local build used ESP32 core 3.3.11, GFX 1.13.0,
+ILI9341 1.7.0, BusIO 1.17.4, and ArduinoJson 6.21.5 in an isolated Arduino
+user library directory. Built-in GTS Root R4 was used; no OTA auth secret or
+device credential was included.
+
+| Profile | Delivery / capacity | App size / SHA-256 | Package SHA-256 |
+| --- | --- | --- | --- |
+| `es3c28p-n16r8-m910-gm65uart1` | OTA; `default_8MB`, 3,342,336-byte slots; partition SHA `1d9cca96de0fe07ad7fc0648b9878ddecd9ce565e38b589ad20fea698ed4c80c` | 1,439,152 bytes; `7bd88fcded7db31538ae532114c0052e9684ed8cf115f7edac55cc9300fb8df6` | ZIP `363dad1742b4cb2c6d878463f73247567acbd0e5cddd52f3f82e88661f07f294` |
+| `es3c28p-n16r8-m910-hugeapp-serial` | Serial app only; one 3,145,728-byte app at `0x10000`; partition SHA `aaae2888c5a6a348004b5b436f47abb25ae32e72d9003902955a998eda723edd` | 1,439,152 bytes; `3bd21bf3455f7f770db01ae192f64857f034d50ee275b72f7af2bc693ff2c25e` | No OTA ZIP by design; manifest SHA `a84421694a2216874aff5e360a74351828848f7a1579596eddad65a3377e5a27` |
+
+Release ZIP verification passed. Artifacts and manifests were copied under
+`/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-5.6.13/`.
+`WORKER_REQUIRED`, UTF-8 scanner and OPID handling, setup cancel, OTA rollback,
+approval, numeric ID, GM65/keypad and deep-sleep interlocks remain covered by
+the local tests. No hardware write or device-specific Kimex build was made.
+Each 5.6.13 profile is built from one source commit, with profile-specific
 partition identity and artifact checksums recorded in the release handoff.
