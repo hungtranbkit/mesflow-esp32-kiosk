@@ -8,7 +8,8 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "npx playwright test tests/ui/esp-ui-visual.spec.js",
+    "test": "npm run test:scanner && npx playwright test tests/ui/esp-ui-visual.spec.js",
+    "test:scanner": "./tests/native/run-scanner-qr-tests.sh",
     "audit-ui": "./scripts/audit-ui.sh"
   },
   "repository": {

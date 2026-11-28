@@ -3,6 +3,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include "scanner_qr.h"
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <time.h>
@@ -5248,7 +5249,7 @@ void handleSerialLine(String line) {
     return;
   }
 
-  if (line.startsWith("WF|OP|")) {
+  if (isMesflowOperationQr(line.c_str())) {
     emitActionEvent("OPERATION_SCANNED", "USER_ACTION", "RECEIVED");
     Serial.printf("[SCAN OP] %s\n", line.c_str());
     if (!rt.hasWorker || !rt.workerQr[0]) {
@@ -5456,10 +5457,10 @@ void dispatchScannerFrame(const char* reason) {
   char decoded[SCANNER_FRAME_MAX + 1] = {0};
   size_t decodedLength = 0;
 
-  Serial.print("ASCII: ");
+  Serial.print("DATA : ");
   for (size_t i = 0; i < scannerFrameLength; ++i) {
     const uint8_t value = scannerFrame[i];
-    if (value >= 32 && value <= 126) {
+    if (isScannerQrDataByte(value)) {
       Serial.write(value);
       if (decodedLength < SCANNER_FRAME_MAX) {
         decoded[decodedLength++] = static_cast<char>(value);
@@ -5484,7 +5485,7 @@ void dispatchScannerFrame(const char* reason) {
                 static_cast<unsigned>(scannerText.length()),
                 scannerText.c_str());
 
-  if (scannerText.startsWith("WF|EMP|") || scannerText.startsWith("WF|OP|")) {
+  if (isMesflowQrPayload(scannerText.c_str())) {
     lastInputWasVirtual = false;
     lastInputWasKeypad = false;
     handleSerialLine(scannerText);
