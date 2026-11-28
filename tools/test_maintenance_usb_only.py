@@ -1,6 +1,7 @@
 """Source contract: maintenance entry is USB CDC serial only, bounded, and
 does not touch Wi-Fi/OTA/scanner/pending-journal state (not a hardware test)."""
 from pathlib import Path
+from test_enrollment_display import function
 
 ROOT = Path(__file__).parents[1]
 SOURCE = (ROOT / "esp/mesflow_app.cpp").read_text()
@@ -61,8 +62,9 @@ def test_maintenance_has_idle_timeout_and_usb_exit():
     usb = body("static void handleUsbConsoleLine(String line) {")
     assert "mfmt::allowedDuringMaintenance" in usb and "exitMaintenanceMode()" in usb
     loop = body("void loop() {")
-    m = loop[loop.index("if (maintenanceMode) {"):]
-    m = m[:m.index("return;")]
+    m = function(loop, "if (maintenanceMode) {")
+    assert "if (setupPortalActive) return;" in m
+    assert m.index("if (setupPortalActive) return;") < m.index("WiFi.reconnect()")
     assert "readSerialCommands();" in m and "serviceMaintenanceMode();" in m
     assert "servicePendingWebCommand" not in m  # LAN console stays off during maintenance
 

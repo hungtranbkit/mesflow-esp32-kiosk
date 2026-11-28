@@ -426,6 +426,11 @@ constexpr uint16_t C_INFO    = 0x64BF; // #60A5FA secondary blue
 // Functions used by subsystems before their implementation later in this file.
 void clearRuntimeSelection();
 void startSetupPortal(const char* reason);
+static bool setupPortalEntryAllowed();
+static void redrawProductionUi();
+static void drawRecoveryMenu();
+static void serviceSetupPortalInput();
+static void cancelSetupPortal();
 void startLanProvisioning();
 void addAuthHeaders(HTTPClient& http);
 void serviceDeviceManagement();
@@ -453,6 +458,7 @@ static void serviceRuntimeKeypadCalibration();
 static void enterMaintenanceMode(bool duringBoot);
 static void openRecoveryMenu();
 extern bool recoveryMenuActive;
+static bool recoveryInfoActive = false;
 void handleKeypadKey(char key);
 static void exitMaintenanceMode();
 static void drawMaintenanceScreen();
@@ -1770,6 +1776,15 @@ WebServer maintenanceWeb(80);
 DNSServer captiveDns;
 WiFiUDP discoveryUdp;
 bool setupPortalActive = false;
+static bool setupCancelRequested = false;
+static bool setupResumePending = false;
+static bool setupKeyReleaseRequired = false;
+static bool setupTouchReleaseRequired = false;
+static bool setupTouchTracking = false;
+static uint32_t setupTouchSince = 0;
+static char setupCancelNonce[33] = "";
+constexpr int16_t SETUP_BACK_X = 12, SETUP_BACK_Y = 264;
+constexpr int16_t SETUP_BACK_W = 216, SETUP_BACK_H = 48;
 bool lanProvisionActive = false;
 uint32_t lastDiscoveryAt = 0;
 char setupApSsid[40] = "";
@@ -2154,20 +2169,26 @@ static String setupPage() {
   page += F("body{font-family:Arial,sans-serif;background:#eef2f6;margin:0;padding:18px;color:#17202a}");
   page += F(".card{max-width:620px;margin:auto;background:white;border-radius:14px;padding:20px;box-shadow:0 3px 18px #0002}");
   page += F("h1{font-size:24px;margin:0 0 6px}.sub{color:#607080;margin-bottom:18px}");
-  page += F("label{display:block;font-weight:700;margin-top:14px}input,select,button{width:100%;box-sizing:border-box;padding:12px;margin-top:6px;border-radius:9px;border:1px solid #bbc5cf;font-size:16px}");
-  page += F("button{background:#1769aa;color:white;border:0;font-weight:700}.secondary{background:#52616b}.row{display:grid;grid-template-columns:1fr auto;gap:8px}.status{white-space:pre-wrap;background:#f4f6f8;padding:12px;border-radius:9px;margin-top:12px}.hint{font-size:13px;color:#667}");
+  page += F("label{display:block;font-weight:700;margin-top:14px}input,select,button{width:100%;box-sizing:border-box;padding:12px;margin-top:6px;border-radius:9px;border:1px solid #7c8995;font-size:16px}");
+  page += F("button{background:#1769aa;color:white;border:0;font-weight:700;min-height:44px}.secondary{background:#52616b}.row{display:grid;grid-template-columns:1fr auto;gap:8px}.status{white-space:pre-wrap;background:#f4f6f8;padding:12px;border-radius:9px;margin-top:12px}.hint{font-size:13px;color:#667}");
+  page += F("button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #103f68;outline-offset:3px}.open-network{display:flex;align-items:center;gap:12px;min-height:44px}.open-network input{width:20px;height:20px;margin:0;padding:0}");
   page += F("</style></head><body><div class='card'><h1>MESFlow Kiosk Setup</h1>");
   page += F("<div class='sub'>Cấu hình Wi-Fi bằng điện thoại. ESP32 AP: ");
   page += htmlEscape(setupApSsid); page += F(" · IP 192.168.4.1</div>");
   page += F("<button type='button' onclick='scanWifi()'>Quét Wi-Fi gần đây</button>");
-  page += F("<label>Wi-Fi SSID</label><select id='ssid'><option>");
+  page += F("<label for='ssid'>Wi-Fi SSID</label><select id='ssid'><option>");
   page += htmlEscape(WIFI_SSID); page += F("</option></select>");
-  page += F("<label>Mật khẩu Wi-Fi</label><input id='pass' type='password' value='");
-  page += htmlEscape(WIFI_PASSWORD); page += F("' autocomplete='new-password'>");
+  page += F("<label for='pass'>Mật khẩu Wi-Fi</label><input id='pass' type='password' autocomplete='new-password'>");
+  page += F("<div class='hint'>Để trống để giữ mật khẩu của Wi-Fi hiện tại. Quay lại giữ nguyên cấu hình.</div>");
+  page += F("<label class='open-network'><input id='open' type='checkbox'> Mạng không mật khẩu</label>");
   page += F("<button type='button' onclick='saveCfg()'>Lưu, kiểm tra và khởi động lại</button>");
-  page += F("<div id='status' class='status'>Sẵn sàng.</div></div><script>");
+  page += F("<button type='button' class='secondary' onclick='cancelSetup()'>Quay lại, không lưu</button>");
+  page += F("<div id='status' class='status' role='status'>Sẵn sàng.</div></div><script>");
+  page += F("async function cancelSetup(){let s=document.getElementById('status');try{let r=await fetch('/api/config/cancel',{method:'POST',headers:{'X-Setup-Cancel':'");
+  page += setupCancelNonce;
+  page += F("'}});let j=await r.json();s.textContent=j.message}catch(x){s.textContent='Nhấn # trên máy để quay lại.'}}");
   page += F("async function scanWifi(){let s=document.getElementById('status');s.textContent='Đang quét...';try{let r=await fetch('/api/wifi/scan');let j=await r.json();let e=document.getElementById('ssid');e.innerHTML='';j.networks.forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' ('+n.rssi+' dBm)'+(n.secure?' 🔒':'');e.appendChild(o)});s.textContent='Đã tìm thấy '+j.networks.length+' mạng.'}catch(x){s.textContent='Lỗi quét Wi-Fi: '+x}}");
-  page += F("async function saveCfg(){let s=document.getElementById('status');s.textContent='Đang lưu...';let b={ssid:document.getElementById('ssid').value,password:document.getElementById('pass').value};try{let r=await fetch('/api/config/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let j=await r.json();s.textContent=j.message||JSON.stringify(j)}catch(x){s.textContent='Lỗi lưu: '+x}}");
+  page += F("async function saveCfg(){let s=document.getElementById('status');s.textContent='Đang lưu...';let b={ssid:document.getElementById('ssid').value,password:document.getElementById('open').checked?'':document.getElementById('pass').value,preserve_password:!document.getElementById('open').checked};try{let r=await fetch('/api/config/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let j=await r.json();s.textContent=j.message||JSON.stringify(j)}catch(x){s.textContent='Lỗi lưu: '+x}}");
   page += F("</script></body></html>");
   return page;
 }
@@ -2246,6 +2267,10 @@ static void handlePhoneConfigSave() {
   String ssid = doc["ssid"] | "";
   String password = doc["password"] | "";
   ssid.trim();
+  // The page never embeds the stored password. Preserve it only when explicitly
+  // requested for the same SSID; direct API callers keep the existing semantics.
+  if ((doc["preserve_password"] | false) && password.length() == 0 && ssid == WIFI_SSID)
+    password = WIFI_PASSWORD;
   String error;
   if (ssid.length() == 0 || ssid.length() >= sizeof(WIFI_SSID) || password.length() >= sizeof(WIFI_PASSWORD)) {
     error = "Thông tin Wi-Fi không hợp lệ";
@@ -2273,29 +2298,89 @@ static void handlePhoneConfigSave() {
   delay(1200); ESP.restart();
 }
 
+// Only the physically opened AP session can cancel; never accept GET, a stale
+// session nonce or a request arriving through the station interface.
+static void handlePhoneConfigCancel() {
+  if (!setupPortalActive || !setupCancelNonce[0] ||
+      setupWeb.client().localIP() != WiFi.softAPIP() ||
+      !setupWeb.hasHeader("X-Setup-Cancel") ||
+      setupWeb.header("X-Setup-Cancel") != setupCancelNonce) {
+    setupWeb.send(403, "application/json", "{\"ok\":false,\"message\":\"Phiên cài đặt không hợp lệ\"}");
+    return;
+  }
+  setupWeb.send(200, "application/json", "{\"ok\":true,\"message\":\"Đã hủy. Máy đang quay lại, không lưu.\"}");
+  setupCancelRequested = true;  // stop the server only after this callback unwinds
+}
+
 void startSetupPortal(const char* reason) {
   if (setupPortalActive) return;
+  if (!setupPortalEntryAllowed()) {
+    Serial.println("[SETUP PORTAL] REFUSED: active workflow or OTA");
+    if (recoveryMenuActive) drawRecoveryMenu();
+    else if (maintenanceMode) drawMaintenanceScreen();
+    else redrawProductionUi();
+    return;
+  }
+  portENTER_CRITICAL(&otaSleepMux);
+  const bool reserved = otaSleepGate.beginSetup();
+  portEXIT_CRITICAL(&otaSleepMux);
+  if (!reserved) {
+    if (recoveryMenuActive) drawRecoveryMenu();
+    else if (maintenanceMode) drawMaintenanceScreen();
+    else redrawProductionUi();
+    return;
+  }
   setupPortalActive = true;
+  setupResumePending = false;
+  setupCancelRequested = false;
+  setupKeyReleaseRequired = setupTouchReleaseRequired = true;
+  setupTouchTracking = false;
+  wifiSetupHoldActive = wifiSetupHoldTriggered = false;
+  wifiSetupHoldStartedAt = 0;
+  recoveryMenuActive = recoveryInfoActive = false;
+  maintenanceWeb.stop(); maintenanceWebActive = false;
+  maintenanceMode = maintenanceEnteredDuringBoot = false;
+  provisionWeb.stop(); discoveryUdp.stop();
+  if (mdnsReady) { MDNS.end(); mdnsReady = false; }
   lanProvisionActive = false;
+  rt.online = false; otaLinkReady = false;
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
   WiFi.disconnect(true, false);
   delay(200);
   WiFi.mode(WIFI_AP_STA);
   snprintf(setupApSsid, sizeof(setupApSsid), "MESFlow-Setup-%s", chipSuffix().substring(4).c_str());
+  snprintf(setupCancelNonce, sizeof(setupCancelNonce), "%08lx%08lx%08lx%08lx",
+           (unsigned long)esp_random(), (unsigned long)esp_random(),
+           (unsigned long)esp_random(), (unsigned long)esp_random());
   WiFi.softAP(setupApSsid, SETUP_AP_PASSWORD);
   captiveDns.start(DNS_PORT, "*", WiFi.softAPIP());
 
-  setupWeb.on("/", HTTP_GET, [](){ setupWeb.send(200, "text/html; charset=utf-8", setupPage()); });
-  setupWeb.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
-  setupWeb.on("/api/config/save", HTTP_POST, handlePhoneConfigSave);
-  setupWeb.on("/generate_204", HTTP_ANY, sendSetupRedirect);
-  setupWeb.on("/hotspot-detect.html", HTTP_ANY, sendSetupRedirect);
-  setupWeb.on("/connecttest.txt", HTTP_ANY, sendSetupRedirect);
-  setupWeb.onNotFound(sendSetupRedirect);
+  static bool routesRegistered = false;
+  if (!routesRegistered) {
+    const char* headers[] = {"X-Setup-Cancel"};
+    setupWeb.collectHeaders(headers, 1);
+    setupWeb.on("/", HTTP_GET, [](){
+      setupWeb.sendHeader("Cache-Control", "no-store");
+      setupWeb.send(200, "text/html; charset=utf-8", setupPage());
+    });
+    setupWeb.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
+    setupWeb.on("/api/config/save", HTTP_POST, handlePhoneConfigSave);
+    setupWeb.on("/api/config/cancel", HTTP_POST, handlePhoneConfigCancel);
+    setupWeb.on("/generate_204", HTTP_ANY, sendSetupRedirect);
+    setupWeb.on("/hotspot-detect.html", HTTP_ANY, sendSetupRedirect);
+    setupWeb.on("/connecttest.txt", HTTP_ANY, sendSetupRedirect);
+    setupWeb.onNotFound(sendSetupRedirect);
+    routesRegistered = true;
+  }
   setupWeb.begin();
 
-  drawSimple("CÀI ĐẶT WI-FI", setupApSsid, "MỞ 192.168.4.1", "", C_INFO);
-  Serial.printf("[SETUP PORTAL] reason=%s SSID=%s IP=%s\n", reason ? reason : "", setupApSsid,
-                WiFi.softAPIP().toString().c_str());
+  drawSimple("CÀI ĐẶT WI-FI", setupApSsid, "MỞ 192.168.4.1", "KHÔNG LƯU KHI QUAY LẠI", C_INFO);
+  tft.fillRoundRect(SETUP_BACK_X, SETUP_BACK_Y, SETUP_BACK_W, SETUP_BACK_H, 6, C_PANEL);
+  tft.drawRoundRect(SETUP_BACK_X, SETUP_BACK_Y, SETUP_BACK_W, SETUP_BACK_H, 6, C_TEXT);
+  drawCenteredTextFit("#: Quay lại", SETUP_BACK_X, SETUP_BACK_Y, SETUP_BACK_W,
+                      SETUP_BACK_H, FONT_SECTION, FONT_SECTION - 1, 1, C_TEXT, true);
+  Serial.printf("[SETUP PORTAL] reason=%s\n", reason ? reason : "");
 }
 
 // LAN provisioning changes Wi-Fi/server config, so it needs physical presence:
@@ -3076,28 +3161,33 @@ static void handleTestDataApi() {
 void startLanProvisioning() {
   if (lanProvisionActive || WiFi.status() != WL_CONNECTED) return;
   refreshProvisionToken();
-  const char* headers[] = {"X-Provision-Token"};
-  provisionWeb.collectHeaders(headers, 1);
-  provisionWeb.on("/", HTTP_GET, [](){ provisionWeb.send(200, "text/html; charset=utf-8", webConsolePage()); });
-  provisionWeb.on("/api/device/info", HTTP_GET, [](){ sendDeviceInfo(provisionWeb); });
-  provisionWeb.on("/api/device/health", HTTP_GET, handleDeviceHealthApi);
-  provisionWeb.on("/console", HTTP_GET, [](){ provisionWeb.send(200, "text/html; charset=utf-8", webConsolePage()); });
-  provisionWeb.on("/api/device/console", HTTP_POST, handleRemoteConsoleApi);
-  provisionWeb.on("/api/device/test-data", HTTP_GET, handleTestDataApi);
-  provisionWeb.on("/api/device/catalog-refresh", HTTP_POST, handleCatalogRefreshApi);
-  provisionWeb.on("/api/device/catalog-debug", HTTP_GET, handleCatalogDebugApi);
-  provisionWeb.on("/api/device/catalog-raw", HTTP_GET, handleCatalogRawApi);
+  // WebServer.stop() retains handlers across portal entry/cancel cycles.
+  static bool routesRegistered = false;
+  if (!routesRegistered) {
+    const char* headers[] = {"X-Provision-Token"};
+    provisionWeb.collectHeaders(headers, 1);
+    provisionWeb.on("/", HTTP_GET, [](){ provisionWeb.send(200, "text/html; charset=utf-8", webConsolePage()); });
+    provisionWeb.on("/api/device/info", HTTP_GET, [](){ sendDeviceInfo(provisionWeb); });
+    provisionWeb.on("/api/device/health", HTTP_GET, handleDeviceHealthApi);
+    provisionWeb.on("/console", HTTP_GET, [](){ provisionWeb.send(200, "text/html; charset=utf-8", webConsolePage()); });
+    provisionWeb.on("/api/device/console", HTTP_POST, handleRemoteConsoleApi);
+    provisionWeb.on("/api/device/test-data", HTTP_GET, handleTestDataApi);
+    provisionWeb.on("/api/device/catalog-refresh", HTTP_POST, handleCatalogRefreshApi);
+    provisionWeb.on("/api/device/catalog-debug", HTTP_GET, handleCatalogDebugApi);
+    provisionWeb.on("/api/device/catalog-raw", HTTP_GET, handleCatalogRawApi);
 #if MESFLOW_UI_SCREENSHOT
-  provisionWeb.on("/debug/screenshot", HTTP_GET, handleDebugScreenshot);
-  provisionWeb.on("/debug/ui-state", HTTP_GET, handleDebugUiState);
-  provisionWeb.on("/debug/screens", HTTP_GET, handleDebugScreens);
-  provisionWeb.on("/debug/show-screen", HTTP_GET, handleDebugShowScreen);
+    provisionWeb.on("/debug/screenshot", HTTP_GET, handleDebugScreenshot);
+    provisionWeb.on("/debug/ui-state", HTTP_GET, handleDebugUiState);
+    provisionWeb.on("/debug/screens", HTTP_GET, handleDebugScreens);
+    provisionWeb.on("/debug/show-screen", HTTP_GET, handleDebugShowScreen);
 #endif
-  provisionWeb.on("/api/device/provision", HTTP_POST, handleLanProvision);
-  provisionWeb.on("/api/device/reboot", HTTP_POST, [](){
-    if (!provisionAuthorized()) { provisionWeb.send(403, "application/json", "{\"ok\":false}"); return; }
-    provisionWeb.send(200, "application/json", "{\"ok\":true}"); delay(300); ESP.restart();
-  });
+    provisionWeb.on("/api/device/provision", HTTP_POST, handleLanProvision);
+    provisionWeb.on("/api/device/reboot", HTTP_POST, [](){
+      if (!provisionAuthorized()) { provisionWeb.send(403, "application/json", "{\"ok\":false}"); return; }
+      provisionWeb.send(200, "application/json", "{\"ok\":true}"); delay(300); ESP.restart();
+    });
+    routesRegistered = true;
+  }
   provisionWeb.begin();
   discoveryUdp.begin(DISCOVERY_PORT);
   String host = buildMdnsHostname();
@@ -3287,6 +3377,12 @@ void refreshTouchTestHeader() {
 void handleTouch() {
   uint16_t x = 0, y = 0;
   bool down = readTouchPoint(x, y);
+  if (setupTouchReleaseRequired) {
+    if (!down) setupTouchReleaseRequired = false;
+    touchWasDown = down;
+    cancelTouchActive = false;
+    return;
+  }
   if (!down) { touchWasDown = false; return; }
   touchX = x; touchY = y;
 
@@ -6987,7 +7083,6 @@ static void appendKeypadDigit(char key) {
 constexpr uint32_t RECOVERY_COUNTDOWN_FROM_MS = 3000;
 constexpr uint32_t RECOVERY_MENU_HOLD_MS = 5000;
 bool recoveryMenuActive = false;
-static bool recoveryInfoActive = false;
 static int recoveryCountdownShown = -1;
 
 static void drawRecoveryMenu() {
@@ -7064,8 +7159,6 @@ static void handleRecoveryMenuKey(char key) {
       closeRecoveryMenu();
       break;
     case '3':   // Wi-Fi setup portal
-      recoveryMenuActive = false;
-      drawSimple("CÀI ĐẶT WI-FI", "ĐANG KHỞI ĐỘNG...", "", "", C_INFO);
       startSetupPortal("Recovery menu");
       break;
     case '4': case '*': case '#':
@@ -7105,8 +7198,6 @@ void handleKeypadKey(char key) {
   if (maintenanceMode) {
     lastMaintenanceActivityAt = millis();
     if (key == '1') {
-      maintenanceWeb.stop(); maintenanceWebActive = false;
-      drawSimple("CÀI ĐẶT WI-FI", "ĐANG KHỞI ĐỘNG...", "", "", C_INFO);
       startSetupPortal("Maintenance WiFi setup");
     } else if (key == '2') {
       lastOfflineSyncAt=0;syncOneOfflineEvent();drawMaintenanceScreen();
@@ -7290,13 +7381,18 @@ void serviceKeypad() {
 
   const char stableKey = keypadCandidatePair >= 0
       ? keypadPairToKey(static_cast<uint8_t>(keypadCandidatePair)) : '\0';
+  if (setupKeyReleaseRequired) {
+    if (keypadCandidatePair == -1) {
+      setupKeyReleaseRequired = false;
+      keypadEmittedPair = -1;
+    }
+    return;
+  }
   if (wifiSetupHoldActive) {
     if (stableKey == '*') {
       const uint32_t held = millis() - wifiSetupHoldStartedAt;
       if (!wifiSetupHoldTriggered && held >= WIFI_SETUP_HOLD_MS) {
         wifiSetupHoldTriggered = true;          // held through the menu: Wi-Fi setup (v2)
-        recoveryMenuActive = false; recoveryInfoActive = false;
-        drawSimple("CÀI ĐẶT WI-FI", "ĐANG KHỞI ĐỘNG...", "", "", C_INFO);
         startSetupPortal("Hold * 10s");
       } else if (!wifiSetupHoldTriggered && held >= RECOVERY_MENU_HOLD_MS && !recoveryMenuActive) {
         openRecoveryMenu();
@@ -7357,6 +7453,87 @@ void serviceKeypad() {
     Serial.println("[KEYPAD] Loi giao tiep I2C voi PCF8574T.");
     keypadEmittedPair = -3;
   }
+}
+
+static bool setupPortalEntryAllowed() {
+  // A durable offline queue may wait; an in-flight workflow may not be interrupted.
+  return (uiState == UiState::READY || uiState == UiState::OFFLINE) &&
+      !rt.hasWorker && !rt.hasOperation && rt.activeSessionId == 0 && openOpCount == 0 &&
+      !hasPendingTransaction() && !deferredFinishReset && !pendingWebCommandReady &&
+      scannerFrameLength == 0 && !keypadTestActive && !keypadCalibrationRequested &&
+      !keypadCalibrationInProgress && !otaInstallInProgress && !otaCheckTaskRunning &&
+      !otaAvailableSince;
+}
+
+static void cancelSetupPortal() {
+  if (!setupPortalActive) return;
+  captiveDns.stop();
+  setupWeb.stop();
+  setupCancelNonce[0] = '\0';
+  setupCancelRequested = false;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  // Asynchronous: never trap the operator in connectWifi's 20-second wait.
+  if (WIFI_SSID[0]) WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  wifiSetupHoldActive = wifiSetupHoldTriggered = false;
+  wifiSetupHoldStartedAt = 0;
+  recoveryCountdownShown = -1;
+  setupKeyReleaseRequired = setupTouchReleaseRequired = true;
+  setupTouchTracking = cancelTouchActive = false;
+  keypadCandidatePair = keypadEmittedPair = -1;
+  keypadCandidateSince = millis();
+  lastUserActionAt = millis();
+  rt.online = false;
+  offlineMode = true;
+  setupPortalActive = false;
+  setUi(UiState::OFFLINE);
+  drawFooter("GIỮ *: KHÔI PHỤC", "");
+  setupResumePending = true;
+  portENTER_CRITICAL(&otaSleepMux);
+  otaSleepGate.endSetup();
+  portEXIT_CRITICAL(&otaSleepMux);
+  Serial.println("[SETUP PORTAL] CANCEL: configuration unchanged");
+}
+
+static void serviceSetupPortalInput() {
+  // Drop scanner bytes collected during setup; never dispatch production scans.
+  for (unsigned i = 0; i < 2048 && ScannerSerial.available() > 0; ++i) ScannerSerial.read();
+  scannerFrameLength = 0;
+  if (keypadAvailable && keypadMappingReady && millis() - keypadLastPollAt >= 12) {
+    keypadLastPollAt = millis();
+    const int pair = scanKeypadPair();
+    if (pair != keypadCandidatePair) {
+      keypadCandidatePair = pair;
+      keypadCandidateSince = millis();
+    } else if (millis() - keypadCandidateSince >= 40) {
+      if (pair == -1) {
+        setupKeyReleaseRequired = false;
+        keypadEmittedPair = -1;
+      } else if (!setupKeyReleaseRequired && pair >= 0 && pair != keypadEmittedPair) {
+        keypadEmittedPair = pair;
+        if (keypadPairToKey(static_cast<uint8_t>(pair)) == '#') setupCancelRequested = true;
+      }
+    }
+  }
+  uint16_t x = 0, y = 0;
+  const bool down = readTouchPoint(x, y);
+  if (setupTouchReleaseRequired) {
+    if (!down) setupTouchReleaseRequired = false;
+  } else if (!down) {
+    setupTouchTracking = false;
+  } else if (!pointIn(x, y, SETUP_BACK_X, SETUP_BACK_Y, SETUP_BACK_W, SETUP_BACK_H)) {
+    setupTouchTracking = false;
+    setupTouchReleaseRequired = true;  // sliding into Back is not a new press
+  } else if (!setupTouchTracking) {
+    setupTouchTracking = true;
+    setupTouchSince = millis();
+  } else if (millis() - setupTouchSince >= 60) {
+    setupCancelRequested = true;
+  }
+  if (setupCancelRequested) cancelSetupPortal();
 }
 
 void maintainConnection() {
@@ -7742,10 +7919,14 @@ void loop() {
 
   // Serve LAN Web Console first so button presses are accepted with minimal latency.
   serviceDeviceManagement();
-  if (setupPortalActive) return;
+  if (setupPortalActive) {
+    serviceSetupPortalInput();
+    return;  // including the cancel tick: no production touch/key/scan fall-through
+  }
   if (maintenanceMode) {
     readSerialCommands();   // USB only; restricted to 'maintenance exit'/status/help
     serviceKeypad();
+    if (setupPortalActive) return;
     serviceMaintenanceMode();
     static uint32_t lastMaintenanceReconnectAt = 0;
     if (WiFi.status() != WL_CONNECTED && millis() - lastMaintenanceReconnectAt >= 10000) {
@@ -7768,9 +7949,14 @@ void loop() {
   serviceKioskSleep();
   readScannerCommands();
   serviceKeypad();
+  if (setupPortalActive) return;
   handleTouch();
   serviceStateWatchdog();
   maintainConnection();
+  if (setupResumePending && (rt.online || uiState != UiState::OFFLINE)) {
+    setupResumePending = false;
+    if (uiState == UiState::OFFLINE) setUi(UiState::READY);
+  }
   refreshDeviceIdentityDisplay();
   // Background telemetry is lowest priority. Do not let its HTTP POST delay a
   // recent Web Console command or scanner interaction.

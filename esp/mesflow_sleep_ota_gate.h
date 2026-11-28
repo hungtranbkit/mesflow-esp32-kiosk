@@ -4,9 +4,12 @@ namespace mfks {
 struct OtaSleepGate {
   bool ota = false;
   bool sleeping = false;
-  bool beginOta() { if (ota || sleeping) return false; ota=true; return true; }
+  bool setup = false;
+  bool beginOta() { if (ota || sleeping || setup) return false; ota=true; return true; }
   void endOta() { ota=false; }
-  bool beginSleep() { if (ota || sleeping) return false; sleeping=true; return true; }
+  bool beginSleep() { if (ota || sleeping || setup) return false; sleeping=true; return true; }
   void endSleep() { sleeping=false; }
+  bool beginSetup() { if (ota || sleeping || setup) return false; setup=true; return true; }
+  void endSetup() { setup=false; }
 };
 }
