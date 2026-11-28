@@ -1,4 +1,4 @@
-# ESP32 Canonical Release 5.6.14 Implementation Plan
+# ESP32 Canonical Release 5.6.15 Implementation Plan
 
 > **For agentic workers:** execution uses the existing owner session and dedicated integration worktree.
 

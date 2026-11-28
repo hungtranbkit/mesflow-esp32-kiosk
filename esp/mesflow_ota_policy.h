@@ -8,6 +8,17 @@
 
 namespace mfota {
 
+// v2 separates transport acceptance from event application. Keep legacy Agents
+// compatible when they omit `applied`, but do not drop a pending ACK otherwise.
+inline bool eventAcknowledged(bool transported, bool hasOk, bool ok,
+                              bool hasApplied, bool applied) {
+  if (!transported) return false;
+  // The legacy Agent returns only `duplicate` (or an empty success object).
+  // HTTP 2xx is its acknowledgement; v2 responses carry `ok` and `applied`.
+  if (!hasOk && !hasApplied) return true;
+  return hasOk && ok && (!hasApplied || applied);
+}
+
 // The compiled default of firmware <= 5.6.2. Kept ONLY to recognise legacy
 // NVS values; it is never a default for a new install any more.
 static const char LEGACY_DEFAULT_AGENT[] = "https://deploy.mesflow.net/agent";

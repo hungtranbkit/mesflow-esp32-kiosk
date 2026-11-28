@@ -80,6 +80,13 @@ static void safePoint() {
 
 int main() {
   versions(); origins(); agentBase(); image(); safePoint();
+  CHECK(!eventAcknowledged(false, true, true, true, true));
+  CHECK(!eventAcknowledged(true, true, false, true, true));
+  CHECK(!eventAcknowledged(true, true, true, true, false));
+  CHECK(eventAcknowledged(true, true, true, true, true));
+  CHECK(eventAcknowledged(true, true, true, false, false)); // v1 Agent: ok, no applied
+  CHECK(eventAcknowledged(true, false, false, false, false)); // legacy fixture: 2xx, duplicate only
+  CHECK(!eventAcknowledged(true, false, false, true, true)); // malformed v2 response
   std::printf("%d/%d checks passed\n", total - fails, total);
   return fails ? 1 : 0;
 }

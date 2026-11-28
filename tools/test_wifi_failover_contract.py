@@ -43,3 +43,17 @@ def test_operation_worker_guard_and_utf8_scanner_policy_remain_in_source():
     assert '"mesflow_scanner_qr_policy.h"' in source
     assert "mfqr::isDataByte" in source
     assert "mfqr::isAsciiPrintable" in source
+
+
+def test_ready_network_indicator_repaints_only_on_idle_link_transition():
+    source = SOURCE.read_text()
+    record = source[source.index('void recordServerResult('):source.index('static void freeOfflineBuffers()')]
+    assert 'const bool wasOnline = rt.online;' in record
+    assert 'if (rt.online != wasOnline) readyNetworkRedrawNeeded = true;' in record
+    loop = source[source.index('void loop() {'):]
+    start = loop.index('if (readyNetworkRedrawNeeded)')
+    end = loop.index('if (setupResumePending', start)
+    redraw = loop[start:end]
+    assert 'uiState == UiState::READY' in redraw
+    assert '!hasPendingTransaction()' in redraw
+    assert 'drawReady(0)' in redraw

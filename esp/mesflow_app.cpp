@@ -96,10 +96,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.14"
-#define FW_BUILD "20261128.0004"
+#define FW_VERSION "5.6.15"
+#define FW_BUILD "20261128.0005"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.14-KIMEX-INTEGRATED";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.15-KIMEX-INTEGRATED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -974,8 +974,12 @@ uint16_t offlineAckCapacity = MAX_OFFLINE_EVENTS;
 // time an operator sees anything. Remember it separately, tagged by source.
 int lastLinkFailureStatus = 0;
 char lastLinkFailureSource[16] = "";
+// Repaint the READY header after a server-link transition without interrupting
+// scanner, keypad or an active production workflow.
+static bool readyNetworkRedrawNeeded = false;
 
 void recordServerResult(bool success,bool wifiDown=false,int status=0,const char* source=nullptr){
+  const bool wasOnline = rt.online;
   if(success){serverFailureStreak=0;if(serverSuccessStreak<2)serverSuccessStreak++;if(serverSuccessStreak>=2)serverLinkState=ServerLinkState::AVAILABLE;}
   else{serverSuccessStreak=0;if(wifiDown){serverFailureStreak=2;serverLinkState=ServerLinkState::WIFI_DOWN;}
     else{if(serverFailureStreak<2)serverFailureStreak++;if(serverFailureStreak>=2)serverLinkState=ServerLinkState::UNREACHABLE;}
@@ -983,6 +987,7 @@ void recordServerResult(bool success,bool wifiDown=false,int status=0,const char
     if(source) safeCopy(lastLinkFailureSource,sizeof(lastLinkFailureSource),source);
   }
   rt.online=serverLinkState==ServerLinkState::AVAILABLE;
+  if (rt.online != wasOnline) readyNetworkRedrawNeeded = true;
   if (!rt.online) otaLinkReady = false;
 }
 
@@ -1160,7 +1165,7 @@ bool enqueueOfflineEvent(OfflineEventType type,const char* localSessionId,int go
   Serial.printf("[OFFLINE] queued %s seq=%lu pending=%u\n",type==OfflineEventType::START?"START":"FINISH",(unsigned long)seq,countPendingOfflineEvents());return true;
 }
 
-bool isOperationQr(const char* qr){return qr&&(strncmp(qr,"WF|OP|",6)==0||strncmp(qr,"WF|OPID|",8)==0);}
+bool isOperationQr(const char* qr){return mfqr::isOperationQr(qr);}
 int operationIdFromQr(const char* qr){return (qr&&strncmp(qr,"WF|OPID|",8)==0)?atoi(qr+8):0;}
 void clearOpenOps(){openOpCount=0;}
 int findOpenOp(const char* qr){
@@ -2151,6 +2156,9 @@ static bool adoptServerDisplayNumber(JsonVariantConst value) {
 // credential: it is stashed, restored, or the change is refused.
 static bool applyServerChange(const String& newServer, String& error) {
   prefs.begin("mesflow", true);
+  const String storedToken = prefs.getString("token", "");
+  const String storedTokenServer = prefs.getString("token_srv", "");
+  const String storedStation = prefs.getString("station", "");
   const String altSrv = prefs.getString("alt_srv", "");
   const String altTok = prefs.getString("alt_token", "");
   const String altSt = prefs.getString("alt_station", "");
@@ -2170,22 +2178,124 @@ static bool applyServerChange(const String& newServer, String& error) {
   if (d == mfcred::Switch::NO_CHANGE) return true;
   identityDisplayChanges.numbered();  // Re-evaluate the display cache for the new server.
   enrollmentPending = false; enrollmentCode[0] = '\0';
-  prefs.begin("mesflow", false);
+  if (!prefs.begin("mesflow", false)) {
+    error = "Không mở được vùng lưu credential; giữ nguyên cấu hình server";
+    return false;
+  }
   if (d == mfcred::Switch::STASH_AND_UNBIND) {
-    prefs.putString("alt_srv", SERVER_BASE); prefs.putString("alt_token", rt.kioskToken); prefs.putString("alt_station", STATION_CODE);
+    // Do not remove the active token until its spare copy is durable and
+    // verified. A failed NVS write must leave the original credential usable.
+    bool saved = prefs.putString("alt_srv", SERVER_BASE) > 0 &&
+                 prefs.putString("alt_token", rt.kioskToken) > 0 &&
+                 prefs.putString("alt_station", STATION_CODE) > 0;
+    saved = saved && prefs.getString("alt_srv", "") == SERVER_BASE &&
+                    prefs.getString("alt_token", "") == rt.kioskToken &&
+                    prefs.getString("alt_station", "") == STATION_CODE;
+    if (!saved) {
+      prefs.end();
+      error = "Không lưu được credential dự phòng; credential hiện tại được giữ nguyên";
+      return false;
+    }
     prefs.remove("token"); prefs.remove("token_srv");
     rt.kioskToken[0] = '\0'; rt.bound = false;
   } else if (d == mfcred::Switch::RESTORE_FROM_SPARE) {
-    const String curSrv(SERVER_BASE), curTok(rt.kioskToken), curSt(STATION_CODE);
+    // Runtime can be unbound while NVS still contains a token scoped to a
+    // different server. Treat that durable credential as the current spare
+    // during the swap so it is not silently discarded.
+    const String curSrv = storedTokenServer.length() ? storedTokenServer : String(SERVER_BASE);
+    const String curTok = rt.kioskToken[0] ? String(rt.kioskToken) : storedToken;
+    const String curSt = storedStation.length() ? storedStation : String(STATION_CODE);
+    const String targetStation = altSt.length() && altSt.length() < sizeof(STATION_CODE) ? altSt : curSt;
+    bool restored = prefs.putString("token", altTok) > 0 &&
+                    prefs.putString("token_srv", newServer) > 0 &&
+                    prefs.putString("station", targetStation) > 0;
+    restored = restored && prefs.getString("token", "") == altTok &&
+                          prefs.getString("token_srv", "") == newServer &&
+                          prefs.getString("station", "") == targetStation;
+    if (!restored) {
+      // Keep the spare untouched and roll the active slot back before refusing
+      // the server change. The caller has not yet replaced SERVER_BASE.
+      bool rolledBack = true;
+      if (curTok.length()) rolledBack &= prefs.putString("token", curTok) > 0;
+      else prefs.remove("token");
+      if (curSrv.length()) rolledBack &= prefs.putString("token_srv", curSrv) > 0;
+      else prefs.remove("token_srv");
+      if (curSt.length()) rolledBack &= prefs.putString("station", curSt) > 0;
+      rolledBack &= prefs.getString("token", "") == curTok &&
+                    prefs.getString("token_srv", "") == curSrv &&
+                    prefs.getString("station", "") == curSt;
+      prefs.end();
+      error = rolledBack ? "Không khôi phục được credential dự phòng; credential cũ vẫn được giữ" :
+                           "Lỗi NVS khi khôi phục credential; dừng đổi server và cần kiểm tra lưu trữ";
+      return false;
+    }
+    if (curTok.length()) {
+      bool savedOld = prefs.putString("alt_srv", curSrv) > 0 &&
+                      prefs.putString("alt_token", curTok) > 0 &&
+                      prefs.putString("alt_station", curSt) > 0;
+      savedOld = savedOld && prefs.getString("alt_srv", "") == curSrv &&
+                              prefs.getString("alt_token", "") == curTok &&
+                              prefs.getString("alt_station", "") == curSt;
+      if (!savedOld) {
+        // The target credential is still available in the spare slot until
+        // all new spare fields are written; restore that slot and active state.
+        bool rolledBack = prefs.putString("alt_srv", altSrv) > 0 &&
+                          prefs.putString("alt_token", altTok) > 0 &&
+                          prefs.putString("alt_station", altSt) > 0;
+        if (curTok.length()) rolledBack &= prefs.putString("token", curTok) > 0;
+        else prefs.remove("token");
+        if (curSrv.length()) rolledBack &= prefs.putString("token_srv", curSrv) > 0;
+        else prefs.remove("token_srv");
+        if (curSt.length()) rolledBack &= prefs.putString("station", curSt) > 0;
+        rolledBack = rolledBack && prefs.getString("alt_srv", "") == altSrv &&
+                                  prefs.getString("alt_token", "") == altTok &&
+                                  prefs.getString("alt_station", "") == altSt &&
+                                  prefs.getString("token", "") == curTok &&
+                                  prefs.getString("token_srv", "") == curSrv &&
+                                  prefs.getString("station", "") == curSt;
+        prefs.end();
+        safeCopy(rt.kioskToken, sizeof(rt.kioskToken), curTok.c_str());
+        safeCopy(STATION_CODE, sizeof(STATION_CODE), curSt.c_str());
+        rt.bound = rolledBack && curTok.length() > 0;
+        error = rolledBack ? "Không lưu được credential dự phòng cũ; thao tác đổi server đã hủy" :
+                             "Lỗi NVS khi khôi phục credential; giữ thiết bị không bound để tránh dùng sai token";
+        return false;
+      }
+    } else {
+      prefs.remove("alt_srv"); prefs.remove("alt_token"); prefs.remove("alt_station");
+    }
     safeCopy(rt.kioskToken, sizeof(rt.kioskToken), altTok.c_str());
-    if (altSt.length() && altSt.length() < sizeof(STATION_CODE)) safeCopy(STATION_CODE, sizeof(STATION_CODE), altSt.c_str());
-    prefs.putString("token", rt.kioskToken); prefs.putString("token_srv", newServer); prefs.putString("station", STATION_CODE);
-    if (curTok.length()) { prefs.putString("alt_srv", curSrv); prefs.putString("alt_token", curTok); prefs.putString("alt_station", curSt); }
-    else { prefs.remove("alt_srv"); prefs.remove("alt_token"); prefs.remove("alt_station"); }
+    safeCopy(STATION_CODE, sizeof(STATION_CODE), targetStation.c_str());
     rt.bound = true;
   } else {  // CHANGE_UNBOUND: no current token to keep
-    prefs.remove("token_srv");
-    rt.bound = false;
+    // Startup may have left an unusable old-server token in NVS while runtime
+    // is unbound. Preserve it in the spare slot before the caller writes the
+    // new server; an empty token_srv would make legacy logic treat it as
+    // portable to the new server.
+    if (storedToken.length()) {
+      if (mfcred::sameServer(storedTokenServer.c_str(), newServer.c_str())) {
+        safeCopy(rt.kioskToken, sizeof(rt.kioskToken), storedToken.c_str());
+        if (storedStation.length() && storedStation.length() < sizeof(STATION_CODE))
+          safeCopy(STATION_CODE, sizeof(STATION_CODE), storedStation.c_str());
+        rt.bound = true;
+      } else {
+        const String previousServer = storedTokenServer.length() ? storedTokenServer : String(SERVER_BASE);
+        const String previousStation = storedStation.length() ? storedStation : String(STATION_CODE);
+        bool saved = prefs.putString("alt_srv", previousServer) > 0 &&
+                     prefs.putString("alt_token", storedToken) > 0 &&
+                     prefs.putString("alt_station", previousStation) > 0;
+        saved = saved && prefs.getString("alt_srv", "") == previousServer &&
+                        prefs.getString("alt_token", "") == storedToken &&
+                        prefs.getString("alt_station", "") == previousStation;
+        if (!saved) {
+          prefs.end();
+          error = "Không lưu được credential cũ vào vùng dự phòng; giữ nguyên server và auth";
+          return false;
+        }
+        prefs.remove("token"); prefs.remove("token_srv");
+        rt.bound = false;
+      }
+    }
   }
   prefs.end();
   return true;
@@ -4748,7 +4858,9 @@ bool httpPostJson(const char* path,
   }
 
   Serial.printf("\n[POST] %s\n", url);
-  Serial.println(body);
+  // Request bodies can contain device_secret, tokens, Wi-Fi and enrollment data.
+  // Keep payloads out of serial/remote logs; status and response diagnostics
+  // below are sufficient for transport troubleshooting.
 
   int lastStatus = 0;
   String lastMessage = "Ket noi API that bai";
@@ -5470,7 +5582,22 @@ static bool otaEvent(const char* status, const char* errorCode = "", const char*
   // matches the pinned artifact's build/profile.
   req["build_id"] = FW_BUILD_ID;
   req["hardware_profile"] = HW_PROFILE[0] ? HW_PROFILE : otaTargetProfile;
-  char cid[20]; snprintf(cid, sizeof(cid), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+  char cid[65];
+  if (otaBootReportPending) {
+    // Stable across retries/reboots: a lost response must not discard the
+    // server's applied decision. Do not include credentials in the key.
+    const String key = String(otaTargetId) + ":" + otaFirmwareId + ":" + otaClaimId + ":" + status;
+    uint8_t digest[32];
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha, 0);
+    mbedtls_sha256_update(&sha, reinterpret_cast<const unsigned char*>(key.c_str()), key.length());
+    mbedtls_sha256_finish(&sha, digest); mbedtls_sha256_free(&sha);
+    for (uint8_t i = 0; i < 32; ++i) snprintf(cid + i * 2, sizeof(cid) - i * 2, "%02x", digest[i]);
+    cid[64] = '\0';
+    memset(digest, 0, sizeof(digest));
+  } else {
+    snprintf(cid, sizeof(cid), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+  }
   req["client_event_id"] = cid;
   req["status"] = status; req["error_code"] = errorCode; req["message"] = message;
   req["timestamp"] = currentEpoch();
@@ -5478,7 +5605,8 @@ static bool otaEvent(const char* status, const char* errorCode = "", const char*
   suppressNetworkUiErrors = true;  // background OTA never hijacks the LCD (no ERROR_STATE)
   const bool ok = httpPostJson("/api/esp-ota/event", req, resp, true, false, base);
   suppressNetworkUiErrors = previousSuppress;
-  return ok;
+  return mfota::eventAcknowledged(ok, resp.containsKey("ok"), resp["ok"] | false,
+                                  resp.containsKey("applied"), resp["applied"] | false);
 }
 
 static mfota::SafePoint otaSafePoint() {
@@ -8194,6 +8322,10 @@ void loop() {
   handleTouch();
   serviceStateWatchdog();
   maintainConnection();
+  if (readyNetworkRedrawNeeded) {
+    readyNetworkRedrawNeeded = false;
+    if (uiState == UiState::READY && !hasPendingTransaction()) drawReady(0);
+  }
   if (setupResumePending && (rt.online || uiState != UiState::OFFLINE)) {
     setupResumePending = false;
     if (uiState == UiState::OFFLINE) setUi(UiState::READY);

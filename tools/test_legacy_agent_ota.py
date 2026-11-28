@@ -185,6 +185,13 @@ def test_lost_boot_ack_reconciled_by_heartbeat_version(ota, tmp_path):
     assert ota.get_job(job["id"])["status"] == "SUCCESS"
 
 
+def test_legacy_event_ack_response_is_duplicate_only(ota):
+    _online(ota)
+    body = {"kiosk_id": KIOSK, "status": "OTA_BOOT_NEW_VERSION", "client_event_id": "stable-boot-ack"}
+    assert ota.record_event(body) == {"duplicate": False}
+    assert ota.record_event(body) == {"duplicate": True}
+
+
 # --- firmware side of the same contract (source contract, no hardware) ------
 def test_firmware_speaks_the_legacy_contract():
     assert re.search(r'#define HW_MODEL "ES3C28P"', APP)
@@ -200,3 +207,4 @@ def test_firmware_speaks_the_legacy_contract():
                "OTA_BOOT_NEW_VERSION", "OTA_HEALTHCHECK_OK", "OTA_ROLLBACK", "OTA_FAILED", "OTA_VERIFY_FAILED"):
         assert ev in legacy_events and f'"{ev}"' in APP, ev
     assert 'httpPostJson("/api/esp-ota/event"' in APP and "addAuthHeaders(http)" in APP
+    assert "!hasOk && !hasApplied" in (ROOT / "esp/mesflow_ota_policy.h").read_text()

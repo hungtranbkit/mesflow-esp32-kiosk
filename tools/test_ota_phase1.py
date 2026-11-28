@@ -6,9 +6,9 @@ POLICY=(Path(__file__).parents[1]/"esp/mesflow_ota_policy.h").read_text()
 
 
 def test_integrated_release_identity_advances_v5610():
-    assert '#define FW_VERSION "5.6.14"' in SOURCE
-    assert '#define FW_BUILD "20261128.0004"' in SOURCE
-    assert 'const char* APP_VERSION  = "ESP32-KIOSK-5.6.14-KIMEX-INTEGRATED"' in SOURCE
+    assert '#define FW_VERSION "5.6.15"' in SOURCE
+    assert '#define FW_BUILD "20261128.0005"' in SOURCE
+    assert 'const char* APP_VERSION  = "ESP32-KIOSK-5.6.15-KIMEX-INTEGRATED"' in SOURCE
 
 
 def test_identity_and_partition_safe_contract():
@@ -46,6 +46,19 @@ def test_boot_validation_and_rollback_support():
     assert 'ESP_OTA_IMG_PENDING_VERIFY' in SOURCE
     assert 'esp_ota_mark_app_valid_cancel_rollback' in SOURCE
     assert 'OTA_BOOT_NEW_VERSION' in SOURCE and 'OTA_HEALTHCHECK_OK' in SOURCE
+
+
+def test_pending_ota_ack_is_stable_and_observes_application_result():
+    event = SOURCE[SOURCE.index('static bool otaEvent('):SOURCE.index('static mfota::SafePoint otaSafePoint()')]
+    assert 'if (otaBootReportPending)' in event
+    assert 'otaTargetId' in event and 'otaFirmwareId' in event and 'otaClaimId' in event
+    assert 'mfota::eventAcknowledged(ok, resp.containsKey("ok"), resp["ok"] | false' in event
+    assert 'resp.containsKey("applied")' in event
+
+
+def test_post_json_never_logs_request_body():
+    post = SOURCE[SOURCE.index('bool httpPostJson('):SOURCE.index('static bool otaEvent(')]
+    assert 'Serial.println(body)' not in post
 
 
 def test_header_clock_and_signal_regions_do_not_overlap():

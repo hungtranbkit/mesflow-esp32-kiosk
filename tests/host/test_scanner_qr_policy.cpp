@@ -22,5 +22,9 @@ int main() {
   assert(!mfqr::isAsciiPrintable(0xc3));
   assert(mfqr::isAsciiPrintable(0x7e));
   assert(!mfqr::isAsciiPrintable(0x7f));
+  assert(mfqr::isOperationQr("WF|OP|6391 - GHẾ KHÔNG TAY"));
+  assert(mfqr::isOperationQr("WF|OPID|83001"));
+  assert(!mfqr::isOperationQr("WF|EMP|NV001"));
+  assert(!mfqr::isOperationQr("not-a-MESFlow-QR"));
   std::puts("scanner QR UTF-8 policy: PASS");
 }

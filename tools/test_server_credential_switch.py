@@ -41,6 +41,32 @@ def test_switch_stashes_or_restores_never_deletes_spare():
         assert bad not in sw, bad
 
 
+def test_nvs_failure_cannot_delete_active_token_before_verified_stash():
+    sw = body("static bool applyServerChange(const String& newServer, String& error) {")
+    stash = sw[sw.index("STASH_AND_UNBIND) {"):sw.index("RESTORE_FROM_SPARE) {")]
+    assert "if (!prefs.begin(\"mesflow\", false))" in sw
+    assert 'prefs.getString("alt_token", "") == rt.kioskToken' in stash
+    assert stash.index("if (!saved)") < stash.index('prefs.remove("token")')
+    assert "credential hiện tại được giữ nguyên" in stash
+
+
+def test_unbound_server_switch_keeps_scoped_nvs_credentials_and_recovery_path():
+    sw = body("static bool applyServerChange(const String& newServer, String& error) {")
+    change = sw[sw.index("} else {  // CHANGE_UNBOUND"):]
+    assert 'prefs.getString("token", "")' in sw
+    assert 'prefs.getString("token_srv", "")' in sw
+    assert "mfcred::sameServer(storedTokenServer.c_str(), newServer.c_str())" in change
+    assert change.index("if (!saved)") < change.index('prefs.remove("token_srv")')
+
+
+def test_restore_verifies_target_before_overwriting_spare_and_rolls_back_on_error():
+    sw = body("static bool applyServerChange(const String& newServer, String& error) {")
+    restore = sw[sw.index("RESTORE_FROM_SPARE) {"):sw.index("CHANGE_UNBOUND:")]
+    assert 'prefs.getString("token_srv", "") == newServer' in restore
+    assert restore.index("if (!restored)") < restore.index('prefs.putString("alt_srv", curSrv)')
+    assert "bool rolledBack" in restore and 'prefs.getString("alt_token", "") == altTok' in restore
+
+
 def test_token_is_bound_only_for_its_issuing_server():
     setup = body("void setup() {")
     assert "mfcred::tokenUsableFor(true, storedTokenServer.c_str(), SERVER_BASE)" in setup
