@@ -27,7 +27,7 @@
 
 ## Recent handoff
 
-- 2026-11-28: PR #9 merged 5.6.15; PR #10 merged 5.6.16 after exact-head CI success. PR #1 and #5–#8 closed as superseded with source branches retained. Follow up on post-merge main CI and release artifact promotion. No hardware writes until a unique safe rollback-capable target is proven.
+- 2026-11-28: PR #9 merged 5.6.15; PR #10/#11 established canonical 5.6.16. USB provisioning source is ported as candidate branch `agent/codex/esp-usb-provisioning-5616` at `313b158`; host tests and both verified M910 profile builds pass. Source PR/CI and staged hardware acceptance remain; do not flash or enable auto-provisioning before those gates.
 
 ## USB provisioning candidate handoff (2026-11-28)
 
