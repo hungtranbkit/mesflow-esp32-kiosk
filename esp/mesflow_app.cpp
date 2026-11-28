@@ -4825,7 +4825,6 @@ static void wifiBeginSlot(int8_t slot) {
   if (slot < 0 || slot > 2 || !wifiSlotSsid(slot)[0]) return;
   wifiSlot = slot;
   wifiPreferredCheckAt = millis();
-  mesKeepAlive.drop();
   Serial.printf("[NETWORK] Connecting configured WiFi priority %d\n", slot + 1);
   // Stop a pending reconnect before applying another STA config. Verify the
   // driver accepted it; otherwise do not assume the bookkeeping changed.
