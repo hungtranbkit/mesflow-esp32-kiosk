@@ -64,13 +64,30 @@ inline bool isMaintenanceConfirm(const char* lowerTrimmed) {
 // While in maintenance the USB console accepts only these (no QR/session input).
 inline bool allowedDuringMaintenance(const char* lowerTrimmed) {
   if (!lowerTrimmed) return false;
-  const char* ok[] = {"maintenance exit", "status", "help", "?"};
+  const char* ok[] = {"maintenance exit", "status", "help", "?", "scanner-probe"};
   for (const char* w : ok) {
     const char* a = w; const char* b = lowerTrimmed;
     while (*a && *a == *b) { ++a; ++b; }
     if (!*a && !*b) return true;
   }
   return false;
+}
+
+struct ScannerProbeInputs {
+  bool maintenance;
+  bool idleScreen;
+  bool noActiveWork;
+  bool noPendingWork;
+  bool noOtaActivity;
+  bool noOtherActivity;
+  bool cleanScannerFrame;
+  bool supportedProfile;
+};
+
+inline bool mayRunScannerProbe(const ScannerProbeInputs& in) {
+  return in.maintenance && in.idleScreen && in.noActiveWork &&
+         in.noPendingWork && in.noOtaActivity && in.noOtherActivity &&
+         in.cleanScannerFrame && in.supportedProfile;
 }
 
 static const uint32_t MAINTENANCE_IDLE_TIMEOUT_MS = 10UL * 60UL * 1000UL;

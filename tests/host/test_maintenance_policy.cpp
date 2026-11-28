@@ -28,11 +28,22 @@ int main() {
   CHECK(allowedDuringMaintenance("maintenance exit"));
   CHECK(allowedDuringMaintenance("status"));
   CHECK(allowedDuringMaintenance("help"));
+  CHECK(allowedDuringMaintenance("scanner-probe"));
   CHECK(!allowedDuringMaintenance("factory-reset"));
   CHECK(!allowedDuringMaintenance("clear-offline"));
   CHECK(!allowedDuringMaintenance("WF|EMP|E001"));
   CHECK(!allowedDuringMaintenance("statusx"));
   CHECK(!allowedDuringMaintenance(nullptr));
+  const ScannerProbeInputs probeAllowed{true, true, true, true, true, true, true, true};
+  CHECK(mayRunScannerProbe(probeAllowed));
+  CHECK(!mayRunScannerProbe({false, true, true, true, true, true, true, true}));
+  CHECK(!mayRunScannerProbe({true, false, true, true, true, true, true, true}));
+  CHECK(!mayRunScannerProbe({true, true, false, true, true, true, true, true}));
+  CHECK(!mayRunScannerProbe({true, true, true, false, true, true, true, true}));
+  CHECK(!mayRunScannerProbe({true, true, true, true, false, true, true, true}));
+  CHECK(!mayRunScannerProbe({true, true, true, true, true, false, true, true}));
+  CHECK(!mayRunScannerProbe({true, true, true, true, true, true, false, true}));
+  CHECK(!mayRunScannerProbe({true, true, true, true, true, true, true, false}));
   // Idle timeout, millis() wrap-safe.
   CHECK(!maintenanceTimedOut(1000, 1000 + MAINTENANCE_IDLE_TIMEOUT_MS - 1));
   CHECK(maintenanceTimedOut(1000, 1000 + MAINTENANCE_IDLE_TIMEOUT_MS));

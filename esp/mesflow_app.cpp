@@ -96,10 +96,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.15"
-#define FW_BUILD "20261128.0005"
+#define FW_VERSION "5.6.16"
+#define FW_BUILD "20261128.0006"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.15-KIMEX-INTEGRATED";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.16-KIMEX-INTEGRATED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -6168,6 +6168,7 @@ static void consolePrintHelp() {
   Serial.println("keypad-calibrate          : hieu chinh lai keypad ngay, khong reboot");
   Serial.println("maintenance confirm       : vao bao tri (chi USB; READY, khong giao dich cho)");
   Serial.println("maintenance exit          : thoat bao tri (tu thoat sau 10 phut khong thao tac)");
+  Serial.println("scanner-probe             : do edge GPIO44 10 giay (USB maintenance/profile da xac minh)");
   Serial.println("restart | reboot          : khoi dong lai ESP32");
   Serial.println("bind                      : bind kiosk lai");
   Serial.println("heartbeat                 : gui heartbeat ngay");
@@ -6297,6 +6298,72 @@ static void consoleEnterMaintenance() {
   enterMaintenanceMode(false);
 }
 
+static bool scannerProbeProfileSupported() {
+  return strcmp(HW_PROFILE, "es3c28p-n16r8-m910-gm65uart1") == 0 ||
+         strcmp(HW_PROFILE, "es3c28p-n16r8-m910-hugeapp-serial") == 0;
+}
+
+static void runScannerProbe() {
+  const bool idle = uiState == UiState::READY || uiState == UiState::OFFLINE;
+  const mfmt::ScannerProbeInputs in{
+      maintenanceMode,
+      idle,
+      !rt.hasWorker && !rt.hasOperation && rt.activeSessionId == 0 && openOpCount == 0,
+      !hasPendingTransaction() && countPendingOfflineEvents() == 0 && actionQueueCount() == 0,
+      !otaInstallInProgress && !otaCheckTaskRunning && !otaAvailableSince,
+      !setupPortalActive && !keypadTestActive && !keypadCalibrationRequested &&
+          !keypadCalibrationInProgress && !recoveryMenuActive && !enrollmentPending &&
+          !pendingWebCommandReady,
+      scannerFrameLength == 0,
+      scannerProbeProfileSupported(),
+  };
+  if (!mfmt::mayRunScannerProbe(in)) {
+    Serial.println("[SCANNER PROBE] Tu choi: can USB maintenance, idle, queue trong va hardware profile da xac minh.");
+    return;
+  }
+
+  // This diagnostic samples the already-configured RX pin only. It never
+  // changes UART baud, NVS, Wi-Fi, identity, credentials, or scanner wiring.
+  while (ScannerSerial.available() > 0) ScannerSerial.read();
+  scannerFrameLength = 0;
+  pinMode(SCANNER_RX_PIN, INPUT_PULLUP);
+  int previous = digitalRead(SCANNER_RX_PIN);
+  uint32_t previousEdgeUs = micros();
+  uint32_t minimumPulseUs = UINT32_MAX;
+  uint32_t edges = 0;
+  uint32_t probeBytes = 0;
+  uint32_t lastWatchdogMs = millis();
+  const uint32_t startedMs = millis();
+  Serial.println("[SCANNER PROBE] Quet ma trong 10 giay; chi ghi aggregate GPIO/UART.");
+  while (static_cast<uint32_t>(millis() - startedMs) < 10000UL) {
+    const int level = digitalRead(SCANNER_RX_PIN);
+    if (level != previous) {
+      const uint32_t nowUs = micros();
+      const uint32_t interval = nowUs - previousEdgeUs;
+      if (interval && interval < minimumPulseUs) minimumPulseUs = interval;
+      previousEdgeUs = nowUs;
+      previous = level;
+      ++edges;
+    }
+    if (static_cast<uint32_t>(millis() - lastWatchdogMs) >= 100UL) {
+      esp_task_wdt_reset();
+      lastWatchdogMs = millis();
+      delay(0);  // let Wi-Fi/IDF tasks run while the USB maintenance probe is active
+    } else {
+      delayMicroseconds(10);
+    }
+  }
+  while (ScannerSerial.available() > 0) { ScannerSerial.read(); ++probeBytes; }
+  scannerFrameLength = 0;
+  const uint32_t estimatedBaud = minimumPulseUs != UINT32_MAX && minimumPulseUs
+                                     ? 1000000UL / minimumPulseUs : 0;
+  Serial.printf("[SCANNER PROBE] GPIO%u edges=%lu min_sample_us=%lu est_baud~%lu uart_baud=%lu bytes_uart=%lu\n",
+                static_cast<unsigned>(SCANNER_RX_PIN), static_cast<unsigned long>(edges),
+                static_cast<unsigned long>(minimumPulseUs == UINT32_MAX ? 0 : minimumPulseUs),
+                static_cast<unsigned long>(estimatedBaud), static_cast<unsigned long>(scannerBaud),
+                static_cast<unsigned long>(probeBytes));
+}
+
 static bool handleConsoleCommand(String line) {
   line.trim();
   String cmd = line;
@@ -6369,6 +6436,7 @@ static bool handleConsoleCommand(String line) {
   }
   if (cmd == "touch-test" || cmd == "touch") { setUi(UiState::TOUCH_TEST); Serial.println("Da mo test cam ung."); return true; }
   if (cmd == "recovery-menu") { openRecoveryMenu(); return true; }
+  if (cmd == "scanner-probe") { runScannerProbe(); return true; }
   if (mfmt::isMaintenanceConfirm(cmd.c_str())) { consoleEnterMaintenance(); return true; }
   if (cmd == "maintenance") {
     Serial.println("[MAINT] Go chinh xac 'maintenance confirm' (chi qua USB) de vao bao tri.");
@@ -6667,7 +6735,7 @@ static void handleUsbConsoleLine(String line) {
   cmd.toLowerCase();
   if (maintenanceMode) {
     if (!mfmt::allowedDuringMaintenance(cmd.c_str())) {
-      Serial.println("[MAINT] Dang bao tri: chi nhan 'maintenance exit', 'status', 'help'.");
+      Serial.println("[MAINT] Dang bao tri: chi nhan 'maintenance exit', 'status', 'help', 'scanner-probe'.");
       return;
     }
     if (cmd == "maintenance exit") { exitMaintenanceMode(); return; }
@@ -6714,11 +6782,43 @@ void dispatchScannerFrame(const char* reason) {
   if (scannerFrameLength == 0) return;
 
   scannerFrameCount++;
+  char decoded[SCANNER_FRAME_MAX + 1] = {0};
+  size_t decodedLength = 0;
+  size_t asciiPrintableCount = 0;
+  for (size_t i = 0; i < scannerFrameLength; ++i) {
+    const uint8_t value = scannerFrame[i];
+    if (mfqr::isAsciiPrintable(value)) ++asciiPrintableCount;
+    if (mfqr::isDataByte(value)) {
+      if (decodedLength < SCANNER_FRAME_MAX) {
+        decoded[decodedLength++] = static_cast<char>(value);
+      }
+    }
+  }
+  decoded[decodedLength] = '\0';
+
+  // Remove surrounding spaces in the same way as the virtual scanner input.
+  String scannerText(decoded);
+  scannerText.trim();
+
+  static String lastDispatchedScan;
+  static uint32_t lastDispatchedScanAt = 0;
+  const uint32_t nowMs = millis();
+  if (mfqr::isRecentRepeat(scannerText.c_str(), lastDispatchedScan.c_str(),
+                           nowMs - lastDispatchedScanAt)) {
+    scannerFrameLength = 0;
+    Serial.printf("[SCANNER DUP] duplicate valid QR suppressed; length=%u\n",
+                  static_cast<unsigned>(scannerText.length()));
+    return;
+  }
+  if (mfqr::isMesflowQr(scannerText.c_str())) {
+    lastDispatchedScan = scannerText;
+    lastDispatchedScanAt = nowMs;
+  }
+
   Serial.println();
   Serial.printf("========== SCANNER FRAME %lu / %s ==========\n",
                 static_cast<unsigned long>(scannerFrameCount), reason);
   Serial.printf("Do dai: %u byte\n", static_cast<unsigned>(scannerFrameLength));
-
   Serial.print("HEX  : ");
   for (size_t i = 0; i < scannerFrameLength; ++i) {
     if (scannerFrame[i] < 0x10) Serial.print('0');
@@ -6726,36 +6826,16 @@ void dispatchScannerFrame(const char* reason) {
     Serial.print(' ');
   }
   Serial.println();
-
-  char decoded[SCANNER_FRAME_MAX + 1] = {0};
-  size_t decodedLength = 0;
-  size_t asciiPrintableCount = 0;
-
   Serial.print("DATA : ");
   for (size_t i = 0; i < scannerFrameLength; ++i) {
     const uint8_t value = scannerFrame[i];
-    if (mfqr::isAsciiPrintable(value)) ++asciiPrintableCount;
-    if (mfqr::isDataByte(value)) {
-      Serial.write(value);
-      if (decodedLength < SCANNER_FRAME_MAX) {
-        decoded[decodedLength++] = static_cast<char>(value);
-      }
-    } else if (value == '\r') {
-      Serial.print("<CR>");
-    } else if (value == '\n') {
-      Serial.print("<LF>");
-    } else if (value == '\t') {
-      Serial.print("<TAB>");
-    } else {
-      Serial.print('.');
-    }
+    if (mfqr::isDataByte(value)) Serial.write(value);
+    else if (value == '\r') Serial.print("<CR>");
+    else if (value == '\n') Serial.print("<LF>");
+    else if (value == '\t') Serial.print("<TAB>");
+    else Serial.print('.');
   }
   Serial.println();
-  decoded[decodedLength] = '\0';
-
-  // Remove surrounding spaces in the same way as the virtual scanner input.
-  String scannerText(decoded);
-  scannerText.trim();
   Serial.printf("[SCANNER STRING] len=%u data=%s\n",
                 static_cast<unsigned>(scannerText.length()),
                 scannerText.c_str());
@@ -6793,16 +6873,9 @@ void readScannerCommands() {
     scannerByteCount++;
     scannerLastByteAt = millis();
 
-    Serial.printf("[SCANNER BYTE %lu] HEX=0x%02X",
-                  static_cast<unsigned long>(scannerByteCount), value);
-    if (value >= 32 && value <= 126) {
-      Serial.printf(" ASCII='%c'", static_cast<char>(value));
-    } else if (value == '\r') {
-      Serial.print(" <CR>");
-    } else if (value == '\n') {
-      Serial.print(" <LF>");
-    }
-    Serial.println();
+    // Count bytes without echoing QR contents to the USB log. Payloads can
+    // contain worker/operation identifiers and are logged only by the
+    // frame-level diagnostic when a new, non-duplicate frame is dispatched.
 
     if (scannerFrameLength < SCANNER_FRAME_MAX) {
       scannerFrame[scannerFrameLength++] = value;

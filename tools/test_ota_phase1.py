@@ -6,9 +6,9 @@ POLICY=(Path(__file__).parents[1]/"esp/mesflow_ota_policy.h").read_text()
 
 
 def test_integrated_release_identity_advances_v5610():
-    assert '#define FW_VERSION "5.6.15"' in SOURCE
-    assert '#define FW_BUILD "20261128.0005"' in SOURCE
-    assert 'const char* APP_VERSION  = "ESP32-KIOSK-5.6.15-KIMEX-INTEGRATED"' in SOURCE
+    assert '#define FW_VERSION "5.6.16"' in SOURCE
+    assert '#define FW_BUILD "20261128.0006"' in SOURCE
+    assert 'const char* APP_VERSION  = "ESP32-KIOSK-5.6.16-KIMEX-INTEGRATED"' in SOURCE
 
 
 def test_identity_and_partition_safe_contract():

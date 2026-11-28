@@ -1,6 +1,6 @@
-# ESP32 firmware profile matrix — 5.6.15 integration candidate
+# ESP32 firmware profile matrix — merged main 5.6.15 baseline
 
-Canonical source candidate: `integration/esp-canonical-release-20261128` (currently being qualified for PR #9 → `main`). Firmware source is shared; only hardware-specific build profiles may select verified pins, flash/partition layout, scanner defaults or display drivers. An unknown profile stays inactive and must not enter release artifacts. A matching model name is not physical identity.
+Canonical source: `main` at merge commit `4d10dbc54763abfe312531834d904b31e7983cdd`, merged from PR #9. Firmware source is shared; only hardware-specific build profiles may select verified pins, flash/partition layout, scanner defaults or display drivers. An unknown profile stays inactive and must not enter release artifacts. A matching model name is not physical identity. The 5.6.16 scanner-safety follow-up is documented separately in `FIRMWARE_PROFILE_MATRIX_5_6_16.md`.
 
 ## Evidence-backed hardware matrix
 
@@ -17,7 +17,7 @@ The M910 serial-only profile and dual-slot profile are distinct and cannot be su
 
 ## Release artifact state
 
-- Version in the current uncommitted integration candidate: **5.6.15**, build `20261128.0005`. This is not yet a merged or published release.
+- Main source version: **5.6.15**, build `20261128.0005`, merged by PR #9. This source merge does not authorize a hardware write.
 - The previous 5.6.14 artifacts are retained as superseded evidence under `task-artifacts/po6391-diagnosis-20261128/firmware-canonical-5.6.14/`; they do not contain the current credential persistence or OTA ACK/logging fixes and must not be promoted as 5.6.15.
 - Dell pinned build at code commit `bf1cf9cbb18b2f0333ad40c09bf171b46fb0c130` (ESP32 core 3.3.11, GFX 1.13.0, ILI9341 1.7.0, BusIO 1.17.4, ArduinoJson 6.21.5):
 
@@ -26,7 +26,7 @@ The M910 serial-only profile and dual-slot profile are distinct and cannot be su
 | `es3c28p-n16r8-m910-gm65uart1` | 1,448,064 / 3,342,336 bytes | `5ebe988f07dcd739b6f577c85e934b9a09555b3da07c3d920b716d7959146b8b` | OTA ZIP `2cfcc0a28ef82b540f9fe0ed31ee8ea4e72b0107079b12c622372724c6fb9be7`; legacy ZIP `67a3c9bba21c85278e526b59b6963c58df2d4fe568ab40259aa44c04eadaa91f` | OTA dual-slot; verifier PASS |
 | `es3c28p-n16r8-m910-hugeapp-serial` | 1,448,064 / 3,145,728 bytes | `1a0318533c841987de7865231aa77e9276e2cb4b73df96456c9e7194d519494a` | none by design | app-only, manifest `ota_capable=false` |
 
-Artifacts/manifests/checksums are retained at `/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-5.6.15-bf1cf9c/`. They are pre-merge candidate evidence; exact merged-main CI artifacts take precedence for promotion. Built-in GTS Root R4 only; no external OTA CA/auth secret, device token, Wi-Fi credential, UUID secret or NVS data is embedded. The builder skips unverified profiles.
+Artifacts/manifests/checksums are retained at `/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-5.6.15-bf1cf9c/` as pre-merge local evidence. Exact merged-main CI artifacts take precedence for promotion. Built-in GTS Root R4 only; no external OTA CA/auth secret, device token, Wi-Fi credential, UUID secret or NVS data is embedded. The builder skips unverified profiles.
 
 ## Scanner baud evidence
 
