@@ -33,7 +33,7 @@ Inventory was refreshed with `git ls-remote --heads origin` and `git fetch origi
 ### Follow-up delta discovered after PR #9
 
 - PR #1's `scanner-probe` and exact-repeat suppression were genuinely missing from PR #9's main tree; the previous matrix disposition above was corrected after comparing the actual functions.
-- Follow-up `agent/codex/esp-scanner-safety-5616` is based on merged main `4d10dbc` and advances code to 5.6.16. It keeps probe access on USB maintenance, gates it to idle/no-work/no-queue/no-OTA states and two verified ES3C28P M910 profiles, samples GPIO44 without changing UART/NVS/network/auth, and drains scanner UART before and after. Unknown boards remain inactive.
+- Follow-up `agent/codex/esp-scanner-safety-5616` at `bf8b0e011e95c26005c1e542e45a2cf1f1bab856` is based on merged main `4d10dbc` and advances code to 5.6.16. It keeps probe access on USB maintenance, gates it to idle/no-work/no-queue/no-OTA states and two verified ES3C28P M910 profiles, samples GPIO44 without changing UART/NVS/network/auth, and drains scanner UART before and after. Unknown boards remain inactive. Pinned dual-slot OTA and single-slot serial builds passed; OTA verifier passed. PR #10 carries the review/CI gate.
 - The follow-up is a source qualification candidate; no OTA/serial package is a production promotion and no device was flashed.
 
 ## Hardware distinction that remains unresolved

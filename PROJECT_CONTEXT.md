@@ -22,9 +22,9 @@
 
 ## Verification and artifacts
 
-- At follow-up source SHA (see branch/PR head), local official host gate: 10 C++ host suites PASS; official Python set PASS (91 tests, including new scanner safety tests); `git diff --check` PASS. Pinned profile builds and final CI status are tracked in PR #10 and the release handoff.
-- Current profile matrix and build evidence are recorded under `docs/`. Artifact files, checksums and release handoff are stored under `/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-release-handoff.md`; 5.6.15 artifacts remain preserved under `firmware-canonical-5.6.15-bf1cf9c/`.
+- At `bf8b0e011e95c26005c1e542e45a2cf1f1bab856`, local official host gate: 10 C++ host suites PASS; official Python set PASS (91 tests, including new scanner safety tests); `git diff --check` PASS. Pinned dual-slot M910 OTA build PASS at 1,449,120/3,342,336 bytes, app SHA `328fe64877864fe93894c1a9e225a87e6a89e54a71a8b6063c7c6b63bb97c5c5`; package SHA `1a7e7b1b4f1fe4683bc650e872a41a51179f4ec77073e45f2704b8a14a79f959`; verifier PASS. Single-slot serial build PASS at 1,449,136/3,145,728 bytes, SHA `07fa153cea5bac778ce24cd83e9fe46d455ce3692ddefe91391123666b7ea89d`, no OTA capability. Kiosk Linux unverified profile skipped.
+- Artifact bundle and `SHA256SUMS`: `/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-5.6.16-bf8b0e0/`; checkpoint: `/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-release-handoff.md`. 5.6.15 artifacts remain preserved under `firmware-canonical-5.6.15-bf1cf9c/`.
 
 ## Recent handoff
 
-- 2026-11-28: PR #9 merged 5.6.15. Semantic re-review found two missing PR #1 scanner changes; ported them safely as the 5.6.16 follow-up branch above. Next: finish local profile builds/artifact checks, push/open PR #10, wait for exact-head required CI/review, merge only on gate pass, update branch matrix and handoff. No hardware writes until a unique safe rollback-capable target is proven.
+- 2026-11-28: PR #9 merged 5.6.15. Semantic re-review found two missing PR #1 scanner changes; ported them safely as 5.6.16 with local tests/builds above. Next: push/open PR #10, wait for exact-head required CI/review, merge only on gate pass. No hardware writes until a unique safe rollback-capable target is proven.
