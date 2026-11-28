@@ -2,6 +2,8 @@
 
 Inventory was refreshed with `git ls-remote --heads origin` and `git fetch origin +refs/heads/*:refs/remotes/origin/*`. This matrix covers the 22 non-`main`/non-canonical branch refs plus the separately listed `main` and canonical branch (24 refs total). Hashes below are the exact fetched remote tips at inventory time; confirm again before merge/cleanup. Source status and test references reflect the integration candidate, not a hardware deployment.
 
+After PR #10 branch creation, a direct `git ls-remote --heads origin` reports 25 remote heads (the original 24 plus the follow-up branch below); PR/branch CI status is tracked separately from this initial semantic audit snapshot.
+
 | Ref at fetched tip | Exact SHA | Unique change / comparison | Disposition |
 |---|---|---|---|
 | `adapt/v5.6.0-m910-gm65-20261110` | `ea192e2ce85318c168949611b602e469a3f244b5` | Ancestor; M910 source adaptation and 115200 scanner/runtime handling are already in canonical lineage. | Integrated; no merge needed. |
@@ -29,6 +31,7 @@ Inventory was refreshed with `git ls-remote --heads origin` and `git fetch origi
 
 | `main` | `4d10dbc54763abfe312531834d904b31e7983cdd` | PR #9 merge commit; source is 5.6.15 / build `20261128.0005`, with shared source and evidence-backed profile matrix. | Current canonical source; PR #10 is a narrow scanner follow-up against this SHA. |
 | `integration/esp-canonical-release-20261128` | `764d6afcd623328f6143d84de27929a81d7bbcfa` | PR #9 source lineage, merged into main at `4d10dbc`. | PR #9 merged; retained as recovery/history, not a second active release line. |
+| `agent/codex/esp-scanner-safety-5616` | `ad751f8295faa14d4bfa8f2c3469b31e67f503fa` | Based on main `4d10dbc`; ports the two missing PR #1 scanner behaviors with maintenance/profile guards and regressions. | PR #10 OPEN draft to main; local official tests and pinned profile builds PASS; exact-head build-release CI in progress. |
 
 ### Follow-up delta discovered after PR #9
 
