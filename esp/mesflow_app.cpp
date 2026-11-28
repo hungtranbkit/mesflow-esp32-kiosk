@@ -96,10 +96,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.13"
-#define FW_BUILD "20261128.0003"
+#define FW_VERSION "5.6.14"
+#define FW_BUILD "20261128.0004"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.13-KIMEX-INTEGRATED";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.14-KIMEX-INTEGRATED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -1178,6 +1178,13 @@ bool addOpenOp(const OpenOp& o){
   openOps[openOpCount++]=o;return true;
 }
 int findOfflineSessionFor(const char* workerQr,const char* opQr){for(uint16_t i=0;i<offlineSessionCount;i++)if(!strcmp(offlineSessions[i].workerQr,workerQr)&&!strcmp(offlineSessions[i].operationQr,opQr))return i;return -1;}
+int findOfflineSessionForOp(const char* workerQr,const char* opQr,int opId){
+  const int byQr=findOfflineSessionFor(workerQr,opQr);
+  if(byQr>=0||opId<=0)return byQr;
+  for(uint16_t i=0;i<offlineSessionCount;i++)
+    if(!strcmp(offlineSessions[i].workerQr,workerQr)&&operationIdFromQr(offlineSessions[i].operationQr)==opId)return i;
+  return -1;
+}
 int findOfflineSessionByLocalId(const char* id){if(!id||!id[0])return -1;for(uint16_t i=0;i<offlineSessionCount;i++)if(!strcmp(offlineSessions[i].localSessionId,id))return i;return -1;}
 // True when the server has answered (ACK or REJECT) the event, i.e. the local
 // START is no longer the only record of that session.
@@ -1185,6 +1192,25 @@ bool eventAnswered(const char* eventId){
   if(!fsReady||!eventId||!eventId[0])return false;
   File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return false;OfflineLogRecord r;
   while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){if(validObject(r)&&(r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&!strcmp(r.eventId,eventId)){f.close();return true;}}
+  f.close();return false;
+}
+bool finishPendingFor(const char* workerQr,const char* opQr,int opId){
+  if(!fsReady||!offlineBuffersReady||countPendingOfflineEvents()==0)return false;
+  File f=LittleFS.open(EVENT_LOG_FILE,"r");if(!f)return false;
+  OfflineLogRecord r;uint16_t ackCount=0;
+  while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r))
+    if(validObject(r)&&(r.recordType==(uint8_t)LogRecordType::ACK||r.recordType==(uint8_t)LogRecordType::REJECT)&&ackCount<offlineAckCapacity)
+      safeCopy(offlineAckScratch[ackCount++],64,r.eventId);
+  f.seek(0);
+  while(f.read((uint8_t*)&r,sizeof(r))==sizeof(r)){
+    if(!validObject(r)||r.recordType!=(uint8_t)LogRecordType::EVENT||r.eventType!=(uint8_t)OfflineEventType::FINISH)continue;
+    if(strcmp(r.workerQr,workerQr))continue;
+    const bool sameOp=(opQr&&opQr[0]&&!strcmp(r.operationQr,opQr))||(opId>0&&operationIdFromQr(r.operationQr)==opId);
+    if(!sameOp)continue;
+    bool answered=false;
+    for(uint16_t i=0;i<ackCount;i++)if(!strcmp(offlineAckScratch[i],r.eventId)){answered=true;break;}
+    if(!answered){f.close();return true;}
+  }
   f.close();return false;
 }
 void removeOfflineSessionAt(uint16_t si){for(uint16_t i=si+1;i<offlineSessionCount;i++)offlineSessions[i-1]=offlineSessions[i];offlineSessionCount--;}
@@ -5075,6 +5101,10 @@ bool lookupQr(const char* qr, bool expectingWorker) {
       if (o.sessionId <= 0) return;
       o.operationId = s["operation_id"] | 0;
       safeCopy(o.opQr, sizeof(o.opQr), s["operation_qr"] | "");
+      if (finishPendingFor(rt.workerQr, o.opQr, o.operationId)) {
+        Serial.printf("[MULTI-OP] session %d da ket thuc tren may, cho dong bo -> an\n", o.sessionId);
+        return;
+      }
       safeCopy(o.opName, sizeof(o.opName), s["operation_name"] | "Cong doan dang mo");
       safeCopy(o.po, sizeof(o.po), s["po"] | "");
       safeCopy(o.part, sizeof(o.part), s["part"] | "");
@@ -5248,7 +5278,7 @@ bool finishSession() {
     setError(-30,"KHÔNG LƯU ĐƯỢC - BÁO QUẢN LÝ");return false;
   }
   {
-    int si=findOfflineSessionFor(rt.workerQr,rt.operationQr);
+    int si=findOfflineSessionForOp(rt.workerQr,rt.operationQr,rt.operationId);
     if(si>=0&&!offlineSessions[si].finishPending){removeOfflineSessionAt(si);saveOfflineSessions();}
   }
   Serial.printf("[OFFLINE] local-first FINISH event=%s pending=%u\n",eventId,countPendingOfflineEvents());
@@ -6653,6 +6683,13 @@ void readScannerCommands() {
       dispatchScannerFrame("BUFFER_FULL");
       scannerFrame[scannerFrameLength++] = value;
     }
+    // Some GM65 configurations terminate each QR with CR or LF. Split here so
+    // two scans drained in one loop pass cannot be concatenated into one QR.
+    // The other byte of a CRLF pair becomes an empty frame and is discarded.
+    if (value == '\r' || value == '\n') {
+      if (scannerFrameLength > 1) dispatchScannerFrame("CR_LF");
+      else scannerFrameLength = 0;
+    }
   }
 
   // A quiet gap of 50 ms marks the end of one scanner frame.
@@ -7361,6 +7398,14 @@ void handleKeypadKey(char key) {
     return;
   }
 
+  // Cancel only the local worker/operation selection. Durable and server-side
+  // sessions remain untouched; the next worker scan refreshes the open list.
+  if (key == '*' && (uiState == UiState::WORKER_OK || uiState == UiState::OPERATION_OK)) {
+    emitActionEvent("USER_CANCELLED", "USER_ACTION", "CANCELLED");
+    resetForNextWorker();
+    return;
+  }
+
   if (uiState == UiState::ASK_REWORK) {
     if (key == '#') { demoReworkQty = 0; setUi(UiState::CONFIRM_QTY); }      // KHONG -> xac nhan
     else if (key == '1') { demoReworkQty = 0; setUi(UiState::INPUT_REWORK); } // CO -> nhap so sua duoc
@@ -8001,6 +8046,12 @@ void setup() {
                 static_cast<unsigned>(ESP.getFreePsram()));
   allocateOfflineBuffers();
   fsReady = LittleFS.begin(true);
+  if (fsReady && LittleFS.exists(ACTION_QUEUE_TMP_PATH)) {
+    // A power loss can interrupt the queue's tmp -> replace sequence. If the
+    // old file was already removed, recover the complete tmp queue on boot.
+    if (!LittleFS.exists(ACTION_QUEUE_PATH)) LittleFS.rename(ACTION_QUEUE_TMP_PATH, ACTION_QUEUE_PATH);
+    else LittleFS.remove(ACTION_QUEUE_TMP_PATH);
+  }
   prefs.begin("mesflow", true);
   clientEventCounter = prefs.getULong("evt_counter", 0);
   safeCopy(offlineSnapshotRevision,sizeof(offlineSnapshotRevision),prefs.getString("snap_rev","unknown").c_str());

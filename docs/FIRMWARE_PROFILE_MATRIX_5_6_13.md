@@ -1,4 +1,4 @@
-# ESP32 firmware profile matrix — 5.6.13 candidate
+# ESP32 firmware profile matrix — 5.6.14 candidate
 
 Release branch: `integration/esp-canonical-release-20261128`, rooted at
 `origin/main` and integrating the 5.6.11 scanner/Wi-Fi-cancel candidate. This
@@ -19,7 +19,7 @@ table. No Kimex Máy 1 profile is built until its actual LCD, flash, and
 partition evidence is joined to its UUID. The two Kimex units therefore do
 not inherit an M910 binary by model-name similarity.
 
-Firmware version `5.6.13` advances past the frozen local 5.6.11 candidate
+Firmware version `5.6.14` advances past the frozen local 5.6.11 candidate
 (`b18cc4b`, app SHA `e46c5bd41d3ee8db984d43ead663f315966eb09c366c86240c3e38c7cad9c835`).
 The intermediate local 5.6.12 compile used unpinned Dell libraries and is
 superseded; its app/manifest/ZIP were preserved under
@@ -29,7 +29,7 @@ release inputs.
 ## Build artifacts
 
 Source commit `6492beb89ae9e1fe96cd67a511c9acb82fa57da5`; build ID
-`20261128.0003.g6492beb89a`. Local build used ESP32 core 3.3.11, GFX 1.13.0,
+`20261128.0004.g6492beb89a`. Local build used ESP32 core 3.3.11, GFX 1.13.0,
 ILI9341 1.7.0, BusIO 1.17.4, and ArduinoJson 6.21.5 in an isolated Arduino
 user library directory. Built-in GTS Root R4 was used; no OTA auth secret or
 device credential was included.
@@ -40,9 +40,9 @@ device credential was included.
 | `es3c28p-n16r8-m910-hugeapp-serial` | Serial app only; one 3,145,728-byte app at `0x10000`; partition SHA `aaae2888c5a6a348004b5b436f47abb25ae32e72d9003902955a998eda723edd` | 1,439,152 bytes; `3bd21bf3455f7f770db01ae192f64857f034d50ee275b72f7af2bc693ff2c25e` | No OTA ZIP by design; manifest SHA `a84421694a2216874aff5e360a74351828848f7a1579596eddad65a3377e5a27` |
 
 Release ZIP verification passed. Artifacts and manifests were copied under
-`/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-5.6.13/`.
+`/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-5.6.14/`.
 `WORKER_REQUIRED`, UTF-8 scanner and OPID handling, setup cancel, OTA rollback,
 approval, numeric ID, GM65/keypad and deep-sleep interlocks remain covered by
 the local tests. No hardware write or device-specific Kimex build was made.
-Each 5.6.13 profile is built from one source commit, with profile-specific
+Each 5.6.14 profile is built from one source commit, with profile-specific
 partition identity and artifact checksums recorded in the release handoff.
