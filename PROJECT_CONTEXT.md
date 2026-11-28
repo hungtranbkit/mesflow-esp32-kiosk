@@ -1,38 +1,27 @@
 # ESP Kiosk project context
 
-## Current canonical candidate
+## Canonical source / integration state
 
-- Branch/worktree: `integration/esp-canonical-release-20261128` at `/home/dell/workspace/mesflow/.worktrees/integration-esp-canonical-release-20261128`; release code source commit `dcd1deb05ba90eb1227f24fb1e2c4ce5a3a65f2a`, followed only by documentation refresh commits.
-- Draft PR #9 targets `main`: https://github.com/hungtranbkit/mesflow-esp32-kiosk/pull/9. PR state OPEN, mergeable, host-tests and build-release PASS on this head; review decision is still pending, so do not merge or mark ready.
-- Firmware candidate `5.6.14`, build `20261128.0004.gdcd1deb05b`. This is candidate source identity, not evidence of a production device's installed version.
-- The branch is based on current `main` `92a80d4`, integrates PR #8's 5.6.11 lineage (PR #4 numeric ID/approval/OTA/deep-sleep, PR #6 UTF-8/OPID scanner, PR #7 Wi-Fi cancel), and carries verified three-network Wi-Fi behavior from PR #1. PRs #5/#6/#7/#8 remain legacy/stacked; PR #9 is the canonical direct-to-main path.
+- `main` at remote `92a80d4ce6ce3c5f169a7d7798ed2309c856b085` is still the legacy 5.5.7 source line. The unified firmware candidate is on `integration/esp-canonical-release-20261128`, PR #9 → `main`; PR remains draft until exact-head CI and source review gates pass.
+- Firmware code commit `bf1cf9cbb18b2f0333ad40c09bf171b46fb0c130` advances to 5.6.15 / build `20261128.0005`. It includes the 5.6.11 lineage, UTF-8/OPID, numeric ID/approval, Wi-Fi cancel/multi-SSID, OTA/deep-sleep safeguards, credential write/readback rollback, stable boot ACK application semantics, legacy OTA response compatibility, no POST-body logging, and idle READY connectivity redraw.
+- `docs/ESP_BRANCH_INTEGRATION_MATRIX_20261128.md` is the fetched 24-ref branch reconciliation. One canonical source branch is maintained; remaining USB auto-provision delta from PR #2 is held because companion MESFlow PR #52 is still open/unmerged. Do not merge PR #2 or expose that protocol until the server contract is reviewed.
+- Common application source serves all kiosk profiles. Verified hardware facts belong in `profiles/*.json`; unknown boards stay inactive/UNVERIFIED. JC4827W543 is a separate NV3041A QSPI test display and is not compatible with the current ES3C28P ILI9341 production image.
 
-## Preserved behavior and current code
+## Verification and artifacts
 
-- Scanner UTF-8 byte policy and `WF|OPID|` remain; GM65 CR/LF now terminates individual frames so queued scans do not merge. `WORKER_REQUIRED` still rejects operation scans before lookup. Worker `*` cancel clears only the local selection; open durable/server sessions remain.
-- Multi-OP selection and offline queues remain. OPID matching is applied to offline sessions where the saved QR itself carries the numeric ID; server session IDs match scanned OPID. Offline FINISH records still pending ACK are hidden from server-open list. Startup recovers an action-queue tmp file when the old file was removed during an interrupted replacement.
-- Wi-Fi setup cancel stays non-destructive and resumes primary asynchronously. Up to three SSIDs are stored in `mesflow_cfg`; config paths preserve UUID/token/approval/server/station namespaces. Deep-sleep, OTA idle interlock, inactive-slot/hash validation, boot confirmation and rollback protections remain.
-- Numeric kiosk ID, approval/identity, QR GM65 UART1 and keypad/PCF8574 behavior remain. No schema/config migration was introduced.
-- Main code change: `esp/mesflow_app.cpp`; Wi-Fi failover policy: `esp/mesflow_wifi_failover_policy.h`; release profile matrix: `docs/FIRMWARE_PROFILE_MATRIX_5_6_14.md`; lineage regression: `tools/test_canonical_lineage_contract.py`.
+- At code SHA `bf1cf9c`: 10 C++ host suites PASS, 87 Python regression/release tests PASS, and `git diff --check` PASS. CI workflow now includes the keypad diagnostic source contract and scanner UTF-8/OPID C++ suite.
+- Pinned Dell build PASS for verified dual-slot OTA profile: app 1,448,064 / 3,342,336 bytes; app SHA `5ebe988f07dcd739b6f577c85e934b9a09555b3da07c3d920b716d7959146b8b`; OTA ZIP `2cfcc0a28ef82b540f9fe0ed31ee8ea4e72b0107079b12c622372724c6fb9be7`; release verifier PASS.
+- Pinned Dell build PASS for verified single-slot huge_app: app 1,448,064 / 3,145,728 bytes; app SHA `1a0318533c841987de7865231aa77e9276e2cb4b73df96456c9e7194d519494a`; app-only manifest says `ota_capable=false`.
+- Local candidate files/manifests/checksums: `/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-5.6.15-bf1cf9c/`. These are not production-promotion artifacts. Use exact merged-main CI artifacts after merge.
+- Current post-push PR #9 exact-head CI is pending; do not merge until pass. `main` protection/rulesets were absent at last read, but do not bypass any checks/reviews if policy changes.
 
-## Verified profile / target matrix
+## Verified profile and hardware gates
 
-- Kimex Máy 1 UUID `fc0c33a9-2f76-424f-a256-217699b57712`: reported ES3C28P/5.6.6; exact MAC, LCD, flash and partition table are not joined. No image assigned.
-- Kimex Máy 2/A UUID `0f2d2ad3-06d7-417f-a1e7-da3d2457db39`, MAC `84:C7:BB:79:39:84`: verified `huge_app` single app0 profile, 3 MiB at `0x10000`, partition SHA `aaae2888c5a6a348004b5b436f47abb25ae32e72d9003902955a998eda723edd`; serial-only, not OTA-capable.
-- Historical M910 UUID `2eebb378-e0dd-4c3b-aa4d-39ae012437e0`: last seen Nov 11, reported 5.6.2; current physical identity/table is unverified. The repository has distinct verified dual-slot and single-slot build profiles; neither proves the physical unit's current layout.
-- Dell USB reference MAC `28:84:85:85:75:10` remains an unverified Kiosk Linux profile; serial was not opened.
-- No PO6391 physical UUID, idle state, current image backup or rollback target is proven. No device reset, flash, OTA, NVS erase, serial access or production write occurred. Do not target any unit from profile name alone.
+- `es3c28p-n16r8-m910-gm65uart1`: 16 MiB flash / 8 MiB OPI PSRAM / ILI9341 240x320 / GM65 RX GPIO44, default_8MB dual slots 3,342,336 bytes; partition hash `1d9cca96de0fe07ad7fc0648b9878ddecd9ce565e38b589ad20fea698ed4c80c`.
+- `es3c28p-n16r8-m910-hugeapp-serial`: verified single app0, 3 MiB at `0x10000`; partition hash `aaae2888c5a6a348004b5b436f47abb25ae32e72d9003902955a998eda723edd`; no OTA slot.
+- Kimex Máy 1 UUID `fc0c33a9-2f76-424f-a256-217699b57712` lacks MAC/board/partition join. Máy 2/A UUID `0f2d2ad3-06d7-417f-a1e7-da3d2457db39`, MAC `84:C7:BB:79:39:84` is the single-slot receipt; no OTA. Kiosk Linux USB MAC `28:84:85:85:75:10` remains `UNVERIFIED`. JC4827W543 is test-only.
+- No production device has verified UUID + exact profile + idle/no-queue/no-session + current backup and rollback. No device has been reset, flashed, sent OTA, or had NVS/config/auth changed in this task. This is the concrete pilot blocker.
 
-## Build/test evidence and artifact location
+## Recent handoff
 
-- On source SHA `dcd1deb`: 10 C++ host suites passed (`-Wall -Wextra -Werror`, including 1,000 threaded OTA/sleep/setup interleavings); 69 Python tests passed.
-- Pinned local build: ESP32 core 3.3.11, GFX 1.13.0, ILI9341 1.7.0, BusIO 1.17.4, ArduinoJson 6.21.5. OTA release verifier PASS.
-- Dual-slot profile `es3c28p-n16r8-m910-gm65uart1`: app 1,440,096 bytes / slot 3,342,336; app SHA `717bf44df75a8e39176e56d94d2bc302adcdff976202b07ec17ae05a85a30de6`; OTA ZIP SHA `002ca40437db54b96888dadd00ae0eceb35cc917340262d00a616bd87075c8b1`.
-- Single-slot serial profile `es3c28p-n16r8-m910-hugeapp-serial`: app 1,440,112 bytes / app0 3,145,728; app SHA `c45af61c2273996d856f91e79e2ad32dc989d3f9abb90278d2aed27418bba512`; manifest `ota_capable=false`.
-- Frozen artifacts and set manifest: `/home/dell/workspace/task-artifacts/po6391-diagnosis-20261128/firmware-canonical-5.6.14/`; release-manifest SHA `87f6e40361920723be0c2daf7424daf22475e6b51e439fa6e393f753c828982f`. Built-in GTS Root R4 used; no device credentials/secrets embedded.
-
-## Remaining gates
-
-- PR #9 checks pass but GitHub review decision remains blank. Keep draft; do not bypass protection or merge without the required review gate.
-- Release owner/PO6391 agent owns incident correlation and hardware inventory. Require exact physical UUID/profile, idle/no-queue/no-session, valid auth/config preservation and rollback proof before any pilot. No test board was proven attached/idle, so no pilot package was flashed.
-- No tag, publication, merge, OTA upload, pilot or production deploy has occurred. Next action: obtain required review; only then continue release owner process, with one identified test target and rollback gate.
+- 2026-11-28: Reconciled remote branch tips; ported missing OTA ACK/logging and READY redraw fixes; preserved auth safely; added profile/branch matrices and local candidate builds. PR #9 is the only source integration path. Next: wait for exact-head checks, mark ready and merge only if gates pass; then use post-merge main CI artifact. Keep production flash blocked until an exact idle rollback-capable target is identified.
