@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -24,6 +25,7 @@
 #include "mesflow_keypad_policy.h"
 #include "mesflow_scanner_rest_policy.h"
 #include "mesflow_scanner_qr_policy.h"
+#include "mesflow_wifi_failover_policy.h"
 #include "mesflow_kiosk_sleep_policy.h"
 #include "mesflow_sleep_ota_gate.h"
 #include <esp_sleep.h>
@@ -75,6 +77,13 @@ using PsramJsonDocument = BasicJsonDocument<PsramJsonAllocator>;
 // phone setup or LAN provisioning from MESFlow Admin Center.
 char WIFI_SSID[33]       = "panda";
 char WIFI_PASSWORD[65]   = "12345678a";
+// Optional fallback networks remain in mesflow_cfg and do not alter the
+// server, station, device identity, approval token, or OTA configuration.
+char WIFI_SSID2[33]      = "";
+char WIFI_PASSWORD2[65]  = "";
+char WIFI_SSID3[33]      = "";
+char WIFI_PASSWORD3[65]  = "";
+int8_t wifiSlot = 0;
 char SERVER_BASE[192]    = "";  // Bat buoc cau hinh qua Setup Portal/NVS; khong co fallback hardcode
 // Deploy Agent is the OTA control plane of THIS kiosk's MESFlow instance.
 // No compiled default: the URL is advertised by the kiosk's own MESFlow over
@@ -87,10 +96,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.11"
-#define FW_BUILD "20261128.0001"
+#define FW_VERSION "5.6.12"
+#define FW_BUILD "20261128.0002"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.11-KIMEX-INTEGRATED";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.12-KIMEX-INTEGRATED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead
@@ -437,6 +446,8 @@ void serviceDeviceManagement();
 bool loadDeviceConfig();
 bool loadOrCreateDeviceIdentity();
 bool saveDeviceConfig();
+static const char* wifiSlotSsid(int8_t slot);
+static const char* wifiSlotPass(int8_t slot);
 void serviceStateWatchdog();
 void recoverUiFromStuck(const char* reason, bool userRequested = false);
 bool sendKioskEvent(const char* eventType, const char* severity, const char* message,
@@ -744,6 +755,8 @@ constexpr uint32_t PENDING_RETRY_MS = 10000;
 // Offline mode starts only after a sustained outage, avoiding mode flapping.
 constexpr uint32_t OFFLINE_ENTER_AFTER_MS = 45000;
 constexpr uint32_t OFFLINE_SYNC_RETRY_MS = 5000;
+constexpr uint32_t WIFI_SWITCH_AFTER_MS = 45000;
+constexpr uint32_t WIFI_PRIMARY_RECHECK_MS = 10UL * 60UL * 1000UL;
 // A stale snapshot remains usable offline and is audited by its revision.
 constexpr uint16_t MAX_OFFLINE_EVENTS = 500;
 constexpr uint16_t MAX_CACHED_WORKERS = 160;
@@ -1980,8 +1993,16 @@ bool loadDeviceConfig() {
   String deviceId = prefs.getString("device_id", DEVICE_ID);
   String deviceName = prefs.getString("device_name", DEVICE_NAME);
   String station = prefs.getString("station", STATION_CODE);
+  String ssid2 = prefs.getString("wifi_ssid2", "");
+  String pass2 = prefs.getString("wifi_pass2", "");
+  String ssid3 = prefs.getString("wifi_ssid3", "");
+  String pass3 = prefs.getString("wifi_pass3", "");
   prefs.end();
 
+  copyConfigValue(WIFI_SSID2, sizeof(WIFI_SSID2), ssid2);
+  copyConfigValue(WIFI_PASSWORD2, sizeof(WIFI_PASSWORD2), pass2);
+  copyConfigValue(WIFI_SSID3, sizeof(WIFI_SSID3), ssid3);
+  copyConfigValue(WIFI_PASSWORD3, sizeof(WIFI_PASSWORD3), pass3);
   copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
   copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), pass);
   copyConfigValue(SERVER_BASE, sizeof(SERVER_BASE), server);
@@ -1998,7 +2019,15 @@ bool saveDeviceConfig() {
   prefs.begin("mesflow_cfg", false);
   bool ok = true;
   ok &= prefs.putString("wifi_ssid", WIFI_SSID) > 0;
-  prefs.putString("wifi_pass", WIFI_PASSWORD); // empty password is valid for open Wi-Fi
+  ok &= prefs.putString("wifi_pass", WIFI_PASSWORD) > 0; // empty password is valid for open Wi-Fi
+  ok &= prefs.putString("wifi_ssid2", WIFI_SSID2) > 0;
+  ok &= prefs.putString("wifi_pass2", WIFI_PASSWORD2) > 0;
+  ok &= prefs.putString("wifi_ssid3", WIFI_SSID3) > 0;
+  ok &= prefs.putString("wifi_pass3", WIFI_PASSWORD3) > 0;
+  ok &= prefs.getString("wifi_ssid2", "") == WIFI_SSID2;
+  ok &= prefs.getString("wifi_pass2", "") == WIFI_PASSWORD2;
+  ok &= prefs.getString("wifi_ssid3", "") == WIFI_SSID3;
+  ok &= prefs.getString("wifi_pass3", "") == WIFI_PASSWORD3;
   if (!SERVER_BASE[0]) { prefs.end(); return false; }
   ok &= prefs.putString("server", SERVER_BASE) > 0;
   // An empty Agent URL is valid (OTA not configured yet); never fail the save on it.
@@ -4777,17 +4806,81 @@ void urlEncode(const char* input, char* output, size_t outputSize) {
 // ============================================================
 // API operations
 // ============================================================
+static const char* wifiSlotSsid(int8_t i) {
+  return i == 0 ? WIFI_SSID : (i == 1 ? WIFI_SSID2 : WIFI_SSID3);
+}
+static const char* wifiSlotPass(int8_t i) {
+  return i == 0 ? WIFI_PASSWORD : (i == 1 ? WIFI_PASSWORD2 : WIFI_PASSWORD3);
+}
+static bool wifiExtraNetworks() { return WIFI_SSID2[0] || WIFI_SSID3[0]; }
+static uint32_t wifiPreferredCheckAt = 0;
+
+static bool wifiDriverSsidIs(const char* ssid) {
+  wifi_config_t conf;
+  return esp_wifi_get_config(WIFI_IF_STA, &conf) == ESP_OK &&
+         !strncmp(reinterpret_cast<const char*>(conf.sta.ssid), ssid, 32);
+}
+
+static void wifiBeginSlot(int8_t slot) {
+  if (slot < 0 || slot > 2 || !wifiSlotSsid(slot)[0]) return;
+  wifiSlot = slot;
+  wifiPreferredCheckAt = millis();
+  mesKeepAlive.drop();
+  Serial.printf("[NETWORK] Connecting configured WiFi priority %d\n", slot + 1);
+  // Stop a pending reconnect before applying another STA config. Verify the
+  // driver accepted it; otherwise do not assume the bookkeeping changed.
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    WiFi.disconnect(false, false);
+    delay(150);
+    WiFi.begin(wifiSlotSsid(slot), wifiSlotPass(slot));
+    if (wifiDriverSsidIs(wifiSlotSsid(slot))) return;
+    delay(500);
+  }
+  Serial.printf("[NETWORK] Driver rejected configured WiFi priority %d\n", slot + 1);
+}
+
+static void wifiSyncSlotFromDriver() {
+  const String now = WiFi.SSID();
+  for (int8_t k = 0; k < 3; ++k) {
+    if (wifiSlotSsid(k)[0] && now == wifiSlotSsid(k)) { wifiSlot = k; return; }
+  }
+}
+
+static int8_t pickKnownNetwork(int16_t n) {
+  int32_t best[3] = {-127, -127, -127};
+  bool configured[3] = {WIFI_SSID[0] != '\0', WIFI_SSID2[0] != '\0', WIFI_SSID3[0] != '\0'};
+  for (int16_t i = 0; i < n; ++i) {
+    for (int8_t k = 0; k < 3; ++k) {
+      if (configured[k] && WiFi.SSID(i) == wifiSlotSsid(k) && WiFi.RSSI(i) > best[k])
+        best[k] = WiFi.RSSI(i);
+    }
+  }
+  return mfwifi::chooseKnownNetwork(configured, best);
+}
+
 bool connectWifi() {
   setUi(UiState::WIFI);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  uint32_t started = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
-    delay(250);
+  int8_t first = 0;
+  if (wifiExtraNetworks()) {
+    const int16_t n = WiFi.scanNetworks(false, true);
+    esp_task_wdt_reset();
+    const int8_t pick = n > 0 ? pickKnownNetwork(n) : -1;
+    WiFi.scanDelete();
+    if (pick >= 0) first = pick;
+  }
+  for (int8_t k = 0; k < 3 && WiFi.status() != WL_CONNECTED; ++k) {
+    const int8_t slot = k == 0 ? first : (k <= first ? k - 1 : k);
+    if (!wifiSlotSsid(slot)[0]) continue;
+    wifiBeginSlot(slot);
+    const uint32_t started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < (k == 0 ? 20000UL : 15000UL)) {
+      delay(250);
+      esp_task_wdt_reset();
+    }
   }
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -4797,6 +4890,7 @@ bool connectWifi() {
   }
 
   rt.online = true;
+  wifiSyncSlotFromDriver();
   Serial.printf("WiFi OK. IP=%s RSSI=%d dBm\n",
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   return true;
@@ -5868,7 +5962,9 @@ static void consolePrintStatus() {
   Serial.printf("Station  : %s\n", STATION_CODE);
   Serial.printf("Server   : %s\n", SERVER_BASE);
   Serial.printf("WiFi     : %s\n", WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
-  Serial.printf("SSID     : %s\n", WIFI_SSID[0] ? WIFI_SSID : "<NOT SET>");
+  Serial.printf("WiFi 1/2/3: %s | %s | %s (active priority %d)\n",
+                WIFI_SSID[0] ? WIFI_SSID : "<NOT SET>", WIFI_SSID2[0] ? WIFI_SSID2 : "-",
+                WIFI_SSID3[0] ? WIFI_SSID3 : "-", wifiSlot + 1);
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("IP       : %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("RSSI     : %d dBm\n", WiFi.RSSI());
@@ -5905,6 +6001,8 @@ static void consolePrintHelp() {
   Serial.println("help | ?                 : danh sach lenh");
   Serial.println("status                    : trang thai day du");
   Serial.println("config                    : xem cau hinh (khong hien password/token)");
+  Serial.println("wifi-scan                 : quet cac WiFi 2.4 GHz quanh kiosk");
+  Serial.println("wifi-set {json}           : luu primary va toi da hai fallback (USB)");
   Serial.println("clear-token               : xoa kiosk token, giu WiFi/server");
   Serial.println("clear-config              : xoa WiFi/server/device/token, giu du lieu offline");
   Serial.println("clear-cache               : xoa worker/operation cache, giu queue/session");
@@ -5936,6 +6034,10 @@ static void forceSetupOnNextBoot() {
   temp.begin("mesflow_cfg", false);
   temp.putString("wifi_ssid", "");
   temp.putString("wifi_pass", "");
+  temp.putString("wifi_ssid2", "");
+  temp.putString("wifi_pass2", "");
+  temp.putString("wifi_ssid3", "");
+  temp.putString("wifi_pass3", "");
   temp.end();
 }
 
@@ -5945,9 +6047,14 @@ static void consoleClearWifi() {
   temp.begin("mesflow_cfg", false);
   temp.putString("wifi_ssid", "");
   temp.putString("wifi_pass", "");
+  temp.putString("wifi_ssid2", "");
+  temp.putString("wifi_pass2", "");
+  temp.putString("wifi_ssid3", "");
+  temp.putString("wifi_pass3", "");
   temp.end();
   WIFI_SSID[0] = '\0';
   WIFI_PASSWORD[0] = '\0';
+  WIFI_SSID2[0] = WIFI_PASSWORD2[0] = WIFI_SSID3[0] = WIFI_PASSWORD3[0] = '\0';
   Serial.println("[CONSOLE] Da xoa WiFi. Reboot vao Setup Portal.");
   delay(700);
   ESP.restart();
@@ -6045,6 +6152,46 @@ static bool handleConsoleCommand(String line) {
                   WIFI_SSID[0] ? WIFI_SSID : "<NOT SET>", SERVER_BASE[0] ? SERVER_BASE : "<NOT SET>",
                   DEVICE_ID, DEVICE_NAME, STATION_CODE, DEVICE_UUID,
                   rt.kioskToken[0] ? "STORED" : "EMPTY");
+    return true;
+  }
+  if (cmd == "wifi-scan") {
+    const int16_t n = WiFi.scanNetworks(false, true);
+    Serial.printf("[WIFI-SCAN] %d networks (2.4 GHz)\n", n);
+    for (int16_t i = 0; i < n; ++i)
+      Serial.printf("[WIFI-SCAN] %-32s RSSI %4ld ch %2ld%s\n", WiFi.SSID(i).c_str(),
+                    static_cast<long>(WiFi.RSSI(i)), static_cast<long>(WiFi.channel(i)),
+                    WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? " OPEN" : "");
+    WiFi.scanDelete();
+    return true;
+  }
+  if (cmd.startsWith("wifi-set ")) {
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, line.substring(9))) { Serial.println("[WIFI-SET] Invalid JSON."); return true; }
+    String ssid = doc["ssid"] | "";
+    String pass = doc["password"] | "";
+    String ssid2 = doc.containsKey("fallback_ssid") ? String(doc["fallback_ssid"] | "") : String(WIFI_SSID2);
+    String pass2 = doc.containsKey("fallback_ssid") ? String(doc["fallback_password"] | "") : String(WIFI_PASSWORD2);
+    String ssid3 = doc.containsKey("fallback2_ssid") ? String(doc["fallback2_ssid"] | "") : String(WIFI_SSID3);
+    String pass3 = doc.containsKey("fallback2_ssid") ? String(doc["fallback2_password"] | "") : String(WIFI_PASSWORD3);
+    if (ssid.length() >= sizeof(WIFI_SSID) || pass.length() >= sizeof(WIFI_PASSWORD) ||
+        ssid2.length() >= sizeof(WIFI_SSID2) || pass2.length() >= sizeof(WIFI_PASSWORD2) ||
+        ssid3.length() >= sizeof(WIFI_SSID3) || pass3.length() >= sizeof(WIFI_PASSWORD3)) {
+      Serial.println("[WIFI-SET] One or more network values are too long."); return true;
+    }
+    if (!SERVER_BASE[0]) { Serial.println("[WIFI-SET] Server URL is not configured; no values saved."); return true; }
+    if (doc.containsKey("fallback_ssid")) {
+      copyConfigValue(WIFI_SSID2, sizeof(WIFI_SSID2), ssid2);
+      copyConfigValue(WIFI_PASSWORD2, sizeof(WIFI_PASSWORD2), pass2);
+    }
+    if (doc.containsKey("fallback2_ssid")) {
+      copyConfigValue(WIFI_SSID3, sizeof(WIFI_SSID3), ssid3);
+      copyConfigValue(WIFI_PASSWORD3, sizeof(WIFI_PASSWORD3), pass3);
+    }
+    copyConfigValue(WIFI_SSID, sizeof(WIFI_SSID), ssid);
+    copyConfigValue(WIFI_PASSWORD, sizeof(WIFI_PASSWORD), pass);
+    if (!saveDeviceConfig()) { Serial.println("[WIFI-SET] Config save failed."); return true; }
+    Serial.printf("[WIFI-SET] Saved 1=%s 2=%s 3=%s; reboot to apply.\n", WIFI_SSID,
+                  WIFI_SSID2[0] ? WIFI_SSID2 : "<none>", WIFI_SSID3[0] ? WIFI_SSID3 : "<none>");
     return true;
   }
   if (cmd == "restart" || cmd == "reboot") {
@@ -7536,8 +7683,31 @@ static void serviceSetupPortalInput() {
   if (setupCancelRequested) cancelSetupPortal();
 }
 
+static void serviceWifiPreferredNetwork() {
+  static bool scanning = false;
+  if (wifiSlot == 0 || !wifiExtraNetworks()) { scanning = false; return; }
+  if (!scanning) {
+    if (uiState != UiState::READY || millis() - stateEnteredAt < 20000 || hasPendingTransaction()) return;
+    if (millis() - wifiPreferredCheckAt < WIFI_PRIMARY_RECHECK_MS) return;
+    wifiPreferredCheckAt = millis();
+    if (WiFi.scanNetworks(true) == WIFI_SCAN_FAILED) return;
+    scanning = true;
+    return;
+  }
+  const int16_t n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;
+  scanning = false;
+  const int8_t pick = n > 0 ? pickKnownNetwork(n) : -1;
+  WiFi.scanDelete();
+  if (pick < 0 || pick >= wifiSlot) return;
+  if (uiState != UiState::READY || hasPendingTransaction()) return;
+  Serial.printf("[NETWORK] Higher-priority WiFi returned; switching to priority %d\n", pick + 1);
+  wifiBeginSlot(pick);
+}
+
 void maintainConnection() {
   static uint32_t lastWifiAttempt = 0;
+  static uint32_t lastSsidSwitchAt = 0;
   static uint32_t disconnectObservedAt = 0;
   constexpr uint32_t WIFI_TRANSIENT_GRACE_MS = 12000;
   constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 20000;
@@ -7571,6 +7741,26 @@ void maintainConnection() {
     // Never call WiFi.disconnect() here: it turns a transient status change
     // into a real disconnect. Let the ESP-IDF auto reconnect first, then issue
     // a non-destructive reconnect request at a controlled interval.
+    if (wifiExtraNetworks() && disconnectedFor >= WIFI_SWITCH_AFTER_MS &&
+        (!lastSsidSwitchAt || millis() - lastSsidSwitchAt >= WIFI_SWITCH_AFTER_MS)) {
+      lastSsidSwitchAt = millis();
+      esp_task_wdt_reset();
+      const int16_t n = WiFi.scanNetworks(false, true);
+      const int8_t pick = n > 0 ? pickKnownNetwork(n) : -1;
+      WiFi.scanDelete();
+      int8_t target = pick;
+      if (target < 0 || target == wifiSlot) {
+        const bool configured[3] = {WIFI_SSID[0] != '\0', WIFI_SSID2[0] != '\0', WIFI_SSID3[0] != '\0'};
+        target = mfwifi::nextConfiguredNetwork(configured, wifiSlot);
+      }
+      if (target >= 0 && target < 3 && wifiSlotSsid(target)[0] && target != wifiSlot) {
+        Serial.printf("[NETWORK] WiFi outage %lu ms -> trying configured priority %d\n",
+                      static_cast<unsigned long>(disconnectedFor), target + 1);
+        wifiBeginSlot(target);
+      }
+      esp_task_wdt_reset();
+      return;
+    }
     if (millis() - lastWifiAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
       lastWifiAttempt = millis();
       Serial.printf("[NETWORK] WiFi mat %lu ms, yeu cau reconnect. status=%d\n",
@@ -7649,6 +7839,7 @@ void maintainConnection() {
   }
   if (rt.bound && canSendHeartbeat() && millis() - lastHeartbeatAt >= HEARTBEAT_MS) { lastHeartbeatAt = millis(); sendHeartbeat(); }
   scheduleOtaCheck();
+  serviceWifiPreferredNetwork();
 }
 
 // ============================================================
