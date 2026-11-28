@@ -23,6 +23,7 @@
 #include "mesflow_ota_policy.h"
 #include "mesflow_keypad_policy.h"
 #include "mesflow_scanner_rest_policy.h"
+#include "mesflow_scanner_qr_policy.h"
 #include "mesflow_kiosk_sleep_policy.h"
 #include "mesflow_sleep_ota_gate.h"
 #include <esp_sleep.h>
@@ -6328,11 +6329,13 @@ void dispatchScannerFrame(const char* reason) {
 
   char decoded[SCANNER_FRAME_MAX + 1] = {0};
   size_t decodedLength = 0;
+  size_t asciiPrintableCount = 0;
 
-  Serial.print("ASCII: ");
+  Serial.print("DATA : ");
   for (size_t i = 0; i < scannerFrameLength; ++i) {
     const uint8_t value = scannerFrame[i];
-    if (value >= 32 && value <= 126) {
+    if (mfqr::isAsciiPrintable(value)) ++asciiPrintableCount;
+    if (mfqr::isDataByte(value)) {
       Serial.write(value);
       if (decodedLength < SCANNER_FRAME_MAX) {
         decoded[decodedLength++] = static_cast<char>(value);
@@ -6373,7 +6376,7 @@ void dispatchScannerFrame(const char* reason) {
     // Garbage (unprintable bytes, or only a couple of characters for a whole
     // scan) is what a wrong baud looks like: try the next likely baud. A clean
     // non-MESFlow barcode at the right baud is all printable and is ignored.
-    if (decodedLength < 4 || decodedLength * 10 < scannerFrameLength * 8) noteScannerFrameGarbage();
+    if (asciiPrintableCount < 4 || asciiPrintableCount * 10 < scannerFrameLength * 8) noteScannerFrameGarbage();
   }
 
   scannerFrameLength = 0;
