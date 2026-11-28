@@ -7,6 +7,7 @@ This is the current handoff for the firmware repository. Source, tests, git stat
 - Branch: `integration/esp-canonical-release-20261128`, dedicated worktree `/home/dell/workspace/mesflow/.worktrees/integration-esp-canonical-release-20261128`.
 - Branch starts at `origin/main` `92a80d4` (legacy 5.5.7), merges the complete 5.6.11 candidate lineage from PR #8, and therefore carries the path needed for a direct PR to `main`. It includes PR #4's accepted numeric kiosk ID, approval/identity and OTA/deep-sleep baseline; scanner UTF-8/`WF|OPID|`; Wi-Fi setup cancel; and the outstanding multi-SSID behavior ported from PR #1's `fe46523`.
 - Source release commit: `6492beb89ae9e1fe96cd67a511c9acb82fa57da5`, firmware `5.6.13`, build prefix `20261128.0003`; candidate is not merged, tagged, published or installed. The earlier 5.6.11 candidate and unpinned 5.6.12 local artifact remain superseded; see `docs/FIRMWARE_PROFILE_MATRIX_5_6_13.md`.
+- Canonical draft PR #9 targets `main` (opening head `502068fbfd785c1b1e14c7e95998598101800898`). GitHub has a host-tests PASS on the code SHA; the newest host-tests and build-release checks were IN_PROGRESS when checked. No review decision yet; keep draft and do not merge while any check/review gate is pending.
 - Main remains unchanged. PR #6/#7/#8 are older stacked drafts and are not the canonical release path; do not merge them independently ahead of the integrated PR.
 
 ## Firmware contracts to preserve
@@ -34,9 +35,8 @@ This is the current handoff for the firmware repository. Source, tests, git stat
 
 ## Release gates / next actions
 
-1. Push the canonical integration branch and open a draft PR to `main`; wait for required CI and review. Do not bypass branch protection or merge a failing/pending gate.
-2. Update this context and the separate `firmware-canonical-release-handoff.md` with the resulting PR/check status and final head SHA.
-3. Do not create or upload an OTA job until a target UUID is joined to a fresh actual partition/profile and auth enrollment. Do not flash/OTA production in this task: no verified idle test M910 and rollback-capable physical target is currently available. The serial-only A/Máy 2 artifact is not a pilot substitute.
-4. The PO6391 diagnosis agent owns further scanner/worker/HB and inventory investigation; coordinate by reading its checkpoint, without changing its worktree or writing device state.
+1. Wait for PR #9 required CI and review. Do not bypass branch protection or merge a failing/pending gate.
+2. Keep hardware action blocked until a target UUID is joined to a fresh actual partition/profile, auth enrollment, idle state, backup and rollback. No verified idle test M910 and rollback-capable physical target is currently available; the serial-only A/Máy 2 artifact is not a pilot substitute.
+3. The PO6391 diagnosis agent owns further scanner/worker/HB and inventory investigation; coordinate by reading its checkpoint, without changing its worktree or writing device state.
 
 No database/schema change. No production write, OTA upload, serial access, reset, flash, NVS erase, merge, tag, or deployment occurred.

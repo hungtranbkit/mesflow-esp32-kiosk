@@ -32,5 +32,5 @@
 - [x] Port three-network failover and host/source-contract regressions.
 - [x] Run host tests and per-verified-profile release builds using pinned local libraries; record exact artifacts.
 - [x] Review source diff, update context and release handoff.
-- [ ] Push branch and open canonical draft PR; keep draft until required CI/review pass.
+- [x] Push branch and open canonical draft PR; keep draft until required CI/review pass.
 - [x] Keep physical pilot blocked until the PO6391 device is uniquely identified, idle, and rollback-capable.
