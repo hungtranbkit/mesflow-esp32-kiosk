@@ -1,4 +1,4 @@
-# ESP32 Canonical Release 5.6.12 Implementation Plan
+# ESP32 Canonical Release 5.6.13 Implementation Plan
 
 > **For agentic workers:** execution uses the existing owner session and dedicated integration worktree.
 
@@ -30,6 +30,6 @@
 
 - [x] Merge candidate lineage to a branch rooted at current `origin/main`.
 - [x] Port three-network failover and host/source-contract regressions.
-- [ ] Run host tests and per-verified-profile release builds; record exact artifacts.
+- [ ] Run host tests and per-verified-profile release builds using pinned local libraries; record exact artifacts.
 - [ ] Review diff, update context/handoff, push branch and open canonical draft PR.
 - [ ] Keep physical pilot blocked until the PO6391 device is uniquely identified, idle, and rollback-capable.

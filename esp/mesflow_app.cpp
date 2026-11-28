@@ -96,10 +96,10 @@ char DEVICE_NAME[64]     = "ESP32 Kiosk Demo 01";
 char STATION_CODE[40]    = "LASER-01";
 char DEVICE_UUID[40]      = "";   // identity vinh vien, namespace mf_identity
 char DEVICE_SECRET[65]    = "";   // 256-bit secret; khong hien tren UI/log
-#define FW_VERSION "5.6.12"
-#define FW_BUILD "20261128.0002"
+#define FW_VERSION "5.6.13"
+#define FW_BUILD "20261128.0003"
 #define HW_MODEL "ES3C28P"
-const char* APP_VERSION  = "ESP32-KIOSK-5.6.12-KIMEX-INTEGRATED";
+const char* APP_VERSION  = "ESP32-KIOSK-5.6.13-KIMEX-INTEGRATED";
 // Hardware profile + build id are injected per profile by
 // scripts/build-ota-release.sh (generated mesflow_build_profile.h). A plain
 // build has NO profile: the Agent then blocks it as PROFILE_REQUIRED instead

@@ -1,4 +1,4 @@
-# ESP32 firmware profile matrix — 5.6.12 candidate
+# ESP32 firmware profile matrix — 5.6.13 candidate
 
 Release branch: `integration/esp-canonical-release-20261128`, rooted at
 `origin/main` and integrating the 5.6.11 scanner/Wi-Fi-cancel candidate. This
@@ -19,7 +19,11 @@ table. No Kimex Máy 1 profile is built until its actual LCD, flash, and
 partition evidence is joined to its UUID. The two Kimex units therefore do
 not inherit an M910 binary by model-name similarity.
 
-Firmware version `5.6.12` advances past the frozen local 5.6.11 candidate
+Firmware version `5.6.13` advances past the frozen local 5.6.11 candidate
 (`b18cc4b`, app SHA `e46c5bd41d3ee8db984d43ead663f315966eb09c366c86240c3e38c7cad9c835`).
+The intermediate local 5.6.12 compile used unpinned Dell libraries and is
+superseded; its app/manifest/ZIP were preserved under
+`task-artifacts/po6391-diagnosis-20261128/retired-v5612-unpinned/` and are not
+release inputs.
 Each 5.6.12 profile is built from one source commit, with profile-specific
 partition identity and artifact checksums recorded in the release handoff.
